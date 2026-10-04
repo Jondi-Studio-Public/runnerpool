@@ -27,7 +27,7 @@ jobs:
     runs-on: [self-hosted, linux, linux-ci]
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # The pool's image has no gh: fetch the build for this machine (x86-64 or ARM64) into the job.
       - name: Install gh

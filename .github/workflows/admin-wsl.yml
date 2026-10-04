@@ -76,7 +76,7 @@ jobs:
       - name: Mask token
         run: if [ -n "$TOKEN" ]; then echo "::add-mask::$TOKEN"; fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         if: inputs.action == 'update-linuxrunner'
 
       - name: ${{ inputs.action }}

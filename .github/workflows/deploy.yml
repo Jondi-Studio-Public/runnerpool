@@ -35,7 +35,7 @@ jobs:
       REF: ${{ github.event.workflow_run.head_sha || github.sha }}
       TAG_INPUT: ${{ inputs.tag || '' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.REF }}
       - name: Work out the image tag
