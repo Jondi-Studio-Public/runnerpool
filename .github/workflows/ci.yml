@@ -1,7 +1,6 @@
-# This repo's own gate. Everything here runs on the shared
-# self-hosted Linux pool (`linux-ci`): these checks take seconds, and that pool is separate from the
-# PC and Mac runners that take other repos' suites.
-# `scripts/gate.sh` runs the same checks locally.
+# This repo's own gate, on GitHub-hosted runners so forks and outside contributors get CI with no
+# setup. It is safe for fork pull requests: triggered by pull_request (never pull_request_target),
+# read-only token, no secrets. `scripts/gate.sh` runs the same checks locally.
 name: CI
 
 on:
@@ -11,121 +10,63 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
-  pull-requests: read # dorny/paths-filter lists a pull request's files through the API
 
 jobs:
-  # The bash that runs on the Macs and the PC. Warnings and errors fail; shellcheck's info notes
-  # (mostly `A && B || C`, used deliberately here) don't.
+  # The bash that runs on the Macs and the PC, and the PowerShell parse. shellcheck and pwsh are
+  # preinstalled on ubuntu-latest. Warnings and errors fail; shellcheck's info notes don't.
   shell:
-    runs-on: [self-hosted, linux, linux-ci]
-    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 2
-      # Skips on a pull request that changes no shell.
-      # Only a pull request is narrowed; the filter reads the PR's file list from the API. If it
-      # cannot (continue-on-error), `want` falls back to running everything, as do a push to main
-      # and a manual run.
-      - uses: dorny/paths-filter@v4
-        id: changes
-        if: github.event_name == 'pull_request'
-        continue-on-error: true
-        with:
-          predicate-quantifier: every
-          filters: |
-            code:
-              - '**'
-              - '!**/*.md'
-              - '!docs/**'
-              - '!**/*.py'
-              - '!tests/**'
-      - id: want
-        env:
-          EVENT: ${{ github.event_name }}
-          OUTCOME: ${{ steps.changes.outcome }}
-          CODE: ${{ steps.changes.outputs.code }}
-        run: |
-          if [ "$EVENT" != pull_request ] || [ "$OUTCOME" != success ] || [ "$CODE" = true ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "code=false" >> "$GITHUB_OUTPUT"
-          fi
-      # shellcheck and PowerShell 7 are installed when the runner lacks them (the gate skips the
-      # PowerShell parse when pwsh is missing, so CI installs it to keep that check real).
-      - if: steps.want.outputs.code == 'true'
-        run: |
-          if ! command -v shellcheck >/dev/null; then
-            sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
-          fi
-          if ! command -v pwsh >/dev/null; then
-            v=7.4.6
-            curl -fsSL "https://github.com/PowerShell/PowerShell/releases/download/v$v/powershell-$v-linux-x64.tar.gz" -o "$RUNNER_TEMP/pwsh.tgz"
-            mkdir -p "$HOME/.local/pwsh" && tar -xzf "$RUNNER_TEMP/pwsh.tgz" -C "$HOME/.local/pwsh"
-            chmod +x "$HOME/.local/pwsh/pwsh"
-            echo "$HOME/.local/pwsh" >> "$GITHUB_PATH"
-          fi
-      - if: steps.want.outputs.code == 'true'
-        run: scripts/gate.sh shell
+          persist-credentials: false
+      - run: scripts/gate.sh shell
 
   # ci_shard.py and the steal queue decide which tests every downstream run executes, so a bug here
   # silently drops tests rather than failing them.
   python:
-    runs-on: [self-hosted, linux, linux-ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v7
+      - run: scripts/gate.sh python
+
+  actionlint:
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 2
-      # Skips on a docs-only pull request.
-      # Only a pull request is narrowed; the filter reads the PR's file list from the API. If it
-      # cannot (continue-on-error), `want` falls back to running everything, as do a push to main
-      # and a manual run.
-      - uses: dorny/paths-filter@v4
-        id: changes
-        if: github.event_name == 'pull_request'
-        continue-on-error: true
-        with:
-          predicate-quantifier: every
-          filters: |
-            code:
-              - '**'
-              - '!**/*.md'
-              - '!docs/**'
-      - id: want
-        env:
-          EVENT: ${{ github.event_name }}
-          OUTCOME: ${{ steps.changes.outcome }}
-          CODE: ${{ steps.changes.outputs.code }}
-        run: |
-          if [ "$EVENT" != pull_request ] || [ "$OUTCOME" != success ] || [ "$CODE" = true ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "code=false" >> "$GITHUB_OUTPUT"
-          fi
-      - if: steps.want.outputs.code == 'true'
-        uses: astral-sh/setup-uv@v7
-      - if: steps.want.outputs.code == 'true'
-        run: scripts/gate.sh python
+          persist-credentials: false
+      # The release script is fetched by version tag from the actionlint repo.
+      - run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+      - run: ./actionlint -color
 
   ci-ok:
     if: always()
-    needs: [shell, python]
-    runs-on: [self-hosted, linux, linux-ci]
+    needs: [shell, python, actionlint]
+    runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      # Passes only when every needed job succeeded or was skipped (a docs-only PR skips work).
+      # Passes only when every needed job succeeded.
       - env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
           echo "$NEEDS" | python3 -c '
           import json, sys
-          bad = {k: v["result"] for k, v in json.load(sys.stdin).items() if v["result"] not in ("success", "skipped")}
+          bad = {k: v["result"] for k, v in json.load(sys.stdin).items() if v["result"] != "success"}
           if bad:
               sys.exit("not green: %s" % bad)
           print("all needed jobs passed")'
