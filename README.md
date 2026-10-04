@@ -92,6 +92,7 @@ In `.github/ISSUE_TEMPLATE/config.yml`, point the security-advisory URL at your 
 | Name | Used by | Meaning |
 | --- | --- | --- |
 | `GITRUNNER_ORG` (required) | `runner`/`rp`, `win/build.sh`, `mac/build-local.sh`, `scripts/deploy.sh`, `compose.yaml` | Your GitHub org. Baked into the Mac and Windows installers at build time (the Mac pkg writes it to `/usr/local/mac-runners/org`); `GITRUNNER_APP_ORG` overrides it for the App lookup |
+| `RUNNERPOOL_SELF_HOSTED` (Actions variable) | `admin*.yml`, `build*.yml`, `deploy.yml` | Set to `true` in your own repo to enable the workflows that need your self-hosted runners and secrets. Unset (forks, fresh clones) they are skipped. This repo's own `ci.yml` runs on GitHub-hosted `ubuntu-latest` and needs no setup |
 | `GITRUNNER_REPO` | `runner` | Repo holding the Admin workflows; default `<org>/runnerpool` |
 | `GITRUNNER_BUNDLE_ID` | Mac build, `mac/gitrunner` | launchd label prefix and pkg id; default `io.github.git-runner.mac-runners`. Also settable as an Actions variable for `build.yml` |
 | `DEPLOY_HOST`, `REMOTE_CONTEXT` | `scripts/*.sh` | ssh target and Docker context of the dashboard server |

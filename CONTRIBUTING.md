@@ -26,6 +26,11 @@ Fork, branch, open a PR against `main`, and wait for CI (the single `ci-ok` chec
 changed and how you tested it; say plainly if it was only build-tested or not run on real hardware (the
 Windows side and the Mac installer package are in that state today, see the README).
 
+CI runs on GitHub-hosted runners with a read-only token and no secrets, so it works on fork PRs. The
+admin, build and deploy workflows need self-hosted runners and secrets; they are skipped unless the repo
+variable `RUNNERPOOL_SELF_HOSTED` is `true`, so your fork never runs them. Do not change them to run on
+`pull_request`, and never add `pull_request_target` with a checkout of PR code.
+
 ## Security issues
 
 Do not file them publicly: see [SECURITY.md](SECURITY.md).

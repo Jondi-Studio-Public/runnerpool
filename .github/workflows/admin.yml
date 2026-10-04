@@ -75,6 +75,7 @@ env:
 
 jobs:
   admin:
+    if: ${{ vars.RUNNERPOOL_SELF_HOSTED == 'true' }} # inert until the owner sets this repo variable (forks never have it)
     runs-on: [self-hosted, macOS, mac-admin, "${{ inputs.host }}"]
     timeout-minutes: 20
     env:

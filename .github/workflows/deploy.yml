@@ -23,8 +23,9 @@ permissions:
 
 jobs:
   deploy:
+    # Inert until the owner sets the repo variable RUNNERPOOL_SELF_HOSTED=true (forks never have it).
     # From CI only when it passed on a push to main, never for a pull request's run.
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    if: vars.RUNNERPOOL_SELF_HOSTED == 'true' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'))
     runs-on: [self-hosted, linux, linux-ci]
     timeout-minutes: 20
     env:

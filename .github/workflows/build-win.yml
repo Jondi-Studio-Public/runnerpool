@@ -23,6 +23,7 @@ concurrency:
 
 jobs:
   build:
+    if: ${{ vars.RUNNERPOOL_SELF_HOSTED == 'true' }} # inert until the owner sets this repo variable (forks never have it)
     runs-on: [self-hosted, linux, linux-ci]
     timeout-minutes: 10
     steps:
