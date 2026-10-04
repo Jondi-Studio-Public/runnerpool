@@ -55,7 +55,7 @@ jobs:
           else echo "::error::Set the CI_APP_ID and CI_APP_PRIVATE_KEY secrets (or RUNNER_PAT) first (see README)."; exit 1; fi
           [ -n "$TS_AUTHKEY" ] || echo "::warning::No TS_AUTHKEY secret: Macs will not join Tailscale (no SSH fallback)."
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # A Mac runner may have no gh: fetch it into the job.
       - name: Install gh
@@ -67,7 +67,7 @@ jobs:
           unzip -q -o -j "$RUNNER_TEMP/gh.zip" "gh_${VERSION}_macOS_arm64/bin/gh" -d "$RUNNER_TEMP"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: false

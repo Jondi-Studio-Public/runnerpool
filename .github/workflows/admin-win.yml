@@ -89,7 +89,7 @@ jobs:
       - name: Mask token
         run: if ($env:TOKEN) { Write-Host "::add-mask::$env:TOKEN" }
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         if: inputs.action == 'update-winrunner'
 
       - name: ${{ inputs.action }}

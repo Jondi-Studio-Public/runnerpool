@@ -92,7 +92,7 @@ jobs:
       - name: Mask token
         run: '[ -z "$TOKEN" ] || echo "::add-mask::$TOKEN"'
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         if: inputs.action == 'update-macrunner' || inputs.action == 'linux-vm-on'
 
       - name: ${{ inputs.action }}
