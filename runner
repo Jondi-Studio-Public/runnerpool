@@ -1,0 +1,443 @@
+#!/usr/bin/env bash
+# runner: manage the Mac CI runners from the PC (Git Bash, or runner.cmd from PowerShell or cmd;
+# `gh` must be signed in).
+# Every action runs on the Mac through this repo's Admin workflow; tokens are minted here,
+# used within seconds, and never stored. `runner help` lists the commands.
+set -euo pipefail
+
+# GITRUNNER_ORG: the GitHub org that owns the runners (required); GITRUNNER_REPO: the repo this tool lives in.
+ORG=${GITRUNNER_ORG:?set GITRUNNER_ORG to your GitHub org, e.g. example-org}
+REPO=${GITRUNNER_REPO:-$ORG/runnerpool}
+CI_REPO=$ORG     # the Macs' CI runners are org-level: every repo in the org can use them
+START_WAIT=120        # seconds an admin job may sit queued before the Mac counts as offline
+
+die() { echo "runner: $*" >&2; exit 1; }
+# OWNER/REPO is a repo's runners, a bare ORG the org's.
+api_path() { case $1 in */*) echo "repos/$1" ;; *) echo "orgs/$1" ;; esac; }
+reg_token() { gh api -X POST "$(api_path "$1")/actions/runners/registration-token" --jq .token; }
+rm_token() { gh api -X POST "$(api_path "$1")/actions/runners/remove-token" --jq .token; }
+check_host() { [[ "${1:-}" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "host must look like air-1, win-1 or wsl-1"; }
+# win-N is a Windows PC, wsl-N a Linux box (the PC's WSL runners), air-N-vm the Linux VM on a Mac (a Linux box too), anything else a Mac: each has
+# its own Admin workflow and tool.
+is_win() { [[ "${1:-}" == win-* ]]; }
+is_wsl() { [[ "${1:-}" == wsl-* || "${1:-}" == *-vm ]]; }   # air-1-vm is the Linux VM on Mac air-1
+mac_only() { if is_win "$1" || is_wsl "$1"; then die "$2 is for Macs only ($1 is not a Mac)"; fi; }
+
+# find_run WORKFLOW REQUEST -> run id (the run-name carries the request id)
+find_run() {
+  local id
+  for _ in $(seq 1 30); do
+    id=$(gh run list -R "$REPO" --workflow "$1" -L 20 --json databaseId,displayTitle \
+      --jq ".[] | select(.displayTitle | contains(\"($2)\")) | .databaseId" | head -1)
+    [ -n "$id" ] && { echo "$id"; return; }
+    sleep 2
+  done
+  die "the $1 run did not appear"
+}
+
+# Prints the named step's output, without the script echo and group markers.
+step_output() {  # run-id step-name
+  gh run view "$1" -R "$REPO" --log 2>/dev/null |
+    awk -F'\t' -v s="$2" '$2 == s { sub(/^[^ ]+ /, "", $3); print $3 }' |
+    grep -vE $'^\e\\[36;1m|^##\\[(end)?group\\]|^shell: |^env:|^  [A-Z_]+: ' || true
+}
+
+# admin HOST ACTION [key=value ...]: run one Admin action on a Mac and show its output.
+admin() {
+  local host=$1 action=$2 req id status workflow=admin.yml
+  shift 2
+  check_host "$host"
+  if is_win "$host"; then
+    workflow=admin-win.yml
+    [ "$action" = update-macrunner ] && action=update-winrunner
+  elif is_wsl "$host"; then
+    workflow=admin-wsl.yml
+    [ "$action" = update-macrunner ] && action=update-linuxrunner
+  fi
+  req="$(date +%s)-$RANDOM"
+  local fields=(-f "host=$host" -f "action=$action" -f "request=$req")
+  for kv in "$@"; do fields+=(-f "$kv"); done
+  # MACS_REF=<branch> runs the Admin workflow (and `update`'s macrunner) from that branch.
+  gh workflow run "$workflow" -R "$REPO" ${MACS_REF:+--ref "$MACS_REF"} "${fields[@]}" >/dev/null
+  id=$(find_run "$workflow" "$req")
+  echo "$action on $host: https://github.com/$REPO/actions/runs/$id"
+  for _ in $(seq 1 $((START_WAIT / 5))); do
+    status=$(gh run view "$id" -R "$REPO" --json jobs --jq '.jobs[0].status // "queued"')
+    [ "$status" != queued ] && break
+    sleep 5
+  done
+  if [ "$status" = queued ]; then
+    gh run cancel "$id" -R "$REPO" >/dev/null 2>&1 || true
+    if is_win "$host" || is_wsl "$host"; then die "$host did not pick the job up in ${START_WAIT}s: it is off, asleep or offline."; fi
+    die "$host did not pick the job up in ${START_WAIT}s: it is off, asleep, offline or locked after a reboot (FileVault). Try: runner ssh $host"
+  fi
+  local rc=0
+  gh run watch "$id" -R "$REPO" --exit-status >/dev/null 2>&1 || rc=$?
+  step_output "$id" "$action"
+  [ "$rc" = 0 ] || die "$action failed on $host (exit $rc): https://github.com/$REPO/actions/runs/$id"
+}
+
+# cred_secrets_ok SECRET_LIST: the repo has the CI GitHub App's secrets (CI_APP_ID and CI_APP_PRIVATE_KEY), or else RUNNER_PAT.
+# Every Actions secret this repo can read: its own (gh secret list) and the org's shared with it (CI_APP_* are org
+# secrets), one name per line at the start.
+secret_names() {
+  gh secret list -R "$REPO"
+  gh api "repos/$REPO/actions/organization-secrets" --paginate --jq '.secrets[].name' 2>/dev/null || true
+}
+cred_secrets_ok() {
+  { grep -q '^CI_APP_ID' <<<"$1" && grep -q '^CI_APP_PRIVATE_KEY' <<<"$1"; } || grep -q '^RUNNER_PAT' <<<"$1"
+}
+CRED_HINT="set the CI_APP_ID and CI_APP_PRIVATE_KEY secrets (or RUNNER_PAT) first (see README)"
+
+LINK=https://github.com/$REPO/releases/download/installer/git-runner-mac.pkg
+WIN_LINK=https://github.com/$REPO/releases/download/installer/win-runners.ps1
+
+cmd_build() {  # build true|false: build and check a test package on a Mac runner, or publish the installer
+  local test=$1 req id secrets
+  secrets=$(secret_names)
+  cred_secrets_ok "$secrets" || die "$CRED_HINT"
+  grep -q '^TS_AUTHKEY' <<<"$secrets" ||
+    echo "warning: no TS_AUTHKEY secret, so Macs will not join Tailscale (no SSH fallback)."
+  req="$(date +%s)-$RANDOM"
+  gh workflow run build.yml -R "$REPO" -f "test=$test" -f "request=$req" >/dev/null
+  id=$(find_run build.yml "$req")
+  echo "building: https://github.com/$REPO/actions/runs/$id"
+  local rc=0
+  gh run watch "$id" -R "$REPO" --exit-status >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 0 ] || die "build failed: https://github.com/$REPO/actions/runs/$id"
+  if [ "$test" = true ]; then
+    step_output "$id" "Check the test package" | tail -25
+    echo "test package checks passed"
+    return
+  fi
+  echo "published."
+  cmd_link
+}
+
+# op_ref NAME -> the op:// reference for secret NAME: $OP_<NAME> if set, else op-secrets.conf.
+op_ref() {
+  local var="OP_$1" key val
+  if [ -n "${!var+x}" ]; then printf '%s' "${!var}"; return; fi
+  [ -f "$here/op-secrets.conf" ] || return 0
+  while IFS='=' read -r key val || [ -n "$key" ]; do  # a last line without a newline counts too
+    [ "$key" = "$1" ] && { printf '%s' "${val%$'\r'}"; return; }
+  done < "$here/op-secrets.conf"
+}
+
+# op_secret NAME: set NAME from 1Password unless it is already set. Stays empty (so the
+# caller prompts) when op is missing, no reference is configured, or the read fails. The
+# value only ever goes from op's output into the variable: never onto a command line or disk.
+op_secret() {
+  local ref val
+  [ -n "${!1:-}" ] && return
+  ref=$(op_ref "$1")
+  [ -n "$ref" ] || return 0
+  if ! command -v op >/dev/null 2>&1; then
+    echo "1Password CLI (op) not found, so asking for $1 instead." >&2; return 0
+  fi
+  [[ "$ref" == op://* ]] || { echo "ignoring $1 reference: it must start with op://" >&2; return 0; }
+  if val=$(MSYS_NO_PATHCONV=1 op read --no-newline "$ref") && [ -n "$val" ]; then
+    printf -v "$1" '%s' "$val"
+    echo "$1: read from 1Password ($ref)"
+  else
+    echo "could not read $1 from 1Password ($ref), so asking instead." >&2
+  fi
+}
+
+# op_app_secrets: set CI_APP_ID and CI_APP_KEY_B64 (the PEM as one base64 line) from 1Password / the environment, or leave
+# both empty (then the build carries RUNNER_PAT). CI_APP_PRIVATE_KEY in the environment counts too.
+op_app_secrets() {
+  CI_APP_ID=${CI_APP_ID:-}; CI_APP_KEY_B64=${CI_APP_KEY_B64:-}
+  if [ -z "$CI_APP_KEY_B64" ]; then
+    op_secret CI_APP_ID
+    op_secret CI_APP_PRIVATE_KEY
+    if [ -n "${CI_APP_PRIVATE_KEY:-}" ]; then CI_APP_KEY_B64=$(printf '%s' "$CI_APP_PRIVATE_KEY" | base64 | tr -d '\r\n'); fi
+    unset CI_APP_PRIVATE_KEY
+  fi
+  if [ -z "$CI_APP_ID" ] || [ -z "$CI_APP_KEY_B64" ]; then CI_APP_ID=""; CI_APP_KEY_B64=""; fi
+}
+
+# build-local [--dry]: build the installer on this PC (Ubuntu WSL, mac/build-local.sh) and
+# upload it to the installer release, using no GitHub Actions minutes. The GitHub App's id and key
+# (1Password item Dev/CI GitHub App, op-secrets.conf) go into the package; without them it carries the
+# RUNNER_PAT token, from 1Password or a hidden prompt. The Tailscale key likewise. They pass into WSL
+# through the environment (the PEM base64-encoded on one line), and the local copy is deleted after upload.
+# --dry builds with placeholders and uploads nothing.
+cmd_build_local() {
+  local dry=${1:-} here out
+  here=$(cd "$(dirname "$0")" && pwd)
+  out=$here/out
+  mkdir -p "$out"
+  if [ "$dry" != --dry ]; then
+    op_app_secrets
+    [ -n "${CI_APP_KEY_B64:-}" ] || op_secret RUNNER_PAT
+    op_secret TS_AUTHKEY
+    if [ -z "${CI_APP_KEY_B64:-}" ] && [ -z "${RUNNER_PAT:-}" ]; then read -rsp "GitHub token (RUNNER_PAT), hidden: " RUNNER_PAT; echo; fi
+    if [ -z "${TS_AUTHKEY:-}" ]; then read -rsp "Tailscale auth key (TS_AUTHKEY), hidden, Enter to skip: " TS_AUTHKEY; echo; fi
+    [ -n "${CI_APP_KEY_B64:-}" ] || [ -n "${RUNNER_PAT:-}" ] || die "a GitHub App key or a token is required"
+    export RUNNER_PAT TS_AUTHKEY CI_APP_ID CI_APP_KEY_B64
+    export WSLENV="${WSLENV:+$WSLENV:}RUNNER_PAT:TS_AUTHKEY:CI_APP_ID:CI_APP_KEY_B64"
+  fi
+  export GITRUNNER_ORG GITRUNNER_BUNDLE_ID
+  export WSLENV="${WSLENV:+$WSLENV:}GITRUNNER_ORG:GITRUNNER_BUNDLE_ID"
+  MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu -- bash "/mnt$(cygpath -u "$here")/mac/build-local.sh" \
+    "/mnt$(cygpath -u "$out")" ${dry:+"$dry"} </dev/null || die "local build failed"
+  [ -s "$out/git-runner-mac.pkg" ] || die "no package was built"
+  if [ "$dry" = --dry ]; then
+    echo "dry build: $out/git-runner-mac.pkg (placeholder token; not uploaded)"
+    return
+  fi
+  gh release view installer -R "$REPO" >/dev/null 2>&1 ||
+    gh release create installer -R "$REPO" --title "Mac installer" --latest \
+      --notes "One installer for every Mac: download git-runner-mac.pkg, then Open Anyway and Install." >/dev/null
+  gh release upload installer "$out/git-runner-mac.pkg" -R "$REPO" --clobber
+  rm -f "$out/git-runner-mac.pkg"
+  echo "uploaded; the local copy is deleted."
+  cmd_link
+}
+
+# publish-win: rebuild the Windows installer in CI (plain text on the linux-ci pool, seconds).
+cmd_build_win() {
+  local req id
+  cred_secrets_ok "$(secret_names)" || die "$CRED_HINT"
+  req="$(date +%s)-$RANDOM"
+  gh workflow run build-win.yml -R "$REPO" ${MACS_REF:+--ref "$MACS_REF"} -f "request=$req" >/dev/null
+  id=$(find_run build-win.yml "$req")
+  echo "building: https://github.com/$REPO/actions/runs/$id"
+  gh run watch "$id" -R "$REPO" --exit-status >/dev/null 2>&1 || die "build failed: https://github.com/$REPO/actions/runs/$id"
+  echo "published: $WIN_LINK"
+}
+
+# build-win [--dry]: the same build on this PC (win/build.sh), the GitHub App key (or the RUNNER_PAT token)
+# from 1Password or a hidden prompt, uploaded to the installer release; --dry builds with a placeholder and
+# uploads nothing.
+cmd_build_win_local() {
+  local dry=${1:-} here out
+  here=$(cd "$(dirname "$0")" && pwd)
+  out=$here/out
+  mkdir -p "$out"
+  if [ "$dry" != --dry ]; then
+    op_app_secrets
+    [ -n "${CI_APP_KEY_B64:-}" ] || op_secret RUNNER_PAT
+    if [ -z "${CI_APP_KEY_B64:-}" ] && [ -z "${RUNNER_PAT:-}" ]; then read -rsp "GitHub token (RUNNER_PAT), hidden: " RUNNER_PAT; echo; fi
+    [ -n "${CI_APP_KEY_B64:-}" ] || [ -n "${RUNNER_PAT:-}" ] || die "a GitHub App key or a token is required"
+    export RUNNER_PAT CI_APP_ID CI_APP_KEY_B64
+  fi
+  "$here/win/build.sh" "$out" ${dry:+"$dry"} </dev/null || die "windows build failed"
+  if [ "$dry" = --dry ]; then
+    echo "dry build: $out/win-runners.ps1 (placeholder token; not uploaded)"
+    return
+  fi
+  gh release view installer -R "$REPO" >/dev/null 2>&1 ||
+    gh release create installer -R "$REPO" --title "Installers" --latest \
+      --notes "Installers for every Mac (git-runner-mac.pkg) and Windows PC (win-runners.ps1)." >/dev/null
+  gh release upload installer "$out/win-runners.ps1" -R "$REPO" --clobber
+  rm -f "$out/win-runners.ps1"
+  echo "uploaded; the local copy is deleted: $WIN_LINK"
+}
+
+cmd_link() {
+  cat <<EOF
+Installer (same link for every Mac, signed in to GitHub): $LINK
+On each Mac:
+  1. Open the link; git-runner-mac.pkg lands in Downloads.
+  2. Double-click it. macOS blocks it (unsigned): System Settings > Privacy & Security > "Open Anyway".
+  3. Double-click it again > Continue > Install > your Mac password.
+  4. Delete the .pkg from Downloads: it holds the GitHub App key (or token) and Tailscale key.
+The first Mac becomes air-1, the next air-2. Then from here: runner list, runner doctor air-1
+
+Windows PC installer (same link for every PC, signed in to GitHub): $WIN_LINK
+On each PC (PowerShell):
+  1. Download win-runners.ps1 from the link.
+  2. Unblock-File .\win-runners.ps1
+  3. powershell -ExecutionPolicy Bypass -File .\win-runners.ps1   (it asks for administrator rights)
+  4. Delete win-runners.ps1: it holds the GitHub App key (or token).
+The first PC becomes win-1, the next win-2. Then from here: runner list, runner doctor win-1
+EOF
+}
+
+# rotate-token: after `gh secret set RUNNER_PAT`, give every Mac the new token and rebuild the
+# installer. Revoke the old token on GitHub once this reports success.
+cmd_rotate_token() {
+  local hosts h failed=0
+  hosts=$(gh api "repos/$REPO/actions/runners" --jq '.runners[] | select(.name | test("^(air|win)-[0-9]+-admin$")) | .name | sub("-admin$"; "")')
+  [ -n "$hosts" ] || die "no Macs registered"
+  for h in $hosts; do admin "$h" rotate-token || failed=1; done
+  cmd_build false
+  cmd_build_win
+  [ "$failed" = 0 ] || die "some Macs kept the old token; run runner rotate-token again when they are on"
+  echo "every Mac has the new token: revoke the old one at https://github.com/settings/personal-access-tokens"
+}
+
+# set-app: switch every Mac and PC to the CI GitHub App (repo secrets CI_APP_ID and CI_APP_PRIVATE_KEY): update the
+# tool on each (it needs set-app), install the App's id and key there (checked, and the PAT deleted, on the device),
+# then rebuild both installers so new devices start on the App. Re-run it for devices that were off. Revoke RUNNER_PAT
+# once `runner status HOST` shows "GitHub App" on every device.
+cmd_set_app() {
+  local hosts h failed=0 secrets
+  secrets=$(secret_names)
+  { grep -q '^CI_APP_ID' <<<"$secrets" && grep -q '^CI_APP_PRIVATE_KEY' <<<"$secrets"; } ||
+    die "set the CI_APP_ID and CI_APP_PRIVATE_KEY secrets first (see README)"
+  hosts=$(gh api "repos/$REPO/actions/runners" --jq '.runners[] | select(.name | test("^(air|win)-[0-9]+-admin$")) | .name | sub("-admin$"; "")')
+  [ -n "$hosts" ] || die "no Macs or PCs registered"
+  for h in $hosts; do
+    # a subshell, because admin() exits the script when a device is off or the action fails
+    ( admin "$h" update-macrunner && admin "$h" set-app ) || failed=1
+  done
+  cmd_build false
+  cmd_build_win
+  [ "$failed" = 0 ] || die "some devices kept their old credential; run runner set-app again when they are on"
+  echo "every Mac and PC mints App tokens: check with runner status HOST, then revoke RUNNER_PAT at https://github.com/settings/personal-access-tokens"
+}
+
+cmd_list() {
+  local r
+  for r in "$CI_REPO" "$REPO"; do
+    echo "== $r"
+    gh api "$(api_path "$r")/actions/runners" --jq '.runners[] |
+      "  \(.name)\t\(.status)\(if .busy then " (busy)" else "" end)\t\([.labels[].name] | join(","))"' |
+      column -t -s $'\t' 2>/dev/null || true
+  done
+}
+
+# dashboard: a control panel in the browser, served on this PC only (127.0.0.1). It reads the
+# Macs over Tailscale SSH and GitHub's runner list, and changes settings over SSH, falling back
+# to the Admin workflow (this script) when SSH can't reach a Mac. PC runners are shown, never
+# touched. Needs Python 3.8+ (python, py or uv); Ctrl+C stops it.
+cmd_dashboard() {
+  local here py
+  here=$(cd "$(dirname "$0")" && pwd)
+  for py in python3 python py; do
+    command -v "$py" >/dev/null 2>&1 &&
+      "$py" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1 && break
+    py=""
+  done
+  export MACS_SCRIPT=$here/runner MACS_BASH=$BASH
+  if command -v cygpath >/dev/null 2>&1; then  # Git Bash: Windows Python wants Windows paths
+    MACS_SCRIPT=$(cygpath -w "$MACS_SCRIPT"); MACS_BASH=$(cygpath -w "$BASH")
+    # Prefer Git's bin\bash.exe launcher, which sets up PATH itself, over usr\bin\bash ($BASH).
+    local gitbash
+    gitbash="$(cygpath -w /)\\bin\\bash.exe"
+    [ -f "$gitbash" ] && MACS_BASH=$gitbash
+  fi
+  if [ -n "$py" ]; then exec "$py" "$here/dashboard/server.py" "$@"; fi
+  command -v uv >/dev/null 2>&1 && exec uv run --no-project --python 3.12 "$here/dashboard/server.py" "$@"
+  die "the dashboard needs Python 3.8 or newer: winget install Python.Python.3.12 (or install uv)"
+}
+
+usage() {
+  cat <<'EOF'
+runner: manage the Mac and Windows CI runners from this PC
+
+  runner list                         every runner of the org and its admin repo, online or not
+  runner link                         the installers' download links and install steps (Mac and Windows)
+  runner publish                      rebuild the installer (after changing mac/ or a secret)
+  runner build-local [--dry]          build it on this PC (WSL) and upload it: no Actions minutes
+  runner test                         build a test package on a Mac runner and check its contents
+  runner publish-win                  rebuild the Windows installer (after changing win/ or a secret)
+  runner build-win [--dry]            build it on this PC and upload it (the token from 1Password)
+  runner rotate-token                 give every Mac and PC the new RUNNER_PAT secret (switches a device back to the PAT), rebuild both installers
+  runner set-app                      switch every Mac and PC to the CI GitHub App (CI_APP_ID, CI_APP_PRIVATE_KEY secrets), rebuild both installers
+  runner dashboard                    open the control panel in the browser (specs, state, settings)
+  runner status HOST                  power, sleep, thermal, disk, Tailscale, runners
+  runner info HOST                    the dashboard's facts about HOST, as JSON
+  runner doctor HOST                  status plus checks
+  runner logs HOST [RUNNER]           recent service log and runner diagnostics
+  runner restart HOST                 restart the CI runner
+  runner reregister HOST              fresh registration of the CI runner
+  runner remove HOST                  unregister the CI runner
+  runner add HOST OWNER/REPO LABELS NAME   register another runner on HOST for another repo
+  runner drop HOST OWNER/REPO NAME    unregister a runner added with `add`
+  runner update HOST                  install this repo's macrunner / winrunner / linuxrunner on HOST
+  runner battery HOST pause|run       pause CI on battery (default) or run it anyway
+  runner ramdisk HOST on [GB]|off     CI workspace on a RAM disk (default 4 GB; 16 GB Macs only)
+  runner linux-vm HOST on [--cpus N] [--memory GB] [--disk GB] [--no-admin]
+                                      an ARM64 Linux VM on a Mac with one linux-ci runner (air-N-vm-1) that takes turns with the Mac's own; run `runner update HOST` first
+  runner linux-vm HOST off|status     stop the VM (CI finishes its job first) / show it
+  runner postgres HOST                install Postgres 16 in /opt/postgres16 (Macs; for integration tests)
+  runner ci HOST on|off               CI takes jobs, or finishes its job and stops (stays off)
+  runner cores HOST N|all             CI jobs may use N cores (CI_MAX_CORES, lower priority); all = no limit
+  runner slots HOST hold|release [NAME [TIMEOUT]]
+                                      a VM or container (default NAME claude-vm) holds one PC slot / gives it back; hold waits for a free
+                                      slot (TIMEOUT s, 0 = forever; exit 3 = timed out, 2 = bad usage) and is a 10 min lease: repeat it to keep it
+  runner slots HOST N|off [THREADS]   any device, changed live (running jobs are never stopped): PC (win-1) and WSL: at most N CI jobs at once
+                                      across the PC's Windows and Linux runners, each on THREADS CPUs (default 8), default off; Mac (air-1):
+                                      N jobs at once across the native runner and its Linux VM, default 1 (take turns), off = no gating
+  runner limit HOST RUNNER cores=<N|default> ram=<MB|default>
+                                      one runner's own limits (either may be left out); they win over `cores`;
+                                      RAM is advisory on Macs and Windows, a systemd MemoryMax cap on Linux
+  runner tailscale HOST               re-join Tailscale with the current TS_AUTHKEY secret
+  runner ssh HOST [COMMAND]           Tailscale SSH as root (when the admin runner is down)
+
+HOST is a Mac (air-1), a Windows PC (win-1) or a Linux box such as the PC's WSL runners (wsl-1); a Mac's Linux VM is air-1-vm (see linux-vm). ramdisk, postgres, linux-vm, tailscale and ssh are Mac-only; slots is for the PC (win-N, wsl-N). linux-vm is air-1-vm style: `runner linux-vm air-1 on`.
+MACS_REF=<branch> runs a Mac action from that branch of this repo. `runner ssh HOST sudo macrunner help` lists what runs on the Mac.
+EOF
+}
+
+cmd=${1:-help}
+shift || true
+case $cmd in
+  list) cmd_list ;;
+  link) cmd_link ;;
+  publish) cmd_build false ;;
+  build-local) cmd_build_local "$@" ;;
+  test) cmd_build true ;;
+  publish-win) cmd_build_win ;;
+  build-win) cmd_build_win_local "$@" ;;
+  rotate-token) cmd_rotate_token ;;
+  set-app) cmd_set_app ;;
+  dashboard) cmd_dashboard "$@" ;;
+  status|doctor|info) [ $# -eq 1 ] || die "$cmd HOST"; admin "$1" "$cmd" ;;
+  logs) [ $# -ge 1 ] || die "logs HOST [RUNNER]"; admin "$1" logs "name=${2:-$1}" ;;
+  restart) [ $# -eq 1 ] || die "restart HOST"; admin "$1" restart-ci ;;
+  reregister) [ $# -eq 1 ] || die "reregister HOST"; admin "$1" reregister-ci "token=$(reg_token "$CI_REPO")" ;;
+  remove) [ $# -eq 1 ] || die "remove HOST"; admin "$1" remove-ci "token=$(rm_token "$CI_REPO")" ;;
+  add) [ $# -eq 4 ] || die "add HOST OWNER/REPO LABELS NAME"
+    admin "$1" add-runner "repo=$2" "labels=$3" "name=$4" "token=$(reg_token "$2")" ;;
+  drop) [ $# -eq 3 ] || die "drop HOST OWNER/REPO NAME"
+    admin "$1" remove-runner "name=$3" "token=$(rm_token "$2")" ;;
+  update) [ $# -eq 1 ] || die "update HOST"; admin "$1" update-macrunner ;;
+  battery) [ $# -eq 2 ] || die "battery HOST pause|run"; admin "$1" "battery-$2" ;;
+  ramdisk) [ $# -ge 2 ] || die "ramdisk HOST on [GB]|off"
+    mac_only "$1" ramdisk
+    case $2 in on) admin "$1" ramdisk-on "size=${3:-4}" ;; off) admin "$1" ramdisk-off ;; *) die "ramdisk HOST on [GB]|off" ;; esac ;;
+  linux-vm) [ $# -ge 2 ] || die "linux-vm HOST on [--cpus N] [--memory GB] [--disk GB] [--no-admin] | off | status"
+    mac_only "$1" linux-vm; h=$1; sub=$2; shift 2
+    case $sub in
+      on) admin "$h" linux-vm-on "size=$*" ;;
+      off|status) [ $# -eq 0 ] || die "linux-vm HOST $sub takes no options"; admin "$h" "linux-vm-$sub" ;;
+      *) die "linux-vm HOST on [--cpus N] [--memory GB] [--disk GB] [--no-admin] | off | status" ;;
+    esac ;;
+  postgres) [ $# -eq 1 ] || die "postgres HOST"; mac_only "$1" postgres; admin "$1" postgres-install ;;
+  ci) [ $# -eq 2 ] && [[ "$2" =~ ^(on|off)$ ]] || die "ci HOST on|off"; admin "$1" "ci-$2" ;;
+  cores) [ $# -eq 2 ] || die "cores HOST N|all"; admin "$1" cores "cores=$2" ;;
+  slots) [ $# -ge 2 ] && [ $# -le 4 ] || die "slots HOST N|off [THREADS] | hold|release [NAME [TIMEOUT]]"
+    case $2 in
+      hold|release)
+        is_win "$1" || die "slots $2 is for the PC (win-N)"
+        [ "$2" = hold ] || [ $# -le 3 ] || die "slots HOST release [NAME]"
+        [[ "${3:-claude-vm}" =~ ^[A-Za-z0-9._-]+$ ]] || die "NAME is letters, digits and . _ -"
+        [[ "${4:-0}" =~ ^[0-9]+$ ]] || die "TIMEOUT is a number of seconds"
+        [ -z "${4:-}" ] || [ -n "${3:-}" ] || die "TIMEOUT needs a NAME"
+        admin "$1" slots "slots=$2${3:+:$3}${4:+:$4}" ;;
+      *)
+        [[ "$2" =~ ^([0-9]+|off)$ ]] || die "slots HOST N|off [THREADS] | hold|release [NAME [TIMEOUT]]"
+        [ $# -le 3 ] || die "slots HOST N|off [THREADS]"
+        [[ "${3:-8}" =~ ^[0-9]+$ ]] || die "THREADS is a number"
+        # a Mac's admin workflow has no spare input: it takes the value in `size`
+        if is_win "$1" || is_wsl "$1"; then admin "$1" slots "slots=$2${3:+:$3}"; else admin "$1" slots "size=$2${3:+:$3}"; fi ;;
+    esac ;;
+  limit) [ $# -ge 3 ] && [ $# -le 4 ] || die "limit HOST RUNNER cores=<N|default> ram=<MB|default>"
+    h=$1; r=$2; shift 2; f=()
+    for kv in "$@"; do
+      case $kv in
+        cores=default|ram=default|cores=[0-9]*|ram=[0-9]*) [[ "$kv" =~ ^(cores|ram)=(default|[0-9]+)$ ]] || die "bad $kv"; f+=("$kv") ;;
+        *) die "limit HOST RUNNER cores=<N|default> ram=<MB|default>" ;;
+      esac
+    done
+    admin "$h" limit "name=$r" "${f[@]}" ;;
+  tailscale) [ $# -eq 1 ] || die "tailscale HOST"; mac_only "$1" tailscale; admin "$1" tailscale-up ;;
+  ssh) [ $# -ge 1 ] || die "ssh HOST [COMMAND]"; check_host "$1"; mac_only "$1" ssh; h=$1; shift; exec ssh "root@$h" "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

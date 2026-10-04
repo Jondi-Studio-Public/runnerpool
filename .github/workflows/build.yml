@@ -1,0 +1,165 @@
+# Builds the Mac installer, git-runner-mac.pkg, on one of our Macs (label mac-ci;
+# installer builds run on your own runners), and publishes it to the
+# `installer` release, whose download link never changes:
+#   https://github.com/<your-org>/runnerpool/releases/download/installer/git-runner-mac.pkg
+# The same package serves every Mac: each one names itself (the lowest free air-N) and
+# registers its runners with the GitHub credential the package carries: the CI GitHub App's id and key (the
+# CI_APP_ID and CI_APP_PRIVATE_KEY secrets; the Mac mints one-hour tokens from them), or, until the App is
+# set up, the RUNNER_PAT secret.
+# Run by hand: `runner publish` after changing the Mac side or a secret.
+# With `test` (`runner test`), the package is built as a test package (an ephemeral admin runner,
+# no CI runner or Tailscale login) and checked by expanding it, never installed: the build
+# machine is a live runner Mac, and installing would replace its own git-runner.
+name: Build installer
+run-name: build${{ inputs.test && ' (test)' || '' }} (${{ inputs.request }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      test:
+        description: Build a test package and check its contents instead of publishing
+        type: boolean
+        default: false
+      request:
+        description: Id the PC uses to find this run
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ inputs.test && 'test' || 'release' }}
+
+env:
+  CI_REPO: ${{ github.repository_owner }} # org-level: the Macs' CI runners serve every repo in the org
+  CI_LABELS: mac-ci-heavy,mac-ci
+  GITRUNNER_BUNDLE_ID: ${{ vars.GITRUNNER_BUNDLE_ID }}   # optional repo variable; default io.github.git-runner.mac-runners
+
+jobs:
+  build:
+    runs-on: [self-hosted, macOS, ARM64, mac-ci]
+    timeout-minutes: 30
+    env:
+      TEST: ${{ inputs.test }}
+    steps:
+      - name: Check secrets
+        env:
+          RUNNER_PAT: ${{ secrets.RUNNER_PAT }}
+          CI_APP_ID: ${{ secrets.CI_APP_ID }}
+          CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          if [ -n "$CI_APP_ID" ] && [ -n "$CI_APP_PRIVATE_KEY" ]; then echo "The package will carry the GitHub App key."
+          elif [ -n "$RUNNER_PAT" ]; then echo "::warning::No CI_APP_ID / CI_APP_PRIVATE_KEY secrets: the package carries RUNNER_PAT."
+          else echo "::error::Set the CI_APP_ID and CI_APP_PRIVATE_KEY secrets (or RUNNER_PAT) first (see README)."; exit 1; fi
+          [ -n "$TS_AUTHKEY" ] || echo "::warning::No TS_AUTHKEY secret: Macs will not join Tailscale (no SSH fallback)."
+
+      - uses: actions/checkout@v5
+
+      # A Mac runner may have no gh: fetch it into the job.
+      - name: Install gh
+        env:
+          VERSION: 2.83.1
+        run: |
+          command -v gh >/dev/null && exit 0
+          curl -sSfL -o "$RUNNER_TEMP/gh.zip" "https://github.com/cli/cli/releases/download/v$VERSION/gh_${VERSION}_macOS_arm64.zip"
+          unzip -q -o -j "$RUNNER_TEMP/gh.zip" "gh_${VERSION}_macOS_arm64/bin/gh" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Build Tailscale (latest release, open-source daemon)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver=$(gh api repos/tailscale/tailscale/releases/latest --jq .tag_name)
+          echo "Tailscale $ver"
+          mkdir -p root/usr/local/mac-runners/bin
+          GOBIN="$PWD/root/usr/local/mac-runners/bin" GOARCH=arm64 \
+            go install "tailscale.com/cmd/tailscale@$ver" "tailscale.com/cmd/tailscaled@$ver"
+          file root/usr/local/mac-runners/bin/*
+
+      - name: Stage the package
+        env:
+          RUNNER_PAT: ${{ secrets.RUNNER_PAT }}
+          CI_APP_ID: ${{ secrets.CI_APP_ID }}
+          CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          install -m 755 mac/gitrunner root/usr/local/mac-runners/gitrunner
+          # Tailscale is BSD-3-Clause and redistributed in the package: ship its licence text.
+          mkdir -p root/usr/local/mac-runners/LICENSES
+          ts_ver=$(gh api repos/tailscale/tailscale/releases/latest --jq .tag_name)
+          curl -fsSL "https://raw.githubusercontent.com/tailscale/tailscale/$ts_ver/LICENSE" -o root/usr/local/mac-runners/LICENSES/tailscale.txt
+          [ -s root/usr/local/mac-runners/LICENSES/tailscale.txt ] || { echo "Tailscale licence text is empty"; exit 1; }
+          install -m 644 THIRD_PARTY_NOTICES.md root/usr/local/mac-runners/LICENSES/THIRD_PARTY_NOTICES.md
+          mkdir -p scripts
+          install -m 755 mac/postinstall scripts/postinstall
+          runner_ver=$(gh api repos/actions/runner/releases/latest --jq .tag_name | sed 's/^v//')
+          env_file=root/usr/local/mac-runners/bootstrap.env
+          {
+            printf 'GITRUNNER_ORG=%q\n' "$GITHUB_REPOSITORY_OWNER"
+            if [ "$TEST" = true ]; then
+              printf 'HOST=%q\n' "test-$GITHUB_RUN_ID"
+              printf 'ADMIN_EPHEMERAL=1\nEXTRA_ADMIN_LABELS=%q\n' "test-$GITHUB_RUN_ID"
+            else
+              printf 'CI_REPO=%q\nCI_LABELS=%q\n' "$CI_REPO" "$CI_LABELS"
+              printf 'TS_AUTHKEY=%q\n' "$TS_AUTHKEY"
+            fi
+            if [ -n "$CI_APP_ID" ] && [ -n "$CI_APP_PRIVATE_KEY" ]; then
+              # the key is multi-line PEM: it travels base64-encoded on one line and is never echoed
+              printf 'ADMIN_REPO=%q\nGITHUB_APP_ID=%q\nGITHUB_APP_KEY_B64=%q\n' "$GITHUB_REPOSITORY" "$CI_APP_ID" \
+                "$(printf '%s' "$CI_APP_PRIVATE_KEY" | base64 | tr -d '\r\n')"
+            else
+              printf 'ADMIN_REPO=%q\nRUNNER_PAT=%q\n' "$GITHUB_REPOSITORY" "$RUNNER_PAT"
+            fi
+            printf 'RUNNER_VERSION=%q\n' "$runner_ver"
+          } > "$env_file"
+          chmod 600 "$env_file"
+
+      - name: Build the package
+        run: |
+          mkdir -p out
+          pkgbuild --root root --scripts scripts --install-location / \
+            --identifier "${GITRUNNER_BUNDLE_ID:-io.github.git-runner.mac-runners}" --version "1.$GITHUB_RUN_NUMBER" \
+            out/git-runner-mac.pkg
+          pkgutil --payload-files out/git-runner-mac.pkg | sed 's/^/  /'
+          ls -lh out
+
+      - name: Check the test package
+        if: env.TEST == 'true'
+        run: |
+          rm -rf "$RUNNER_TEMP/pkg"
+          pkgutil --expand-full out/git-runner-mac.pkg "$RUNNER_TEMP/pkg"
+          payload="$RUNNER_TEMP/pkg/Payload/usr/local/mac-runners"
+          [ -x "$payload/gitrunner" ] || { echo "gitrunner is missing or not executable"; exit 1; }
+          [ -s "$payload/LICENSES/tailscale.txt" ] || { echo "Tailscale licence text is missing"; exit 1; }
+          [ -x "$RUNNER_TEMP/pkg/Scripts/postinstall" ] || { echo "postinstall is missing"; exit 1; }
+          for b in tailscale tailscaled; do
+            file "$payload/bin/$b" | grep -q arm64 || { echo "$b is not an arm64 binary"; exit 1; }
+          done
+          [ "$(stat -f %Lp "$payload/bootstrap.env")" = 600 ] || { echo "bootstrap.env is not 600"; exit 1; }
+          grep -q '^ADMIN_EPHEMERAL=1$' "$payload/bootstrap.env" || { echo "not a test package"; exit 1; }
+          bash -n "$payload/gitrunner"
+          echo "Package contents check out."
+
+      - name: Publish to the installer release
+        if: env.TEST != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view installer >/dev/null 2>&1 ||
+            gh release create installer --title "Mac installer" --latest \
+              --notes "One installer for every Mac: download git-runner-mac.pkg, then Open Anyway and Install."
+          gh release upload installer out/git-runner-mac.pkg --clobber
+          gh release edit installer --notes "One installer for every Mac: download git-runner-mac.pkg, then Open Anyway and Install. Built $(date -u '+%Y-%m-%d %H:%M UTC') from ${GITHUB_SHA::7}."
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/download/installer/git-runner-mac.pkg"
+
+      # The package and its staging tree carry the App key (or RUNNER_PAT), and a self-hosted workspace outlives the job.
+      - name: Delete the build
+        if: always()
+        run: rm -rf out root scripts/postinstall "$RUNNER_TEMP/pkg" "$RUNNER_TEMP/gh.zip"

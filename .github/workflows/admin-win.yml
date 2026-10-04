@@ -1,0 +1,156 @@
+# Remote control for the Windows PCs: the twin of admin.yml. Runs on the chosen PC's admin
+# runner (as SYSTEM), started by `runner <action> <host>` on the control PC, which may mint a
+# token and pass it in; without one the PC mints its own with its stored GitHub token. If the
+# PC is off or asleep the job waits in the queue; `runner` cancels it after two minutes and says
+# so. The admin runner itself is never restarted from here.
+name: Admin (Windows)
+run-name: ${{ inputs.action }} on ${{ inputs.host }} (${{ inputs.request }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "PC's runner name, e.g. win-1"
+        required: true
+      action:
+        type: choice
+        options:
+          - status
+          - doctor
+          - info
+          - logs
+          - restart-ci
+          - reregister-ci
+          - remove-ci
+          - add-runner
+          - remove-runner
+          - update-winrunner
+          - battery-pause
+          - battery-run
+          - ci-on
+          - ci-off
+          - cores
+          - limit
+          - slots
+          - rotate-token
+          - set-app
+        default: status
+      token:
+        description: Registration or removal token, when the action needs one
+        required: false
+      repo:
+        description: add-runner only, owner/name
+        required: false
+      labels:
+        description: add-runner only, comma-separated
+        required: false
+      name:
+        description: add-runner / remove-runner / logs, the runner's name
+        required: false
+      cores:
+        description: cores action a number or all; limit action a number or default (name is the runner)
+        required: false
+      ram:
+        description: limit action only, MB or default
+        required: false
+      slots:
+        description: "slots action only: N, N:THREADS (CPU threads per job, default 8) or off. N CI jobs may run at once on the PC. Also hold[:NAME[:TIMEOUT]] / release[:NAME] for a held slot"
+        required: false
+      request:
+        description: Id the control PC uses to find this run
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CI_REPO: ${{ github.repository_owner }} # org-level: the PCs' CI runners serve every repo in the org
+  CI_LABELS: win-ci
+
+jobs:
+  admin:
+    runs-on: [self-hosted, Windows, win-admin, "${{ inputs.host }}"]
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -File {0}
+    env:
+      HOST: ${{ inputs.host }}
+      ACTION: ${{ inputs.action }}
+      TOKEN: ${{ inputs.token }}
+      REPO: ${{ inputs.repo }}
+      LABELS: ${{ inputs.labels }}
+      NAME: ${{ inputs.name }}
+      CORES: ${{ inputs.cores }}
+      RAM: ${{ inputs.ram }}
+      SLOTS: ${{ inputs.slots }}
+    steps:
+      - name: Mask token
+        run: if ($env:TOKEN) { Write-Host "::add-mask::$env:TOKEN" }
+
+      - uses: actions/checkout@v5
+        if: inputs.action == 'update-winrunner'
+
+      - name: ${{ inputs.action }}
+        env:
+          NEW_GITHUB_TOKEN: ${{ inputs.action == 'rotate-token' && secrets.RUNNER_PAT || '' }}
+          # set-app: the App's id and private key from the CI_APP_ID / CI_APP_PRIVATE_KEY secrets. The key is
+          # multi-line PEM, so it travels base64-encoded; neither value is ever echoed.
+          NEW_APP_ID: ${{ inputs.action == 'set-app' && secrets.CI_APP_ID || '' }}
+          APP_PRIVATE_KEY: ${{ inputs.action == 'set-app' && secrets.CI_APP_PRIVATE_KEY || '' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wr = Join-Path $env:ProgramData 'win-runners\winrunner.ps1'
+          $tok = if ($env:TOKEN) { $env:TOKEN } else { '-' }
+          $nm = if ($env:NAME) { $env:NAME } else { $env:HOST }
+          function WR { & $wr @args; if ($LASTEXITCODE) { exit $LASTEXITCODE } }
+          switch ($env:ACTION) {
+            'status' { WR status }
+            'doctor' { WR doctor }
+            'info' { WR info }
+            'logs' { WR logs $nm 80 }
+            'restart-ci' { WR restart $env:HOST }
+            'reregister-ci' { WR add-runner $env:CI_REPO $env:HOST $env:CI_LABELS $tok ci }
+            'remove-ci' { WR remove-runner $env:HOST $tok }
+            'add-runner' {
+              if (-not $env:REPO -or -not $env:LABELS -or -not $env:NAME) { Write-Host 'add-runner needs repo, labels and name'; exit 1 }
+              if ($env:NAME -like '*-admin') { Write-Host 'names ending -admin are reserved'; exit 1 }
+              WR add-runner $env:REPO $env:NAME $env:LABELS $tok ci
+            }
+            'remove-runner' {
+              if (-not $env:NAME -or $env:NAME -like '*-admin') { Write-Host 'name a CI runner (not the admin runner)'; exit 1 }
+              WR remove-runner $env:NAME $tok
+            }
+            'update-winrunner' { WR self-update (Join-Path $env:GITHUB_WORKSPACE 'win\winrunner.ps1') }
+            'battery-pause' { WR battery pause }
+            'battery-run' { WR battery run }
+            'ci-on' { WR ci on }
+            'ci-off' { WR ci off }
+            'cores' { WR cores $(if ($env:CORES) { $env:CORES } else { 'all' }) }
+            'limit' {
+              if (-not $env:NAME -or $env:NAME -like '*-admin') { Write-Host 'name a CI runner (not the admin runner)'; exit 1 }
+              $lim = @()
+              if ($env:CORES) { $lim += "cores=$env:CORES" }
+              if ($env:RAM) { $lim += "ram=$env:RAM" }
+              WR limit $env:NAME @lim
+            }
+            'slots' {
+              if (-not $env:SLOTS) { Write-Host 'slots needs a number or off'; exit 1 }
+              $sp = $env:SLOTS -split ':'
+              # hold[:NAME[:TIMEOUT]] / release[:NAME]: something outside the runners takes or gives back one PC slot (name defaults to claude-vm)
+              if ($sp[0] -eq 'hold' -or $sp[0] -eq 'release') {
+                $a = @()
+                if ($sp.Count -gt 1 -and $sp[1]) { $a += '-Name', $sp[1] }
+                if ($sp[0] -eq 'hold' -and $sp.Count -gt 2 -and $sp[2]) { $a += '-TimeoutSec', $sp[2] }
+                WR "slots-$($sp[0])" @a
+              } elseif ($sp.Count -gt 1) { WR slots $sp[0] $sp[1] } else { WR slots $sp[0] }
+            }
+            'rotate-token' { WR set-token $env:CI_REPO }
+            'set-app' {
+              if (-not $env:NEW_APP_ID -or -not $env:APP_PRIVATE_KEY) { Write-Host 'set the CI_APP_ID and CI_APP_PRIVATE_KEY secrets first'; exit 1 }
+              $env:NEW_APP_KEY_B64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($env:APP_PRIVATE_KEY))
+              Remove-Item Env:\APP_PRIVATE_KEY
+              WR set-app $env:CI_REPO
+            }
+            default { Write-Host "unknown action $env:ACTION"; exit 1 }
+          }

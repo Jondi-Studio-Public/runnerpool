@@ -1,0 +1,246 @@
+# Reusable: decide where a repo's CI runs and how a full run is split between its PC
+# runners and whichever Mac runners (runner add) are online and plugged in. It runs no tests:
+# the caller keeps its own install and test steps and feeds this job's matrix to them.
+#
+#   plan:
+#     uses: <your-org>/runnerpool/.github/workflows/ci-plan.yml@main
+#     with:
+#       full: ${{ needs.route.outputs.tier == 'full' }}
+#       pc-labels: '["self-hosted","linux","linux-ci"]'
+#       mac-labels: '["self-hosted","macOS","ARM64","mac-ci-heavy"]'
+#     secrets:
+#       RUNNER_STATUS_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
+#       CI_APP_ID: ${{ secrets.CI_APP_ID }}
+#       CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
+#   suite:
+#     needs: plan
+#     if: needs.plan.outputs.target == 'pc'
+#     runs-on: ${{ matrix.runs-on }}
+#     strategy:
+#       matrix:
+#         include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+#
+# Each matrix entry has name, runs-on, workers and shard ("" = the whole suite, else "K,K/N"
+# for ci/ci_shard.py's --shard). Docs: docs/ci-plan.md.
+name: CI plan
+
+on:
+  workflow_call:
+    inputs:
+      full:
+        description: "true when this run is the whole suite; a targeted run is never split"
+        type: boolean
+        default: true
+      target:
+        description: "auto or pc: both mean the PC (a job queues until a PC runner is free or back). There is no hosted option"
+        type: string
+        default: auto
+      pc-labels:
+        description: "JSON array of the PC runners' labels; a runner must carry all of them"
+        type: string
+        required: true
+      mac-labels:
+        description: "JSON array of the Mac runners' labels for this repo"
+        type: string
+        required: true
+      pc-weight:
+        description: "how many shards the PC takes of pc-weight + macs x mac-weight"
+        type: number
+        default: 6
+      mac-weight:
+        description: "how many shards each Mac takes"
+        type: number
+        default: 2
+      mac-max:
+        description: "most Macs one run uses"
+        type: number
+        default: 2
+      plan-runs-on:
+        description: "JSON array of the labels this planning job runs on; it needs only python3"
+        type: string
+        default: '["self-hosted","linux","linux-ci"]'
+      light-slots:
+        description: "how many light (OS-neutral) jobs the caller will place with the light output"
+        type: number
+        default: 4
+      pc-workers:
+        type: number
+        default: 32
+      mac-workers:
+        type: number
+        default: 8
+    secrets:
+      RUNNER_STATUS_TOKEN:
+        description: "token that can list the repo's runners (Administration: read) and, in an org, the org's (Self-hosted runners: read); without it the plan counts no Macs"
+        required: false
+      CI_APP_ID:
+        description: "id of the org's CI GitHub App; with CI_APP_PRIVATE_KEY the plan mints an installation token and uses it instead of RUNNER_STATUS_TOKEN"
+        required: false
+      CI_APP_PRIVATE_KEY:
+        description: "the CI GitHub App's private key (.pem); see CI_APP_ID"
+        required: false
+    outputs:
+      target:
+        description: "always pc (kept so callers can still test it)"
+        value: ${{ jobs.plan.outputs.target }}
+      matrix:
+        description: "JSON matrix for the PC and Mac jobs"
+        value: ${{ jobs.plan.outputs.matrix }}
+      macs:
+        description: "how many Macs the run uses"
+        value: ${{ jobs.plan.outputs.macs }}
+      light:
+        description: "JSON array of light-slots runs-on label arrays: idle online Macs first, then the PC. Use fromJSON(...)[N] as a light job's runs-on"
+        value: ${{ jobs.plan.outputs.light }}
+      mac-first:
+        description: "JSON runs-on labels for a job that can run on either: the Macs when one is online (the job queues if both are busy), else the PC"
+        value: ${{ jobs.plan.outputs.mac-first }}
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ${{ fromJSON(inputs.plan-runs-on) }}
+    timeout-minutes: 5
+    outputs:
+      target: ${{ steps.pick.outputs.target }}
+      matrix: ${{ steps.pick.outputs.matrix }}
+      macs: ${{ steps.pick.outputs.macs }}
+      light: ${{ steps.pick.outputs.light }}
+      mac-first: ${{ steps.pick.outputs.mac-first }}
+    env:
+      HAS_APP: ${{ secrets.CI_APP_ID != '' && secrets.CI_APP_PRIVATE_KEY != '' }}
+    steps:
+      # A JS action: the runner's own node runs it, so the python3-only PC and Mac images are fine.
+      # Both secrets present means an installation token (1 hour, runner lists need no other scope
+      # than the App's permissions); otherwise, or if the App cannot mint one, RUNNER_STATUS_TOKEN.
+      - name: Mint a GitHub App token
+        id: app
+        if: env.HAS_APP == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - name: Pick runners
+        id: pick
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.RUNNER_STATUS_TOKEN }}
+          REQUESTED: ${{ inputs.target }}
+          FULL: ${{ inputs.full }}
+          PC_LABELS: ${{ inputs.pc-labels }}
+          MAC_LABELS: ${{ inputs.mac-labels }}
+          PC_WEIGHT: ${{ inputs.pc-weight }}
+          MAC_WEIGHT: ${{ inputs.mac-weight }}
+          MAC_MAX: ${{ inputs.mac-max }}
+          PC_WORKERS: ${{ inputs.pc-workers }}
+          MAC_WORKERS: ${{ inputs.mac-workers }}
+          LIGHT_SLOTS: ${{ inputs.light-slots }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          # Needs only python3 (the PC's runners have no jq or gh). Listing self-hosted
+          # runners needs RUNNER_STATUS_TOKEN; GITHUB_TOKEN cannot list them.
+          # No secret means no Macs. The target is always the PC: if it is off the job queues.
+          python3 - <<'PY'
+          import json, os, ssl, urllib.request
+
+          env = os.environ
+          target = "pc"
+          macs = 0
+          idle_macs = 0
+          online_macs = 0
+          pc_online = 0
+          if env.get("GH_TOKEN"):
+              def listed(path):
+                  req = urllib.request.Request(
+                      f"https://api.github.com/{path}/actions/runners?per_page=100",
+                      headers={"Authorization": f"Bearer {env['GH_TOKEN']}",
+                               "Accept": "application/vnd.github+json"})
+                  # Apple's python3 (the Macs' Command Line Tools) ships no CA bundle, so
+                  # verification fails there; macOS keeps its own at /etc/ssl/cert.pem.
+                  ctx = None
+                  if os.path.exists("/etc/ssl/cert.pem") and not os.path.exists(ssl.get_default_verify_paths().cafile or ""):
+                      ctx = ssl.create_default_context(cafile="/etc/ssl/cert.pem")
+                  try:
+                      return json.load(urllib.request.urlopen(req, timeout=30, context=ctx))["runners"]
+                  except Exception as err:  # never stall a run on the plan
+                      print(f"could not list {path}'s runners: {err}")
+                      return []
+
+              # The repo's own runners plus the org's, which every repo in the org can use
+              # (the default runner group). A personal account has no org list; that 404 is fine.
+              runners = listed(f"repos/{env['REPO']}") + listed(f"orgs/{env['OWNER']}")
+              # Print what GitHub sees, so a runner that is offline or mislabelled shows here.
+              for r in runners:
+                  labels = ",".join(l["name"] for l in r["labels"])
+                  print(f"{r['name']} status={r['status']} busy={r['busy']} labels={labels}")
+
+              def count(want):
+                  want = {w.lower() for w in json.loads(want)}
+                  # Online is enough: a busy runner queues the job, which beats leaving the
+                  # PC pool. A Mac that is off or unplugged is offline, so it is left out.
+                  return sum(1 for r in runners if r["status"] == "online"
+                             and want <= {l["name"].lower() for l in r["labels"]})
+
+              def idle(want):
+                  want = {w.lower() for w in json.loads(want)}
+                  # The runner running this plan job reports busy but is free the moment the
+                  # plan ends, so it counts as idle (plan-runs-on may be a Mac).
+                  me = env.get("RUNNER_NAME", "")
+                  return sum(1 for r in runners if r["status"] == "online"
+                             and (not r["busy"] or r["name"] == me)
+                             and want <= {l["name"].lower() for l in r["labels"]})
+
+              online, macs = count(env["PC_LABELS"]), count(env["MAC_LABELS"])
+              idle_macs, pc_online = idle(env["MAC_LABELS"]), online
+              online_macs = macs
+              print(f"online PC runners: {online}, online Mac runners: {macs}")
+          else:
+              print("no App token or RUNNER_STATUS_TOKEN: no Macs counted")
+          # auto and pc both mean the PC, and both count the Macs that are online. Nothing
+          # else is accepted: there is no hosted fallback.
+          if env["REQUESTED"] not in ("auto", "pc"):
+              raise SystemExit(f"target must be auto or pc, not {env['REQUESTED']!r}")
+          # A targeted change is never split, and Macs cannot join a run that is not on the PC.
+          full = env["FULL"] == "true"
+          if not (full and target == "pc"):
+              macs = 0
+          # Light jobs (route, ci-ok, lint-sized checks) need no PC: place each on an idle Mac
+          # while one is free, then on the PC. With no PC online they go to a Mac if one is up,
+          # so a job never waits on a machine that is off. Counted before macs is capped.
+          slots = int(env["LIGHT_SLOTS"])
+          mac_l, pc_l = json.loads(env["MAC_LABELS"]), json.loads(env["PC_LABELS"])
+          mac_first = mac_l if online_macs else pc_l
+          light = []
+          for i in range(slots):
+              if i < idle_macs or (not pc_online and macs):
+                  light.append(mac_l)
+              else:
+                  light.append(pc_l)
+          macs = min(macs, int(env["MAC_MAX"]))
+          pw, mw = int(env["PC_WEIGHT"]), int(env["MAC_WEIGHT"])
+          n = pw + macs * mw
+
+          def spec(first, count):
+              return ",".join(str(i) for i in range(first, first + count)) + f"/{n}"
+
+          matrix = [{"name": "PC", "runs-on": json.loads(env["PC_LABELS"]),
+                     "workers": int(env["PC_WORKERS"]),
+                     "shard": spec(1, pw) if macs else ""}]
+          for i in range(macs):
+              matrix.append({"name": f"Mac {i + 1}", "runs-on": json.loads(env["MAC_LABELS"]),
+                             "workers": int(env["MAC_WORKERS"]),
+                             "shard": spec(pw + i * mw + 1, mw)})
+          for m in matrix:
+              print(f"{m['name']}: shard {m['shard'] or 'all'}")
+          with open(env["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"target={target}\nmacs={macs}\nmatrix={json.dumps(matrix, separators=(',', ':'))}\n"
+                        f"light={json.dumps(light, separators=(',', ':'))}\n"
+                        f"mac-first={json.dumps(mac_first, separators=(',', ':'))}\n")
+          print(f"light: {len(light)} slots, {sum(1 for x in light if x == mac_l)} on Macs")
+          with open(env["GITHUB_STEP_SUMMARY"], "a") as out:
+              out.write(f"target={target} macs={macs}\n")
+          PY

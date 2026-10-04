@@ -1,0 +1,7 @@
+# Scans staged changes for secrets before each commit, with a pinned gitleaks version. Set up once per clone: `pre-commit install`.
+# Exceptions go in .gitleaks.toml or a `gitleaks:allow` comment, the same as in CI.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.28.0
+    hooks:
+      - id: gitleaks

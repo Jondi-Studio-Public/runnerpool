@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# rp: short name for `runner` (runnerpool's control command).
+exec "$(dirname "${BASH_SOURCE[0]}")/runner" "$@"

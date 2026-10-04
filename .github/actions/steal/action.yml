@@ -1,0 +1,37 @@
+name: Work-stealing CI chunks
+description: >-
+  Machines in one run take chunks of a test suite from a shared queue until none is left, so
+  a fast machine does more and the run ends when the work does. The queue is a set of git refs
+  (refs/claims/...) in the repo: creating a ref is atomic, so exactly one machine gets each
+  chunk. Run it in every machine's job with mode run, then once in a final job with mode verify.
+  The calling job needs `permissions: contents: write`. See docs/ci-plan.md.
+inputs:
+  mode:
+    description: "run (take and run chunks) or verify (check every chunk finished, delete the queue)"
+    required: true
+  chunks:
+    description: "how many chunks the suite is cut into; 1 = no sharing, the machine runs it all"
+    default: "16"
+  command:
+    description: "shell command for one chunk; {k} and {n} become the chunk number and count, {shard} becomes k/n"
+    default: ""
+  machine:
+    description: "this machine's name, for the log"
+    default: ${{ runner.name }}
+  token:
+    description: "a token with contents: write on the repo"
+    default: ${{ github.token }}
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        STEAL_MODE: ${{ inputs.mode }}
+        STEAL_CHUNKS: ${{ inputs.chunks }}
+        STEAL_COMMAND: ${{ inputs.command }}
+        STEAL_MACHINE: ${{ inputs.machine }}
+        STEAL_TOKEN: ${{ inputs.token }}
+        STEAL_REPO: ${{ github.repository }}
+        STEAL_RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+        STEAL_SHA: ${{ github.sha }}
+      run: python3 "$GITHUB_ACTION_PATH/steal.py"

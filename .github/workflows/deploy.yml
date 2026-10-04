@@ -1,0 +1,86 @@
+# Deploys the dashboard and the CI watchdog (one image) to your server when CI passes on main.
+# Actions > Deploy > Run workflow (or `gh workflow run deploy.yml -f tag=<12-char sha>`) redeploys or
+# rolls back. Needs repo secrets DEPLOY_SSH_KEY (private key) and DEPLOY_HOST (ssh target such as
+# root@192.0.2.10), and the repo variables MACS_ALLOWED_HOSTS and DEPLOY_HEALTH_URL (e.g. http://192.0.2.10:8765/healthz). The secrets are files in /root/macs-dashboard/secrets on the server. docs/dashboard-deploy.md
+# has the procedure; scripts/deploy.sh is the manual fallback.
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag (a 12-character commit sha) to roll back to. Blank builds and deploys main.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  packages: write # build pushes to GHCR; deploy pulls
+
+jobs:
+  deploy:
+    # From CI only when it passed on a push to main, never for a pull request's run.
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: [self-hosted, linux, linux-ci]
+    timeout-minutes: 20
+    env:
+      SERVER_DIR: /root/macs-dashboard
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      HEALTH_URL: ${{ vars.DEPLOY_HEALTH_URL }}
+      REF: ${{ github.event.workflow_run.head_sha || github.sha }}
+      TAG_INPUT: ${{ inputs.tag || '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.REF }}
+      - name: Work out the image tag
+        run: |
+          echo "TAG=${TAG_INPUT:-${REF::12}}" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/macs-dashboard" >> "$GITHUB_ENV"
+      # Blank tag = build and push this commit; a tag = roll back to an image already in GHCR.
+      - name: Build and push the image
+        if: inputs.tag == ''
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker build -f dashboard/Dockerfile -t "$IMAGE:$TAG" .
+          docker push "$IMAGE:$TAG"
+      - name: Set up ssh
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${DEPLOY_HOST#*@}" >> ~/.ssh/known_hosts
+          echo "SSH=ssh -i $HOME/.ssh/deploy_key -o BatchMode=yes $DEPLOY_HOST" >> "$GITHUB_ENV"
+      # What scripts/deploy.sh does before every deploy: compose needs all eight secret files (six
+      # are optional, so create them empty), and the dashboard cannot start without the first two.
+      - name: Deploy
+        env:
+          MACS_ALLOWED_HOSTS: ${{ vars.MACS_ALLOWED_HOSTS }}
+        run: |
+          $SSH "mkdir -p $SERVER_DIR/secrets"
+          scp -i ~/.ssh/deploy_key -o BatchMode=yes compose.yaml compose.server.yaml "$DEPLOY_HOST:$SERVER_DIR/"
+          $SSH bash -s -- "$SERVER_DIR" "$TAG" "${GITHUB_REPOSITORY_OWNER,,}" "$MACS_ALLOWED_HOSTS" <<'REMOTE'
+          set -euo pipefail
+          cd "$1"
+          for n in gh_token_personal push_tokens gh_app_id gh_app_key ntfy_topic ntfy_token; do
+            f=secrets/$n
+            [ -e "$f" ] || { umask 077; : > "$f"; chown 1000:1000 "$f"; chmod 400 "$f"; }
+          done
+          test -s secrets/gh_token && test -s secrets/dashboard_token \
+            || { echo "secrets/{gh_token,dashboard_token} missing: see docs/dashboard-deploy.md" >&2; exit 1; }
+          export IMAGE_TAG=$2 GITRUNNER_ORG=$3 MACS_ALLOWED_HOSTS=$4
+          docker compose -f compose.yaml -f compose.server.yaml pull
+          docker compose -f compose.yaml -f compose.server.yaml up -d --remove-orphans
+          REMOTE
+      - name: Health check
+        run: |
+          for _ in $(seq 1 30); do
+            curl -fsS -m 5 -o /dev/null "$HEALTH_URL" && { echo healthy; exit 0; }
+            sleep 2
+          done
+          echo "dashboard did not become healthy at $HEALTH_URL" >&2
+          exit 1

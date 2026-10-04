@@ -1,0 +1,18 @@
+# Server-side secret paths: compose resolves `file:` on the Docker host, not on the PC.
+secrets:
+  gh_token:
+    file: /root/macs-dashboard/secrets/gh_token
+  dashboard_token:
+    file: /root/macs-dashboard/secrets/dashboard_token
+  gh_token_personal:
+    file: /root/macs-dashboard/secrets/gh_token_personal
+  push_tokens:
+    file: /root/macs-dashboard/secrets/push_tokens
+  gh_app_id:
+    file: /root/macs-dashboard/secrets/gh_app_id
+  gh_app_key:
+    file: /root/macs-dashboard/secrets/gh_app_key
+  ntfy_topic:
+    file: /root/macs-dashboard/secrets/ntfy_topic
+  ntfy_token:
+    file: /root/macs-dashboard/secrets/ntfy_token

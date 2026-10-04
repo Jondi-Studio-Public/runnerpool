@@ -1,0 +1,70 @@
+# Builds the Windows installer, win-runners.ps1, and publishes it to the `installer` release:
+#   https://github.com/<your-org>/runnerpool/releases/download/installer/win-runners.ps1
+# It is plain text (win/build.sh), so it needs no Windows machine and takes seconds, on the
+# self-hosted Linux pool (installer builds run on your own runners). The same
+# file serves every PC: each names itself (the lowest free win-N). Run by hand: `runner publish-win`
+# after changing win/ or the CI_APP_ID / CI_APP_PRIVATE_KEY (or RUNNER_PAT) secrets. The installer carries the CI
+# GitHub App's id and key when those secrets are set (the PC mints one-hour tokens from them), else RUNNER_PAT.
+name: Build Windows installer
+run-name: build windows installer (${{ inputs.request }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      request:
+        description: Id the control PC uses to find this run
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-win
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, linux-ci]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      # The pool's image has no gh: fetch the build for this machine (x86-64 or ARM64) into the job.
+      - name: Install gh
+        env:
+          VERSION: 2.83.1
+        run: |
+          command -v gh >/dev/null && exit 0
+          case "$(uname -m)" in
+            x86_64) arch=amd64 ;; aarch64) arch=arm64 ;;
+            *) echo "::error::no gh build for $(uname -sm)"; exit 1 ;;
+          esac
+          curl -sSfL "https://github.com/cli/cli/releases/download/v$VERSION/gh_${VERSION}_linux_${arch}.tar.gz" |
+            tar xz -C "$RUNNER_TEMP" --strip-components=2 "gh_${VERSION}_linux_${arch}/bin/gh"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Build
+        env:
+          RUNNER_PAT: ${{ secrets.RUNNER_PAT }}
+          CI_APP_ID: ${{ secrets.CI_APP_ID }}
+          CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          GITRUNNER_ORG: ${{ github.repository_owner }}
+        run: |
+          if [ -n "$CI_APP_ID" ] && [ -n "$CI_APP_PRIVATE_KEY" ]; then echo "The installer will carry the GitHub App key."
+          elif [ -n "$RUNNER_PAT" ]; then echo "::warning::No CI_APP_ID / CI_APP_PRIVATE_KEY secrets: the installer carries RUNNER_PAT."
+          else echo "::error::Set the CI_APP_ID and CI_APP_PRIVATE_KEY secrets (or RUNNER_PAT) first (see README)."; exit 1; fi
+          win/build.sh out
+
+      - name: Publish to the installer release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view installer >/dev/null 2>&1 ||
+            gh release create installer --title "Installers" --latest \
+              --notes "Installers for every Mac (git-runner-mac.pkg) and Windows PC (win-runners.ps1)."
+          gh release upload installer out/win-runners.ps1 --clobber
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/download/installer/win-runners.ps1"
+
+      # The installer carries the App key (or RUNNER_PAT), and a self-hosted workspace outlives the job.
+      - name: Delete the built installer
+        if: always()
+        run: rm -rf out

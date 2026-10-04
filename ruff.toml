@@ -1,0 +1,4 @@
+# Lint and format for the Python here (CI runs both in scripts/gate.sh python).
+# 120 columns. py39 because steal.py and ci_shard.py run on the Macs' system python3.
+line-length = 120
+target-version = "py39"

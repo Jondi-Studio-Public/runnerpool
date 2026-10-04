@@ -1,0 +1,12 @@
+*.pkg
+out/
+root/
+__pycache__/
+secrets/
+dashboard/runner-limits.json
+
+.env
+*.pem
+*.key
+.DS_Store
+.venv

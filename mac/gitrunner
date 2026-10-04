@@ -1,0 +1,2030 @@
+#!/bin/bash
+# gitrunner (formerly macrunner): installs and manages GitHub Actions runners on this Mac.
+# Installed by the mac-runners package to /usr/local/mac-runners/gitrunner and run as root,
+# either by the package's postinstall, by the admin workflow (its runner runs as root), or
+# over Tailscale SSH. `gitrunner help` lists the commands.
+set -euo pipefail
+
+HOME_DIR=${GITRUNNER_HOME:-/usr/local/mac-runners}   # tests point it elsewhere
+RUNNERS=$HOME_DIR/runners
+CACHE=$HOME_DIR/cache
+LOGS=${GITRUNNER_LOGS:-/var/log/mac-runners}
+CI_USER=_cirunner
+CI_HOME=/var/cirunner
+PLIST_PREFIX=${GITRUNNER_BUNDLE_ID:-io.github.git-runner.mac-runners}   # reverse-DNS prefix of the launchd labels and the package id
+TS_BIN=/usr/local/bin/tailscale
+TS_SOCK=/var/run/tailscaled.socket              # our tailscaled, never the Tailscale app's
+POWER_POLL=30                                   # seconds between power checks
+BATTERY_FLAG=$HOME_DIR/pause-on-battery         # present = CI pauses on battery (default)
+TS_JOINED=$HOME_DIR/tailscale-joined            # present once `tailscale up` has succeeded
+AUTH_HEADER=$HOME_DIR/github-auth.header        # the stored PAT: "Authorization: Bearer <token>", root-only (used when there is no App key)
+APP_ID_FILE=$HOME_DIR/github-app.id             # the GitHub App's id (or client id), root-only
+APP_KEY_FILE=$HOME_DIR/github-app.pem           # its private key (PKCS#1 or PKCS#8 PEM), root 600
+APP_INSTALL_FILE=$HOME_DIR/github-app.installation   # cached installation id on $APP_ORG
+APP_TOKEN_FILE=$HOME_DIR/github-app-token.header     # cached installation token as a header file, root 600
+APP_EXPIRY_FILE=$HOME_DIR/github-app-token.expires   # "EPOCH ISO8601" of that token's expires_at
+ORG_FILE=$HOME_DIR/org                          # the org, written at install time from the package's GITRUNNER_ORG
+APP_ORG=${GITRUNNER_APP_ORG:-${GITRUNNER_ORG:-$(cat "$ORG_FILE" 2>/dev/null || echo example-org)}}   # placeholder only if never configured; the org the App is installed on
+APP_REFRESH_MARGIN=600                          # mint a new installation token this many seconds before the old one expires
+HOST_FILE=$HOME_DIR/host                        # this Mac's runner name, e.g. air-1
+CONF=$HOME_DIR/conf                             # one REPO/LABELS/AS file per runner
+HEAL_EVERY=600                                  # seconds between checks that GitHub still has our runners
+RAM_FLAG=$HOME_DIR/ramdisk                      # present = CI workspaces on a RAM disk; holds its size in GB
+RAM_MNT=/private/var/cirunner-ram               # where that RAM disk is mounted
+PG_DIR=/opt/postgres16                          # integration tests start a throwaway Postgres from $PG_DIR/bin
+PG_VERSION=16.15.0                              # the pinned zonky build, installed without Homebrew
+PG_JAR_SHA256=65b953905f0a4d46030767a6b44a52360170d69a7985f1b02aa435f2f6256a83
+CI_OFF=$HOME_DIR/ci-off                         # present = CI runners take no jobs (`ci off`)
+CORES_FILE=$HOME_DIR/max-cores                  # holds N = CI jobs may use N cores (`cores N`); absent = all
+LAUNCHD_DIR=${GITRUNNER_LAUNCHD_DIR:-/Library/LaunchDaemons}   # only the Linux VM code uses it; tests point it elsewhere
+VM_USER=_gitrunnervm                            # hidden account that runs Colima/Lima (limactl refuses root)
+VM_HOME=${GITRUNNER_VM_HOME:-/var/gitrunner-vm} # its home: the VM disk lives under it
+VM_DIR=$HOME_DIR/vm                             # Colima + Lima binaries, settings, runner list, copies of linuxrunner
+VM_PROFILE=gitrunner                            # the Colima profile (Lima instance colima-gitrunner)
+VM_PLIST_LABEL=$PLIST_PREFIX.linux-vm
+SLOT_DIR=${GITRUNNER_SLOT_DIR:-/private/var/gitrunner-slot}   # the job slots (slot-1..N) and slots.conf, shared with the VM (virtiofs)
+SLOT_CONF=$SLOT_DIR/slots.conf                  # slots=N|off and threads=T (`slots N`); missing = 1 slot
+HOOKS_DIR=$HOME_DIR/hooks                       # job-started.sh / job-completed.sh: links to linux/slot-hook.sh
+VM_SSH=${GITRUNNER_SSH:-/usr/bin/ssh}           # tests stand in for it
+# Pinned releases, fetched from GitHub (no Homebrew). Each download is checked against the checksum file its
+# release publishes; set the *_SHA256 values (or the env vars) to pin the hash itself as well.
+COLIMA_VERSION=${LINUX_VM_COLIMA_VERSION:-0.9.1}
+LIMA_VERSION=${LINUX_VM_LIMA_VERSION:-1.2.1}
+COLIMA_SHA256=${LINUX_VM_COLIMA_SHA256:-}
+LIMA_SHA256=${LINUX_VM_LIMA_SHA256:-}
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+die() { log "error: $*" >&2; exit 1; }
+# Without --socket the CLI talks to the Tailscale app's daemon whenever the app is running.
+ts() { "$TS_BIN" --socket="$TS_SOCK" "$@"; }
+# The Tailscale app (App Store or standalone) runs its own daemon, which cannot be a Tailscale
+# SSH server. Ours then runs beside it in userspace networking: no network interface, routes or
+# DNS to fight the app over, and it still serves Tailscale SSH as its own node (air-N).
+ts_app_present() { [ -d /Applications/Tailscale.app ] || pgrep -qf 'io\.tailscale\.ipn'; }
+need_root() { [ "$(id -u)" = 0 ] || die "run as root (sudo gitrunner $*)"; }
+
+# --- GitHub (a GitHub App's short-lived tokens, or a long-lived PAT) --------------------
+
+# This Mac holds a GitHub App's id and private key (the pattern Actions Runner Controller uses) and
+# mints one-hour installation tokens from them on demand: a JWT signed RS256 with the key
+# (iat = now-60, exp = now+540, iss = the App id) is traded at POST /app/installations/ID/access_tokens.
+# The installation id is looked up once (GET /orgs/ORG/installation) and cached; the token is cached with
+# its expires_at and reused until APP_REFRESH_MARGIN seconds before it expires. Signing is the system
+# `openssl` (LibreSSL on macOS), base64url is openssl base64 plus tr. With no App key on the Mac the old
+# stored fine-grained PAT is used exactly as before (limited to the CI and admin repos, Administration
+# read/write: enough to register runners and nothing else). Either way the credential reaches curl as a
+# header file, so it never appears on a command line.
+now() { echo "${GITRUNNER_NOW:-$(date +%s)}"; }   # tests pin the clock
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+app_configured() { [ -s "$APP_ID_FILE" ] && [ -s "$APP_KEY_FILE" ]; }
+app_id() { tr -d '[:space:]' < "$APP_ID_FILE"; }
+have_credential() { app_configured || [ -s "$AUTH_HEADER" ]; }
+credential_kind() { if app_configured; then echo app; elif [ -s "$AUTH_HEADER" ]; then echo pat; else echo none; fi; }
+
+write_private() {  # FILE CONTENT: replace FILE atomically, readable by root only
+  local tmp
+  tmp=$(mktemp "$HOME_DIR/.tmp.XXXXXX")
+  chmod 600 "$tmp"
+  printf '%s\n' "$2" > "$tmp"
+  mv "$tmp" "$1"
+}
+
+app_jwt() {  # -> a JWT that authenticates as the App itself, valid ten minutes
+  local id iss iat head body sig
+  id=$(app_id)
+  case $id in *[!0-9]*) iss="\"$id\"" ;; *) iss=$id ;; esac   # a client id (Iv1...) is a string
+  iat=$(( $(now) - 60 ))
+  head=$(printf '%s' '{"alg":"RS256","typ":"JWT"}' | b64url)
+  body=$(printf '{"iat":%s,"exp":%s,"iss":%s}' "$iat" $(( iat + 600 )) "$iss" | b64url)
+  sig=$(printf '%s.%s' "$head" "$body" | openssl dgst -sha256 -sign "$APP_KEY_FILE" 2>/dev/null | b64url) || return 1
+  [ -n "$sig" ] || return 1
+  printf '%s.%s.%s' "$head" "$body" "$sig"
+}
+
+app_api() {  # METHOD PATH -> response body, called as the App (a JWT on curl's stdin, not in argv)
+  local jwt
+  jwt=$(app_jwt) || { log "could not sign a GitHub App token: is $APP_KEY_FILE a valid RSA key?" >&2; return 1; }
+  curl -fsS -m 20 -X "$1" -H @- -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/$2" <<<"Authorization: Bearer $jwt"
+}
+
+app_installation_id() {  # the App's installation on $APP_ORG, cached
+  local id
+  if [ -s "$APP_INSTALL_FILE" ]; then cat "$APP_INSTALL_FILE"; return; fi
+  id=$(app_api GET "orgs/$APP_ORG/installation" | tr -d '\n' | sed -n 's/^ *{ *"id": *\([0-9][0-9]*\).*/\1/p') || return 1
+  [ -n "$id" ] || { log "the GitHub App has no installation on $APP_ORG" >&2; return 1; }
+  write_private "$APP_INSTALL_FILE" "$id"
+  echo "$id"
+}
+
+iso_epoch() {  # 2026-10-03T12:00:00Z -> epoch seconds; BSD date first (GNU date -d would be a dst setting on a Mac), then GNU
+  date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -u -d "$1" +%s 2>/dev/null
+}
+
+app_refresh() {  # mint a new installation token and cache it
+  local id body token iso epoch
+  id=$(app_installation_id) || return 1
+  if ! body=$(app_api POST "app/installations/$id/access_tokens"); then
+    # a reinstalled App has a new installation id: forget the cached one and ask once more
+    rm -f "$APP_INSTALL_FILE"
+    id=$(app_installation_id) || return 1
+    body=$(app_api POST "app/installations/$id/access_tokens") || { log "could not mint a GitHub App installation token" >&2; return 1; }
+  fi
+  body=$(tr -d '\n' <<<"$body")
+  token=$(sed -n 's/.*"token": *"\([^"]*\)".*/\1/p' <<<"$body")
+  iso=$(sed -n 's/.*"expires_at": *"\([^"]*\)".*/\1/p' <<<"$body")
+  [ -n "$token" ] || { log "GitHub answered with no installation token" >&2; return 1; }
+  epoch=$(iso_epoch "$iso") || epoch=""
+  [ -n "$epoch" ] || { epoch=$(( $(now) + 1800 )); iso=""; }   # unreadable expiry: assume half an hour
+  write_private "$APP_TOKEN_FILE" "Authorization: Bearer $token"
+  write_private "$APP_EXPIRY_FILE" "$epoch ${iso:-unknown}"
+}
+
+app_ensure() {  # a cached token that is good for another APP_REFRESH_MARGIN seconds, else a new one
+  local exp=""
+  if [ -s "$APP_TOKEN_FILE" ] && [ -s "$APP_EXPIRY_FILE" ]; then
+    read -r exp _ < "$APP_EXPIRY_FILE" || exp=""
+    case $exp in ''|*[!0-9]*) ;; *) [ $(( exp - $(now) )) -gt "$APP_REFRESH_MARGIN" ] && return 0 ;; esac
+  fi
+  app_refresh
+}
+
+auth_file() {  # -> the header file to send with the next call (a fresh App token, or the PAT)
+  if app_configured; then
+    app_ensure || return 1
+    echo "$APP_TOKEN_FILE"
+  elif [ -s "$AUTH_HEADER" ]; then
+    echo "$AUTH_HEADER"
+  else
+    log "no GitHub credential on this Mac" >&2
+    return 1
+  fi
+}
+
+gh_api() {  # METHOD PATH [JSON_BODY] -> response body; fails on any HTTP error
+  local af
+  af=$(auth_file) || return 1
+  curl -fsS -m 20 -X "$1" -H @"$af" -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" ${3:+-H "Content-Type: application/json" --data "$3"} \
+    "https://api.github.com/$2"
+}
+
+# A runner's REPO is OWNER/REPO for a repo-level runner, or just ORG for an org-level one that
+# any repo in the org can use.
+api_path() {  # REPO|ORG -> the API path that owns its runners
+  case $1 in */*) echo "repos/$1" ;; *) echo "orgs/$1" ;; esac
+}
+
+mint() {  # registration|remove REPO|ORG -> a one-hour token
+  local kind=registration-token
+  [ "$1" = remove ] && kind=remove-token
+  gh_api POST "$(api_path "$2")/actions/runners/$kind" | sed -n 's/.*"token": *"\([^"]*\)".*/\1/p'
+}
+
+# Whether GitHub lists runner NAME in REPO|ORG: exit 0 yes, 1 no, 2 could not ask. A reply
+# that is not a runner list (a redirect after a repo moved, say) counts as could not ask, so
+# heal never re-registers a runner on a guess.
+on_github() {
+  local body
+  body=$(gh_api GET "$(api_path "$1")/actions/runners?per_page=100") || return 2
+  grep -q '"total_count"' <<<"$body" || return 2
+  grep -q "\"name\": *\"$2\"" <<<"$body"
+}
+
+save_token() {  # token
+  local tmp
+  tmp=$(mktemp "$HOME_DIR/.auth.XXXXXX")
+  chmod 600 "$tmp"
+  printf 'Authorization: Bearer %s\n' "$1" > "$tmp"
+  mv "$tmp" "$AUTH_HEADER"
+}
+
+token_expiry() {  # REPO|ORG -> the token's expiry as GitHub reports it, or "never"
+  local h
+  h=$(curl -sS -m 20 -o /dev/null -D - -H @"$AUTH_HEADER" "https://api.github.com/$(api_path "$1")" 2>/dev/null || true)
+  h=$(sed -n 's/^github-authentication-token-expiration: *//Ip' <<<"$h" | tr -d '\r')
+  echo "${h:-never}"
+}
+
+credential_line() {  # REPO|ORG -> what `status` prints after "token:"
+  case $(credential_kind) in
+    app)
+      if app_ensure 2>/dev/null; then
+        echo "GitHub App $(app_id), token valid until $(cut -d' ' -f2 "$APP_EXPIRY_FILE")"
+      else
+        echo "GitHub App $(app_id), but no token can be minted (check the key, and that the App is installed on $APP_ORG)"
+      fi ;;
+    pat) echo "GitHub token stored, expires $(token_expiry "$1")" ;;
+    *) echo "none (runners cannot re-register themselves)" ;;
+  esac
+}
+
+# The lowest air-N that neither repo has a runner for.
+next_name() {  # CI_REPO ADMIN_REPO
+  local n rc
+  for n in $(seq 1 50); do
+    rc=0; on_github "$1" "air-$n" || rc=$?
+    [ "$rc" = 2 ] && die "could not list runners on GitHub (token or network)"
+    [ "$rc" = 0 ] && continue
+    rc=0; on_github "$2" "air-$n-admin" || rc=$?
+    [ "$rc" = 2 ] && die "could not list runners on GitHub (token or network)"
+    [ "$rc" = 0 ] && continue
+    echo "air-$n"; return
+  done
+  die "no free air-N name"
+}
+
+# --- runners -----------------------------------------------------------------------------
+
+runner_dir() { echo "$RUNNERS/$1"; }
+plist_path() { echo "$LAUNCHD_DIR/$PLIST_PREFIX.runner.$1.plist"; }
+service() { echo "system/$PLIST_PREFIX.runner.$1"; }
+runner_user() { stat -f %Su "$(runner_dir "$1")"; }
+runner_names() { [ -d "$RUNNERS" ] && ls "$RUNNERS" || true; }
+# Where the runner works. On the RAM disk it is the disk's real path, not the _work link: the
+# runner builds GITHUB_WORKSPACE from it, and actions/checkout v6+ points git at its credentials
+# with includeIf "gitdir:<workspace>/.git", which git compares against the real path, so through
+# the link a private repo's fetch got no credentials ("could not read Username").
+set_work_folder() {  # name path (absolute, or _work for the default)
+  local f; f=$(runner_dir "$1")/.runner
+  [ -f "$f" ] || return 0
+  sed -E -i '' "s|(\"workFolder\"[[:space:]]*:[[:space:]]*\")[^\"]*\"|\1$2\"|" "$f"
+}
+runner_work_folder() { sed -nE 's|.*"workFolder"[[:space:]]*:[[:space:]]*"([^"]*)".*|\1|p' "$(runner_dir "$1")/.runner"; }
+is_loaded() { launchctl print "$(service "$1")" >/dev/null 2>&1; }
+# Loaded is not running: a job that launchd keeps failing to start (exit 78, say) stays loaded.
+is_up() { launchctl print "$(service "$1")" 2>/dev/null | grep -q '^[[:space:]]*pid = '; }
+runner_state() {  # running | failing (exit N) | stopped
+  local out code
+  out=$(launchctl print "$(service "$1")" 2>/dev/null) || { echo stopped; return; }
+  case $out in *'pid = '*) echo running; return ;; esac
+  code=$(printf '%s\n' "$out" | sed -n 's/^.*last exit code = \([0-9][0-9]*\).*/\1/p')
+  if [ -n "$code" ] && [ "$code" != 0 ]; then echo "failing (exit $code)"; else echo running; fi
+}
+# A job is running when that runner's Runner.Worker process exists.
+is_busy() { pgrep -f "$(runner_dir "$1")/bin/Runner.Worker" >/dev/null 2>&1; }
+# A runner for CI (run as $CI_USER) pauses on battery; the admin runner (root) never does.
+is_ci() { [ "$(runner_user "$1")" = "$CI_USER" ]; }
+
+latest_runner_version() {  # from the releases/latest redirect: the API is rate-limited per IP
+  curl -fsSI https://github.com/actions/runner/releases/latest |
+    sed -n 's|^[Ll]ocation: .*/tag/v\([0-9.]*\).*|\1|p' | head -1
+}
+
+fetch_runner() {  # version -> path of the cached tarball
+  local ver=$1 tgz="$CACHE/actions-runner-osx-arm64-$1.tar.gz"
+  mkdir -p "$CACHE"
+  if [ ! -s "$tgz" ]; then
+    log "downloading actions runner $ver" >&2
+    curl -fsSL -o "$tgz.part" \
+      "https://github.com/actions/runner/releases/download/v$ver/actions-runner-osx-arm64-$ver.tar.gz"
+    mv "$tgz.part" "$tgz"
+  fi
+  # Only the version in use is worth keeping; each old tarball is another 100+ MB.
+  find "$CACHE" -name 'actions-runner-osx-arm64-*.tar.gz' ! -name "${tgz##*/}" -delete
+  # A killed download leaves a .part file; keep fresh ones, since another run may be writing one.
+  find "$CACHE" -name 'actions-runner-osx-arm64-*.tar.gz.part' -mmin +1440 -delete
+  echo "$tgz"
+}
+
+ensure_user() {  # USER HOME REALNAME
+  local user=$1 home=$2 real=$3
+  id "$user" >/dev/null 2>&1 && return
+  # A hidden service account with no password and no login: it only runs launchd jobs.
+  # (dscl, not sysadminctl, so FileVault and secure-token prompts stay out of it.)
+  local uid=499
+  while dscl . -list /Users UniqueID | awk '{print $2}' | grep -qx "$uid"; do uid=$((uid - 1)); done
+  log "creating service user $user (uid $uid)"
+  dscl . -create "/Users/$user"
+  dscl . -create "/Users/$user" UniqueID "$uid"
+  dscl . -create "/Users/$user" PrimaryGroupID 20
+  dscl . -create "/Users/$user" UserShell /bin/zsh
+  dscl . -create "/Users/$user" NFSHomeDirectory "$home"
+  dscl . -create "/Users/$user" RealName "$real"
+  dscl . -create "/Users/$user" IsHidden 1
+  dscl . -create "/Users/$user" Password '*'
+  mkdir -p "$home"
+  chown "$user:staff" "$home"
+  chmod 750 "$home"
+}
+ensure_ci_user() { ensure_user "$CI_USER" "$CI_HOME" "CI runner"; }
+
+write_plist() {  # name user
+  local name=$1 user=$2 home dir
+  dir=$(runner_dir "$name")
+  if [ "$user" = root ]; then home=/var/root; else home=$CI_HOME; fi
+  # On the RAM disk, _work is a link into it: wait for the disk before starting, since at boot
+  # the ramdisk daemon and this runner start together.
+  local prog="<string>$dir/bin/runsvc.sh</string>"
+  if [ "$user" = "$CI_USER" ] && [ -f "$RAM_FLAG" ]; then
+    prog="<string>/bin/sh</string><string>-c</string><string>until [ -d \"\$0\" ]; do sleep 2; done; exec \"\$1\"</string><string>$RAM_MNT/$name</string><string>$dir/bin/runsvc.sh</string>"
+  fi
+  # A core limit tells jobs (CI_MAX_CORES) and runs them at lower priority (Nice 10). A RAM limit
+  # only tells them (CI_MAX_RAM_MB): macOS has no per-process memory cap, so it is advisory.
+  # A per-runner limit (`limit`) wins over the device-wide `cores`.
+  local cores=0 ram=0 envs="" nice=""
+  if [ "$user" = "$CI_USER" ]; then cores=$(eff_cores "$name"); ram=$(eff_ram "$name"); fi
+  if [ "$cores" -gt 0 ]; then
+    envs="<key>CI_MAX_CORES</key><string>$cores</string>"
+    nice="<key>Nice</key><integer>10</integer>"
+  fi
+  if [ "$ram" -gt 0 ]; then envs="$envs<key>CI_MAX_RAM_MB</key><string>$ram</string>"; fi
+  # With the Linux VM on, each job takes the Mac's one job slot first (linux/slot-hook.sh).
+  if [ "$user" = "$CI_USER" ] && slot_hooks_wanted; then
+    envs="$envs<key>ACTIONS_RUNNER_HOOK_JOB_STARTED</key><string>$HOOKS_DIR/job-started.sh</string>"
+    envs="$envs<key>ACTIONS_RUNNER_HOOK_JOB_COMPLETED</key><string>$HOOKS_DIR/job-completed.sh</string>"
+    envs="$envs<key>SLOT_OWNER</key><string>$name</string><key>GITRUNNER_SLOT_DIR</key><string>$SLOT_DIR</string>"
+  fi
+  mkdir -p "$LOGS" "$CONF"
+  # The directory must be traversable by the runner user too, or the log cannot be opened (exit 78).
+  chmod 755 "$LOGS"
+  echo "$cores" > "$CONF/$name.cores"
+  echo "$ram" > "$CONF/$name.ram"
+  # launchd opens the log as the runner's user; without a file that user can write, the job
+  # exits 78 (EX_CONFIG) before it starts and never logs why.
+  touch "$LOGS/$name.log"
+  chown "$user:$(id -gn "$user")" "$LOGS/$name.log"
+  cat > "$(plist_path "$name")" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$PLIST_PREFIX.runner.$name</string>
+  <key>ProgramArguments</key><array>$prog</array>
+  <key>UserName</key><string>$user</string>
+  <key>WorkingDirectory</key><string>$dir</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  $nice
+  <key>StandardOutPath</key><string>$LOGS/$name.log</string>
+  <key>StandardErrorPath</key><string>$LOGS/$name.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ACTIONS_RUNNER_SVC</key><string>1</string>
+    <key>RUNNER_ALLOW_RUNASROOT</key><string>1</string>
+    $envs
+    <key>HOME</key><string>$home</string>
+    <key>PATH</key><string>$home/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
+EOF
+  chmod 644 "$(plist_path "$name")"
+}
+
+start_runner() {
+  is_loaded "$1" && return
+  launchctl bootstrap system "$(plist_path "$1")"
+}
+
+stop_runner() {
+  is_loaded "$1" || return 0
+  launchctl bootout "$(service "$1")" 2>/dev/null || true
+}
+
+# add-runner REPO|ORG NAME LABELS [TOKEN|-] [ci|root] [--ephemeral]   (- = mint one with the stored token)
+cmd_add_runner() {
+  need_root add-runner
+  local repo=$1 name=$2 labels=$3 token=${4:--} as=${5:-ci} extra=${6:-}
+  local user dir ver tgz
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "runner name '$name' has characters launchd cannot take"
+  if [ "$token" = - ]; then
+    token=$(mint registration "$repo") && [ -n "$token" ] || die "could not get a registration token for $repo"
+  fi
+  if [ "$as" = root ]; then user=root; else ensure_ci_user; user=$CI_USER; fi
+  dir=$(runner_dir "$name")
+  if [ -f "$dir/.runner" ]; then
+    log "$name is already configured; re-registering"
+    stop_runner "$name"
+    rm -rf "$dir"
+  fi
+  ver=${RUNNER_VERSION:-$(latest_runner_version)}
+  [ -n "$ver" ] || die "could not find the latest actions/runner version"
+  tgz=$(fetch_runner "$ver")
+  mkdir -p "$dir"
+  tar xzf "$tgz" -C "$dir"
+  chown -R "$user:staff" "$dir"
+  log "registering $name to $repo with labels $labels (as $user)"
+  local home=$CI_HOME
+  [ "$user" = root ] && home=/var/root
+  # The token goes in the environment, not argv, so `ps` never shows it (as the Ansible role does).
+  (cd "$dir" && sudo -u "$user" env HOME="$home" RUNNER_ALLOW_RUNASROOT=1 ACTIONS_RUNNER_INPUT_TOKEN="$token" \
+    PATH="$home/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    ./config.sh --unattended --replace --url "https://github.com/$repo" \
+      --name "$name" --labels "$labels" --work _work ${extra:+"$extra"})
+  if [ "$user" = "$CI_USER" ] && [ -f "$RAM_FLAG" ]; then
+    ram_mount
+    rm -rf "$dir/_work"  # config.sh just created an empty one; ln -s would land inside it
+    ln -s "$RAM_MNT/$name" "$dir/_work"
+    chown -h "$user:staff" "$dir/_work"
+    set_work_folder "$name" "$RAM_MNT/$name"
+  fi
+  write_plist "$name" "$user"
+  mkdir -p "$CONF"
+  printf 'REPO=%q\nLABELS=%q\nAS=%q\nEPHEMERAL=%q\n' "$repo" "$labels" "$as" "${extra:+1}" > "$CONF/$name"
+  if is_ci "$name" && ci_paused; then
+    log "$name is registered; it stays paused ($(ci_pause_reason))"
+  else
+    start_runner "$name"
+    log "$name is running"
+  fi
+}
+
+# remove-runner NAME [TOKEN|-]   (TOKEN = a removal token; - = mint one with the stored token)
+cmd_remove_runner() {
+  need_root remove-runner
+  local name=$1 token=${2:--} dir user
+  dir=$(runner_dir "$name")
+  [ -d "$dir" ] || die "no runner named $name"
+  if [ "$token" = - ]; then
+    # shellcheck disable=SC1090
+    token=$(. "$CONF/$name"; mint remove "$REPO") || token=""
+  fi
+  user=$(runner_user "$name")
+  stop_runner "$name"
+  (cd "$dir" && sudo -u "$user" env RUNNER_ALLOW_RUNASROOT=1 ACTIONS_RUNNER_INPUT_TOKEN="$token" ./config.sh remove) ||
+    log "GitHub did not confirm the removal; delete $name under Settings > Actions > Runners"
+  rm -f "$(plist_path "$name")" "$CONF/$name" "$CONF/$name.cores" "$CONF/$name.ram" "$CONF/$name.limits"
+  rm -rf "$dir"
+  ram_mounted && rm -rf "${RAM_MNT:?}/$name"
+  log "$name removed"
+}
+
+# Waits (up to DRAIN_TIMEOUT seconds, default 2 h) for CI runner NAME's job to finish. The admin
+# runner is never waited on: the Admin workflow that asked for the restart is its own job.
+drain_runner() {
+  local n=$1 waited=0 limit=${DRAIN_TIMEOUT:-7200}
+  is_ci "$n" || return 0
+  while is_busy "$n"; do
+    [ "$waited" -lt "$limit" ] || { log "$n still in a job after ${limit}s"; return 1; }
+    [ "$waited" -gt 0 ] || log "$n is in a job; waiting for it to finish"
+    sleep 5; waited=$((waited + 5))
+  done
+}
+
+# restart [all|NAME...] [--drain]   (--drain: let a running job finish first, as the runscaler tool does)
+cmd_restart() {
+  need_root restart
+  local names="" n drain=""
+  for n in "$@"; do
+    if [ "$n" = --drain ]; then drain=1; else names="$names $n"; fi
+  done
+  [ -n "$names" ] && [ "${names# }" != all ] || names=$(runner_names)
+  for n in $names; do
+    if [ -n "$drain" ] && ! drain_runner "$n"; then
+      log "$n left running"; continue
+    fi
+    stop_runner "$n"
+    if is_ci "$n" && ci_paused; then
+      log "$n stays paused: $(ci_pause_reason)"
+    else
+      start_runner "$n"
+      log "$n restarted"
+    fi
+  done
+}
+
+# --- power -------------------------------------------------------------------------------
+
+on_battery() { pmset -g batt | head -1 | grep -q "Battery Power"; }
+# Why CI runners are stopped right now, or nothing (and false) when they should run.
+ci_pause_reason() {
+  if [ -f "$CI_OFF" ]; then echo "turned off"
+  elif on_battery && [ -f "$BATTERY_FLAG" ]; then echo "battery"
+  else return 1
+  fi
+}
+ci_paused() { ci_pause_reason >/dev/null; }
+
+# Keeps CI to the times the Mac is plugged in. On AC: CI runners on, and sleep disabled even
+# with the lid closed. On battery: sleep allowed again, and each CI runner stops once it has
+# no job running (a running job is never cut short).
+# GitHub deletes a self-hosted runner that has been offline for 14 days, which a Mac that
+# travels can easily be. Re-register any runner GitHub no longer lists (CI runners only while
+# plugged in, so a Mac on battery stays out of the pool).
+heal() {
+  local n
+  for n in $(runner_names); do
+    [ -f "$CONF/$n" ] || continue
+    ( # shellcheck disable=SC1090
+      . "$CONF/$n"
+      [ -z "$EPHEMERAL" ] || exit 0
+      [ "$AS" = root ] || ! ci_paused || exit 0
+      rc=0; on_github "$REPO" "$n" || rc=$?
+      [ "$rc" = 1 ] || exit 0
+      log "$n is gone from $REPO on GitHub; registering it again"
+      cmd_add_runner "$REPO" "$n" "$LABELS" - "$AS"
+    ) || log "could not re-register $n"
+  done
+  vm_heal || true
+}
+
+# relabel [NAME...]: make each runner's custom labels on GitHub match the LABELS it was installed
+# with, through the API, with no re-registration (an idea from MonolithProjects/ansible-github_actions_runner, MIT).
+cmd_relabel() {
+  need_root relabel
+  local names=$* n
+  [ -n "$names" ] || names=$(runner_names)
+  for n in $names; do
+    [ -f "$CONF/$n" ] || continue
+    ( # shellcheck disable=SC1090
+      . "$CONF/$n"
+      local body id have want
+      body=$(gh_api GET "$(api_path "$REPO")/actions/runners?per_page=100") || { log "could not list runners on $REPO"; exit 1; }
+      id=$(NAME=$n /usr/bin/python3 -c 'import json,os,sys
+for r in json.load(sys.stdin).get("runners", []):
+    if r["name"] == os.environ["NAME"]: print(r["id"])' <<<"$body") || id=""
+      [ -n "$id" ] || { log "$n is not registered on $REPO"; exit 1; }
+      have=$(ID=$id /usr/bin/python3 -c 'import json,os,sys
+for r in json.load(sys.stdin).get("runners", []):
+    if str(r["id"]) == os.environ["ID"]:
+        print(",".join(sorted(l["name"] for l in r["labels"] if l.get("type") == "custom")))' <<<"$body")
+      want=$(tr ',' '\n' <<<"$LABELS" | sort | paste -sd, -)
+      if [ "$have" = "$want" ]; then log "$n labels already match ($want)"; exit 0; fi
+      gh_api PUT "$(api_path "$REPO")/actions/runners/$id/labels" \
+        "$(printf '{"labels":[%s]}' "$(tr ',' '\n' <<<"$LABELS" | sed 's/.*/"&"/' | paste -sd, -)")" >/dev/null ||
+        { log "could not set the labels of $n"; exit 1; }
+      log "$n labels were [$have], now [$want]"
+    ) || true
+  done
+}
+
+cmd_power_watch() {
+  need_root power-watch
+  local last="" state n last_heal=0
+  while true; do
+    if [ $(( $(date +%s) - last_heal )) -ge "$HEAL_EVERY" ]; then
+      heal || true
+      last_heal=$(date +%s)
+    fi
+    if on_battery && [ -f "$BATTERY_FLAG" ]; then state=battery; else state=ac; fi
+    if [ "$state" != "$last" ]; then
+      log "power: $state"
+      if [ "$state" = ac ]; then pmset -a disablesleep 1 || true; else pmset -a disablesleep 0 || true; fi
+      last=$state
+    fi
+    for n in $(runner_names); do
+      is_ci "$n" || continue
+      sync_cores "$n" || true
+      if ! native_blocked; then
+        is_loaded "$n" || { log "starting $n"; start_runner "$n"; }
+      elif is_loaded "$n" && ! is_busy "$n"; then
+        log "pausing $n"; stop_runner "$n"
+      fi
+    done
+    vm_sync_bg || true
+    sleep "$POWER_POLL"
+  done
+}
+
+install_power_watch() {
+  local plist=/Library/LaunchDaemons/$PLIST_PREFIX.power.plist
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$PLIST_PREFIX.power</string>
+  <key>ProgramArguments</key><array><string>$HOME_DIR/gitrunner</string><string>power-watch</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$LOGS/power.log</string>
+  <key>StandardErrorPath</key><string>$LOGS/power.log</string>
+</dict>
+</plist>
+EOF
+  chmod 644 "$plist"
+  launchctl bootout "system/$PLIST_PREFIX.power" 2>/dev/null || true
+  launchctl bootstrap system "$plist"
+}
+
+# Stops every CI runner that has no job right now; a runner in a job is left to finish it.
+# -> 0 when no CI runner is left loaded, 1 when one is still finishing a job.
+ci_sweep() {
+  local n left=0
+  for n in $(runner_names); do
+    is_ci "$n" && is_loaded "$n" || continue
+    if is_busy "$n"; then left=1; else log "CI off: stopping $n"; stop_runner "$n"; fi
+  done
+  return $left
+}
+
+# Background half of `ci off`: a runner that was in a job is stopped the moment that job ends. The 30 s
+# power watch is too slow for this: with jobs queued a runner is never idle at its look, so it never stopped.
+ci_drain() {
+  local lock=$HOME_DIR/ci-drain.pid end=$(( $(date +%s) + 21600 ))
+  if [ -f "$lock" ] && kill -0 "$(cat "$lock" 2>/dev/null)" 2>/dev/null; then return 0; fi
+  echo $$ > "$lock"
+  while [ -f "$CI_OFF" ] && [ "$(date +%s)" -lt "$end" ]; do
+    ci_sweep && break
+    sleep 1
+  done
+  rm -f "$lock"
+}
+
+# ci on|off: take this Mac's CI runners out of the pool (off) or back in (on). Off stops the idle runners
+# now and each busy one as soon as its job ends. On starts them now unless the Mac is on battery with
+# pause-on-battery set.
+cmd_ci() {
+  need_root ci
+  local n
+  case ${1:-} in
+    off)
+      touch "$CI_OFF"
+      if ci_sweep; then log "CI off: runners stopped"
+      else
+        log "CI off: idle runners stopped; the rest stop as soon as their job ends"
+        nohup "$0" ci-drain >/dev/null 2>&1 </dev/null &
+      fi ;;
+    on)
+      rm -f "$CI_OFF"
+      if ci_paused; then log "CI on; paused until plugged in ($(ci_pause_reason))"; return; fi
+      for n in $(runner_names); do is_ci "$n" && start_runner "$n"; done
+      log "CI on" ;;
+    *) die "ci on|off" ;;
+  esac
+}
+
+# The core limit as a number: 0 = no limit.
+max_cores() {
+  local n
+  n=$(cat "$CORES_FILE" 2>/dev/null || echo 0)
+  [[ "$n" =~ ^[0-9]+$ ]] && echo "$n" || echo 0
+}
+
+# A runner's own limits live in $CONF/NAME.limits as `cores=N` and `ram=MB` lines; a missing line
+# means the device-wide behaviour (`cores`, or nothing). 0 = none.
+runner_limit() {  # NAME cores|ram -> its own value, or nothing
+  local v
+  v=$(sed -n "s/^$2=\([0-9][0-9]*\)\$/\1/p" "$CONF/$1.limits" 2>/dev/null | head -1 || true)
+  printf '%s' "$v"
+}
+# A runner's own limit, else the device-wide one, else the job slots' thread count (0 = none).
+eff_cores() {
+  local v
+  v=$(runner_limit "$1" cores); if [ -n "$v" ]; then echo "$v"; return; fi
+  v=$(max_cores); if [ "$v" -gt 0 ]; then echo "$v"; return; fi
+  slot_threads
+}
+eff_ram() { local v; v=$(runner_limit "$1" ram); echo "${v:-0}"; }
+
+# Brings CI runner NAME to its current limits (its own, else the device-wide core limit): rewrites
+# its service file and restarts it. A runner with a job running is left alone and caught up by the
+# power loop once it is idle.
+sync_cores() {
+  local n=$1 want_c want_r applied_c applied_r
+  want_c=$(eff_cores "$n"); want_r=$(eff_ram "$n")
+  applied_c=$(cat "$CONF/$n.cores" 2>/dev/null || echo 0)
+  applied_r=$(cat "$CONF/$n.ram" 2>/dev/null || echo 0)
+  [ "$want_c" = "$applied_c" ] && [ "$want_r" = "$applied_r" ] && return 0
+  is_busy "$n" && return 0
+  log "$n: limits cores ${applied_c} -> ${want_c}, ram ${applied_r} -> ${want_r} MB"
+  stop_runner "$n"
+  write_plist "$n" "$CI_USER"
+  native_blocked || start_runner "$n"
+}
+
+cmd_cores() {  # cores N|all
+  need_root cores
+  local n total
+  total=$(sysctl -n hw.ncpu)
+  case ${1:-} in
+    all|0) rm -f "$CORES_FILE"; log "CI jobs may use every core" ;;
+    *[!0-9]*|"") die "cores N|all" ;;
+    *) [ "$1" -ge 1 ] && [ "$1" -le "$total" ] || die "cores is 1 to $total, or all"
+       echo "$1" > "$CORES_FILE"; log "CI jobs may use $1 of $total cores (runs at lower priority)" ;;
+  esac
+  for n in $(runner_names); do is_ci "$n" && sync_cores "$n"; done
+  return 0
+}
+
+# limit NAME cores=<N|default> ram=<MB|default>: this runner's own limits; either may be left out
+# (unchanged). default drops the override, so the device-wide `cores` (or nothing) applies again.
+cmd_limit() {
+  need_root limit
+  local n=${1:-} arg k v total mem_mb cores ram
+  [ -n "$n" ] || die "limit NAME cores=<N|default> ram=<MB|default>"
+  shift
+  [ -d "$(runner_dir "$n")" ] || die "no runner named $n"
+  is_ci "$n" || die "$n is not a CI runner"
+  [ $# -gt 0 ] || die "limit NAME cores=<N|default> ram=<MB|default>"
+  total=$(sysctl -n hw.ncpu); mem_mb=$(( $(sysctl -n hw.memsize) / 1048576 ))
+  cores=$(runner_limit "$n" cores); ram=$(runner_limit "$n" ram)
+  for arg in "$@"; do
+    k=${arg%%=*}; v=${arg#*=}
+    [ "$k" != "$arg" ] || die "bad argument $arg (cores=<N|default> ram=<MB|default>)"
+    case $k in
+      cores)
+        if [ "$v" = default ]; then cores=
+        elif [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le "$total" ]; then cores=$v
+        else die "cores is 1 to $total, or default"; fi ;;
+      ram)
+        if [ "$v" = default ]; then ram=
+        elif [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 256 ] && [ "$v" -le "$mem_mb" ]; then ram=$v
+        else die "ram is 256 to $mem_mb (MB), or default"; fi ;;
+      *) die "unknown limit $k (cores, ram)" ;;
+    esac
+  done
+  mkdir -p "$CONF"
+  { [ -z "$cores" ] || echo "cores=$cores"; [ -z "$ram" ] || echo "ram=$ram"; } > "$CONF/$n.limits"
+  [ -s "$CONF/$n.limits" ] || rm -f "$CONF/$n.limits"
+  log "$n: cores ${cores:-default}, ram ${ram:-default} MB (RAM is advisory on macOS)"
+  if is_busy "$n"; then log "$n is in a job: the limit applies when it is idle"; return 0; fi
+  sync_cores "$n"
+}
+
+cmd_battery() {  # battery pause|run
+  need_root battery
+  case ${1:-} in
+    pause) touch "$BATTERY_FLAG"; log "CI pauses on battery" ;;
+    run) rm -f "$BATTERY_FLAG"; log "CI runs on battery too" ;;
+    *) die "battery pause|run" ;;
+  esac
+}
+
+# --- tailscale ---------------------------------------------------------------------------
+
+install_tailscale() {  # authkey hostname
+  local key=$1 host=$2
+  mkdir -p /usr/local/bin
+  install -m 755 "$HOME_DIR/bin/tailscale" /usr/local/bin/
+  # install-system-daemon copies the binary it runs from to /usr/local/bin/tailscaled, so it
+  # runs from the package's copy: run from that path, it deletes its own target first.
+  "$HOME_DIR/bin/tailscaled" install-system-daemon
+  if ts_app_present; then
+    log "the Tailscale app is installed: running tailscaled beside it in userspace networking"
+    local plist=/Library/LaunchDaemons/com.tailscale.tailscaled.plist arg
+    launchctl bootout system/com.tailscale.tailscaled 2>/dev/null || true
+    mkdir -p "$HOME_DIR/tailscale"
+    # its own state, apart from the app's in /Library/Tailscale; --port=0 leaves 41641 to the app
+    for arg in --tun=userspace-networking --port=0 "--statedir=$HOME_DIR/tailscale" "--socket=$TS_SOCK"; do
+      /usr/libexec/PlistBuddy -c "Add :ProgramArguments: string $arg" "$plist"
+    done
+    rm -f "$TS_SOCK"
+    # bootout can return before launchd lets go of the label, and bootstrap then fails with error 5
+    for _ in 1 2 3 4 5; do launchctl bootstrap system "$plist" 2>/dev/null && break; sleep 1; done
+    # a bootstrap that never took is reported by the socket wait below
+  fi
+  for _ in $(seq 1 20); do [ -S "$TS_SOCK" ] && break; sleep 1; done
+  if [ ! -S "$TS_SOCK" ]; then
+    log "tailscaled did not start:"
+    launchctl print system/com.tailscale.tailscaled 2>&1 | grep -E "state|last exit|pid" || true
+    return 0  # CI still works without Tailscale; doctor flags it
+  fi
+  [ -n "$key" ] || { log "no Tailscale auth key: skipping tailscale up"; return; }
+  if ! ts up --auth-key="$key" --hostname="$host" --ssh --accept-dns=false --reset; then
+    log "tailscale up failed: no SSH fallback until it is fixed (CI is unaffected)"
+    return 0
+  fi
+  touch "$TS_JOINED"
+  log "tailscale: $(ts ip -4 2>/dev/null | head -1)"
+}
+
+# --- RAM disk ----------------------------------------------------------------------------
+
+# Opt-in, per Mac: `ramdisk on` puts each CI runner's _work (checkout, venv, uv cache, pytest
+# temp) on a RAM disk, as the PC runners' tmpfs does. Everything there is rebuilt by the next
+# job, so losing it at a reboot costs nothing. macOS does not take back the memory of deleted
+# files on a RAM disk, so it holds up to its peak use (at most its size) until `ramdisk off`
+# or a reboot.
+
+ram_mounted() { mount | awk -v m="$RAM_MNT" '$3 == m { f = 1 } END { exit !f }'; }
+ram_dev() { mount | awk -v m="$RAM_MNT" '$3 == m { print $1 }'; }
+
+ram_mount() {  # create and mount the RAM disk if it is not, and a directory per CI runner
+  local gb dev="" n
+  gb=$(cat "$RAM_FLAG")
+  if ! ram_mounted; then
+    for _ in 1 2 3 4 5; do
+      dev=$(hdiutil attach -nomount "ram://$((gb * 2097152))" 2>/dev/null | awk 'NR==1{print $1}') && [ -n "$dev" ] && break
+      sleep 3  # early in boot, disk images may not be ready yet
+    done
+    [ -n "$dev" ] || die "could not create a ${gb} GB RAM disk"
+    # Detach the device again if formatting or mounting fails, so a retry doesn't stack a second one.
+    newfs_hfs -v cirunner-ram "$dev" >/dev/null || { hdiutil detach "$dev" >/dev/null 2>&1 || true; die "could not format the RAM disk"; }
+    mkdir -p "$RAM_MNT"
+    # nobrowse keeps it off the desktop and out of Finder; a plain mount honours ownership.
+    mount -t hfs -o nobrowse,noatime "$dev" "$RAM_MNT" || { hdiutil detach "$dev" >/dev/null 2>&1 || true; die "could not mount the RAM disk"; }
+    mdutil -i off "$RAM_MNT" >/dev/null 2>&1 || true
+    log "RAM disk: ${gb} GB at $RAM_MNT ($dev)"
+  fi
+  for n in $(runner_names); do
+    is_ci "$n" || continue
+    mkdir -p "$RAM_MNT/$n"
+    chown "$CI_USER:staff" "$RAM_MNT/$n"
+  done
+}
+
+install_ram_daemon() {
+  local plist=/Library/LaunchDaemons/$PLIST_PREFIX.ramdisk.plist
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$PLIST_PREFIX.ramdisk</string>
+  <key>ProgramArguments</key><array><string>$HOME_DIR/gitrunner</string><string>ramdisk</string><string>mount</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$LOGS/ramdisk.log</string>
+  <key>StandardErrorPath</key><string>$LOGS/ramdisk.log</string>
+</dict>
+</plist>
+EOF
+  chmod 644 "$plist"
+}
+
+# Point a CI runner's _work at the RAM disk (on) or back at the SSD (off), restarting it.
+relink_work() {  # name on|off
+  local n=$1 dir user
+  dir=$(runner_dir "$n")
+  user=$(runner_user "$n")
+  stop_runner "$n"
+  if [ "$2" = on ] && [ ! -L "$dir/_work" ]; then
+    [ -e "$dir/_work" ] && mv "$dir/_work" "$dir/_work.ssd"
+    ln -s "$RAM_MNT/$n" "$dir/_work"
+    chown -h "$user:staff" "$dir/_work"
+  elif [ "$2" = off ] && [ -L "$dir/_work" ]; then
+    rm "$dir/_work"
+    mkdir "$dir/_work"
+    chown "$user:staff" "$dir/_work"
+  fi
+  if [ "$2" = on ]; then set_work_folder "$n" "$RAM_MNT/$n"; else set_work_folder "$n" _work; fi
+  write_plist "$n" "$user"
+  if ci_paused; then
+    log "$n: _work is on the $([ "$2" = on ] && echo "RAM disk" || echo SSD); it stays paused ($(ci_pause_reason))"
+  else
+    start_runner "$n"
+    log "$n: _work is on the $([ "$2" = on ] && echo "RAM disk" || echo SSD)"
+  fi
+  rm -rf "$dir/_work.ssd"
+}
+
+cmd_ramdisk() {  # ramdisk on [GB] | off | mount
+  need_root ramdisk
+  local n gb mem
+  case ${1:-} in
+    mount) [ -f "$RAM_FLAG" ] && ram_mount; return 0 ;;
+    on)
+      gb=${2:-4}
+      [[ "$gb" =~ ^[0-9]+$ ]] && [ "$gb" -ge 1 ] && [ "$gb" -le 8 ] || die "size is 1 to 8 GB"
+      mem=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+      # The suite's 8 workers take about 1.6 GB on top of macOS: an 8 GB Mac would swap.
+      [ "$mem" -ge 16 ] || die "this Mac has $mem GB of RAM; a RAM disk needs 16 GB or more"
+      if [ -f "$RAM_FLAG" ] && [ "$(cat "$RAM_FLAG")" != "$gb" ] && ram_mounted; then
+        die "the RAM disk is on at $(cat "$RAM_FLAG") GB; run ramdisk off first to resize it"
+      fi ;;
+    off) ;;
+    *) die "ramdisk on [GB] | off" ;;
+  esac
+  for n in $(runner_names); do
+    if is_ci "$n" && is_busy "$n"; then die "$n is in a job; try again when it finishes"; fi
+  done
+  if [ "$1" = on ]; then
+    echo "$gb" > "$RAM_FLAG"
+    install_ram_daemon
+    ram_mount
+    for n in $(runner_names); do is_ci "$n" || continue; relink_work "$n" on; done
+  else
+    rm -f "$RAM_FLAG"  # first, so the rewritten plists no longer wait for the RAM disk
+    for n in $(runner_names); do is_ci "$n" || continue; relink_work "$n" off; done
+    launchctl bootout "system/$PLIST_PREFIX.ramdisk" 2>/dev/null || true
+    rm -f "/Library/LaunchDaemons/$PLIST_PREFIX.ramdisk.plist"
+    if ram_unmount; then log "RAM disk off"; else log "RAM disk is off for CI but still mounted; a reboot frees it"; fi
+  fi
+}
+
+ram_unmount() {
+  local dev
+  ram_mounted || return 0
+  dev=$(ram_dev)
+  umount "$RAM_MNT" && hdiutil detach "$dev" >/dev/null || { log "could not detach $dev"; return 1; }
+}
+
+# --- Postgres ----------------------------------------------------------------------------
+
+# `postgres install`: integration tests start a throwaway Postgres 16 from
+# $PG_DIR/bin/initdb and pg_ctl. Homebrew may not be on the Mac, so this takes the prebuilt
+# Apple Silicon binaries zonky publishes to Maven Central (a jar holding one .txz of bin/, lib/
+# and share/; no psql or pg_isready), checked against the sha256 Maven publishes for it.
+
+pg_smoke() {  # initdb, start, status and stop a scratch cluster as the CI user
+  local tmp rc=0
+  tmp=$(mktemp -d /tmp/pgsmoke.XXXXXX)
+  chown "$CI_USER" "$tmp"
+  sudo -u "$CI_USER" "$PG_DIR/bin/initdb" -D "$tmp/data" -U postgres -A trust >/dev/null &&
+    sudo -u "$CI_USER" "$PG_DIR/bin/pg_ctl" -D "$tmp/data" -w -l "$tmp/log" \
+      -o "-p 54329 -c listen_addresses=127.0.0.1 -c unix_socket_directories=$tmp" start >/dev/null &&
+    sudo -u "$CI_USER" "$PG_DIR/bin/pg_ctl" -D "$tmp/data" status >/dev/null || rc=1
+  sudo -u "$CI_USER" "$PG_DIR/bin/pg_ctl" -D "$tmp/data" -m immediate stop >/dev/null 2>&1 || true
+  [ "$rc" = 0 ] || tail -n 20 "$tmp/log" 2>/dev/null || true
+  rm -rf "$tmp"
+  return "$rc"
+}
+
+cmd_postgres() {  # postgres install
+  [ "${1:-}" = install ] || die "postgres install"
+  need_root postgres
+  [ "$(uname -m)" = arm64 ] || die "the Postgres build here is for Apple Silicon"
+  if [ "$(cat "$PG_DIR/VERSION" 2>/dev/null)" = "$PG_VERSION" ] && "$PG_DIR/bin/initdb" --version >/dev/null 2>&1; then
+    log "Postgres $PG_VERSION is already in $PG_DIR"
+    return 0
+  fi
+  local name=embedded-postgres-binaries-darwin-arm64v8 tmp
+  local url=https://repo1.maven.org/maven2/io/zonky/test/postgres/$name/$PG_VERSION/$name-$PG_VERSION.jar
+  tmp=$(mktemp -d /tmp/pginstall.XXXXXX)
+  # /usr/bin/curl, not Apple's python3, which has no CA bundle.
+  /usr/bin/curl -fsSL -m 600 -o "$tmp/pg.jar" "$url" || { rm -rf "$tmp"; die "could not download $url"; }
+  [ "$(shasum -a 256 "$tmp/pg.jar" | awk '{print $1}')" = "$PG_JAR_SHA256" ] || { rm -rf "$tmp"; die "the Postgres jar does not match its pinned sha256"; }
+  unzip -q "$tmp/pg.jar" postgres-darwin-arm_64.txz -d "$tmp" || { rm -rf "$tmp"; die "no postgres-darwin-arm_64.txz in the jar"; }
+  mkdir -p "$tmp/pg"
+  tar -xJf "$tmp/postgres-darwin-arm_64.txz" -C "$tmp/pg" || { rm -rf "$tmp"; die "could not unpack the Postgres tarball"; }
+  chmod -R a+rX "$tmp/pg"
+  echo "$PG_VERSION" > "$tmp/pg/VERSION"
+  rm -rf "$PG_DIR.new" "$PG_DIR"
+  mv "$tmp/pg" "$PG_DIR.new" && mv "$PG_DIR.new" "$PG_DIR"
+  rm -rf "$tmp"
+  "$PG_DIR/bin/initdb" --version || die "initdb does not run from $PG_DIR"
+  pg_smoke || die "the smoke test (initdb, start, stop as $CI_USER) failed"
+  log "Postgres $PG_VERSION installed in $PG_DIR"
+}
+
+# --- Linux VM ----------------------------------------------------------------------------
+
+# `linux-vm on`: a small ARM64 Ubuntu VM (Colima on Apple's Virtualization.framework, no container
+# runtime) that registers CI runners named <host>-vm-N with the org-wide linux-ci label, so Linux jobs
+# still run when the PC (the only other linux-ci host) is off. It mirrors win/winrunner.ps1's WSL set:
+# the box is provisioned by linux/linux-provision.sh, managed inside by linuxrunner, and has a root
+# admin runner <host>-vm-admin (labels linux-admin, <host>-vm) for the Admin (Linux) workflow.
+# Colima and Lima are pinned release binaries (no Homebrew), run by the hidden user $VM_USER from a
+# launchd daemon, so the VM comes up at boot with no login. The power watch below follows the same
+# pause rules as the native runners: CI inside the VM goes off on battery (a running job finishes) and
+# back on with AC.
+
+VM_STATE=$VM_DIR/enabled             # present = the VM is wanted (the power watch and heal look after it)
+VM_SETTINGS=$VM_DIR/settings         # CPUS= MEMORY= DISK= ADMIN= lines
+VM_APPLIED=$VM_DIR/applied-ci        # on|off: what the last successful `linuxrunner ci` inside the VM asked for
+VM_SYNC_PID=$VM_DIR/sync.pid         # a background sync is running while this pid is alive
+VM_BUSY_FLAG=$VM_DIR/vm-busy         # holds the time (epoch s) the VM runner was last seen in a job
+TURN_POLL=4                          # seconds between looks at who is running a job (the VM loop)
+VM_BOX_HOME=/opt/git-runner          # linuxrunner's home inside the VM
+
+vm_enabled() { [ -f "$VM_STATE" ]; }
+vm_get() { sed -n "s/^$1=//p" "$VM_SETTINGS" 2>/dev/null | head -1 || true; }
+admin_repo() {  # the repo this Mac's admin runner is registered on
+  local host
+  host=$(cat "$HOST_FILE" 2>/dev/null || true)
+  if [ -n "$host" ] && [ -f "$CONF/$host-admin" ]; then
+    # shellcheck disable=SC1090
+    (. "$CONF/$host-admin"; echo "$REPO")
+  else
+    echo "$APP_ORG/runnerpool"
+  fi
+}
+
+# Runs a command as the VM user, from its own home (a root-owned working directory would be unreadable).
+vm_as() {
+  ( cd "$VM_HOME" && sudo -u "$VM_USER" env HOME="$VM_HOME" COLIMA_HOME="$VM_HOME/.colima" \
+      PATH="$VM_DIR/bin:$VM_DIR/lima/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$@" )
+}
+vm_colima() { vm_as "$VM_DIR/bin/colima" "$@"; }
+vm_running() { vm_colima status -p "$VM_PROFILE" >/dev/null 2>&1; }
+vm_state_text() { if vm_running; then echo running; else echo stopped; fi; }
+
+# Runs the script on stdin as root inside the VM (stdin, so a registration token never reaches a
+# command line). Lima's ssh config names the host; read it rather than assume the alias.
+vm_ssh_host() { awk '$1 == "Host" { print $2; exit }' "$VM_DIR/ssh.config"; }
+vm_sh() {
+  vm_as "$VM_SSH" -F "$VM_DIR/ssh.config" -o BatchMode=yes -o ConnectTimeout=15 \
+    -o ServerAliveInterval=30 "$(vm_ssh_host)" 'sudo bash -s'
+}
+vm_refresh_ssh() {
+  local tmp=$VM_DIR/ssh.config.new
+  vm_colima ssh-config -p "$VM_PROFILE" > "$tmp" && [ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
+  chmod 644 "$tmp"; mv "$tmp" "$VM_DIR/ssh.config"
+}
+vm_ready() { [ -s "$VM_DIR/ssh.config" ] && vm_running && vm_sh <<<'true' >/dev/null 2>&1; }
+# busy | idle, or nothing when the VM cannot be asked.
+vm_probe() { vm_sh <<<'pgrep -f Runner.Worker >/dev/null && echo busy || echo idle' 2>/dev/null || true; }
+vm_busy() { [ "$(vm_probe)" = busy ]; }
+
+vm_start() {
+  local cpus mem disk
+  cpus=$(vm_get CPUS); mem=$(vm_get MEMORY); disk=$(vm_get DISK)
+  mkdir -p "$VM_HOME"; chown "$VM_USER:staff" "$VM_HOME"
+  vm_colima start -p "$VM_PROFILE" --arch aarch64 --vm-type vz --runtime none --mount-type virtiofs --mount "$SLOT_DIR:w" \
+    --cpu "${cpus:-2}" --memory "${mem:-4}" --disk "${disk:-40}" || return 1
+  vm_refresh_ssh || log "linux-vm: could not read the VM's ssh config"
+  rm -f "$VM_APPLIED"   # a fresh boot: the power watch tells it again whether CI may run
+}
+vm_stop() { vm_colima stop -p "$VM_PROFILE" || true; }
+
+sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi | awk '{print $1}'
+}
+
+# vm_fetch URL SUMS_URL NAME OUT PINNED: download URL to OUT and check its sha256 against PINNED when
+# one is set here, otherwise against the checksum file the same release publishes (SUMS_URL).
+vm_fetch() {
+  local url=$1 sums_url=$2 name=$3 out=$4 pinned=${5:-} want got
+  curl -fsSL -m 900 -o "$out" "$url" || die "could not download $url"
+  if [ -n "$pinned" ]; then
+    want=$pinned
+  else
+    curl -fsSL -m 60 -o "$out.sums" "$sums_url" || die "could not download $sums_url"
+    want=$(awk -v n="$name" '$2 == n || $2 == "*" n { print $1; exit }' "$out.sums")
+    [ -n "$want" ] || want=$(awk 'NF == 1 { print $1; exit }' "$out.sums")
+  fi
+  got=$(sha256_of "$out")
+  [ -n "$want" ] && [ "$got" = "$want" ] || die "$name does not match its sha256 (wanted '$want', got '$got')"
+}
+
+vm_install_tools() {
+  local tag="colima=$COLIMA_VERSION lima=$LIMA_VERSION" tmp lima=lima-$LIMA_VERSION-Darwin-arm64.tar.gz
+  if [ "$(cat "$VM_DIR/versions" 2>/dev/null)" = "$tag" ] && [ -x "$VM_DIR/bin/colima" ] && [ -x "$VM_DIR/lima/bin/limactl" ]; then
+    return 0
+  fi
+  tmp=$(mktemp -d /tmp/vminstall.XXXXXX)
+  log "downloading Colima $COLIMA_VERSION and Lima $LIMA_VERSION"
+  vm_fetch "https://github.com/abiosoft/colima/releases/download/v$COLIMA_VERSION/colima-Darwin-arm64" \
+    "https://github.com/abiosoft/colima/releases/download/v$COLIMA_VERSION/colima-Darwin-arm64.sha256sum" \
+    colima-Darwin-arm64 "$tmp/colima" "$COLIMA_SHA256"
+  vm_fetch "https://github.com/lima-vm/lima/releases/download/v$LIMA_VERSION/$lima" \
+    "https://github.com/lima-vm/lima/releases/download/v$LIMA_VERSION/SHA256SUMS" \
+    "$lima" "$tmp/lima.tar.gz" "$LIMA_SHA256"
+  rm -rf "$VM_DIR/lima.new"; mkdir -p "$VM_DIR/lima.new" "$VM_DIR/bin"
+  tar -xzf "$tmp/lima.tar.gz" -C "$VM_DIR/lima.new" || { rm -rf "$tmp"; die "could not unpack Lima"; }
+  install -m 755 "$tmp/colima" "$VM_DIR/bin/colima"
+  rm -rf "$VM_DIR/lima"; mv "$VM_DIR/lima.new" "$VM_DIR/lima"
+  chmod -R a+rX "$VM_DIR/bin" "$VM_DIR/lima"
+  rm -rf "$tmp"
+  vm_as "$VM_DIR/lima/bin/limactl" --version >/dev/null || die "limactl does not run as $VM_USER"
+  vm_as "$VM_DIR/bin/colima" version >/dev/null || die "colima does not run as $VM_USER"
+  echo "$tag" > "$VM_DIR/versions"
+  log "Colima $COLIMA_VERSION and Lima $LIMA_VERSION installed in $VM_DIR"
+}
+
+vm_plist_text() {
+  cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$VM_PLIST_LABEL</string>
+  <key>ProgramArguments</key><array><string>$HOME_DIR/gitrunner</string><string>linux-vm</string><string>run</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ExitTimeOut</key><integer>180</integer>
+  <key>StandardOutPath</key><string>$LOGS/linux-vm.log</string>
+  <key>StandardErrorPath</key><string>$LOGS/linux-vm.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>/var/root</string>
+    <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
+PLIST
+}
+vm_plist_path() { echo "$LAUNCHD_DIR/$VM_PLIST_LABEL.plist"; }
+vm_daemon_loaded() { launchctl print "system/$VM_PLIST_LABEL" >/dev/null 2>&1; }
+vm_install_daemon() {
+  mkdir -p "$LOGS"; chmod 755 "$LOGS"
+  vm_plist_text > "$(vm_plist_path)"
+  chmod 644 "$(vm_plist_path)"
+  vm_daemon_loaded || launchctl bootstrap system "$(vm_plist_path)"
+}
+vm_remove_daemon() {
+  launchctl bootout "system/$VM_PLIST_LABEL" 2>/dev/null || true
+  rm -f "$(vm_plist_path)"
+}
+
+# What launchd runs: keeps the VM up. Stopping the daemon stops the VM cleanly.
+cmd_vm_run() {
+  [ -f "$VM_SETTINGS" ] || die "linux-vm is not set up (linux-vm on)"
+  trap 'log "linux-vm: stopping"; vm_stop; exit 0' TERM INT
+  local tick=0
+  while true; do
+    if [ $((tick % 5)) = 0 ] && ! vm_running; then
+      log "linux-vm: starting the VM"
+      vm_start || log "linux-vm: the VM did not start; trying again"
+    fi
+    vm_turns_tick || true
+    tick=$((tick + 1))
+    sleep "$TURN_POLL" &
+    wait $! || true
+  done
+}
+
+# --- the VM's CI follows the Mac's power state --------------------------------------------
+
+# Each Mac takes one job at a time, so its native runner and the VM's runner take turns: while the native
+# runner is in a job the VM's CI is off, and while the VM is in a job the native runner is stopped.
+# Battery and `ci off` (ci_paused) win over both. A job that is running is never cut short: only an idle
+# runner is stopped, and a runner that is already in a job keeps it (if both took a job in the same few
+# seconds they share the Mac for that one job; each then finishes and the other side stays closed).
+native_busy() {
+  local n
+  for n in $(runner_names); do
+    if is_ci "$n" && is_busy "$n"; then return 0; fi
+  done
+  return 1
+}
+vm_busy_flag() {  # the VM runner was seen in a job within the last 30 s (the loop below refreshes it)
+  local t
+  t=$(cat "$VM_BUSY_FLAG" 2>/dev/null || true)
+  [[ "$t" =~ ^[0-9]+$ ]] && [ $(( $(date +%s) - t )) -lt 30 ]
+}
+native_blocked() { ci_paused || slot_full; }
+
+# --- the job slots --------------------------------------------------------------------------
+# The Mac runs N jobs at once (`slots N`, default 1 while the Linux VM is on). linux/slot-hook.sh makes a runner take
+# a folder $SLOT_DIR/slot-K before its job starts and give it back when the job completes, and only while the number
+# of held folders (all of them, so lowering N never evicts a job) is below N: even two jobs started in the same
+# instant never exceed N, the extra one waits in its hook. Idle runners on either side are paused while every slot
+# is held and resumed when one frees (nothing here stops a runner that has a job).
+
+slot_setting() {  # N or off; missing or odd = 1, the safe default
+  local v
+  v=$(sed -n 's/^slots=\([0-9][0-9]*\|off\)$/\1/p' "$SLOT_CONF" 2>/dev/null | head -1 || true)
+  echo "${v:-1}"
+}
+slot_threads() { local v; v=$(sed -n 's/^threads=\([0-9][0-9]*\)$/\1/p' "$SLOT_CONF" 2>/dev/null | head -1 || true); echo "${v:-0}"; }
+slot_count() { local d n=0; for d in "$SLOT_DIR"/slot-*; do [ -d "$d" ] && n=$((n + 1)); done; echo "$n"; }
+# A slot folder left by the one-lock version becomes slot-1.
+slot_migrate() { [ ! -d "$SLOT_DIR/lock" ] || [ -e "$SLOT_DIR/slot-1" ] || mv "$SLOT_DIR/lock" "$SLOT_DIR/slot-1" 2>/dev/null || true; }
+# The slots in use, counting a job that holds no slot folder (hooks not installed yet): a busy native runner, or the
+# VM runner seen busy, that no slot names.
+slot_used() {
+  local d n=0 names=" " who r vm
+  for d in "$SLOT_DIR"/slot-*; do
+    [ -d "$d" ] || continue
+    n=$((n + 1)); who=$(sed -n 's/^runner=\([^ ]*\).*/\1/p' "$d/owner" 2>/dev/null | head -1 || true)
+    names="$names$who "
+  done
+  for r in $(runner_names); do
+    if is_ci "$r" && is_busy "$r"; then case $names in *" $r "*) ;; *) n=$((n + 1)) ;; esac; fi
+  done
+  vm="$(cat "$HOST_FILE" 2>/dev/null)-vm-1"
+  if vm_busy_flag; then case $names in *" $vm "*) ;; *) n=$((n + 1)) ;; esac; fi
+  echo "$n"
+}
+slot_full() {  # every slot is taken (never, with the VM off or slots off)
+  local s
+  vm_enabled || return 1
+  s=$(slot_setting); [ "$s" != off ] || return 1
+  [ "$(slot_used)" -ge "$s" ]
+}
+
+cmd_slots() {  # N|off [THREADS]
+  need_root slots
+  local v=${1:-} t=${2:-} cur_t
+  cur_t=$(slot_threads)
+  case $v in
+    off) ;;
+    ''|*[!0-9]*) die "slots N|off [THREADS] (N is 1 to 16)" ;;
+    *) [ "$v" -ge 1 ] && [ "$v" -le 16 ] || die "slots is 1 to 16, or off" ;;
+  esac
+  if [ -n "$t" ]; then
+    case $t in ''|*[!0-9]*) die "THREADS is a number" ;; esac
+    [ "$t" -ge 1 ] && [ "$t" -le "$(sysctl -n hw.ncpu)" ] || die "THREADS is 1 to $(sysctl -n hw.ncpu)"
+  else t=$cur_t; fi
+  mkdir -p "$SLOT_DIR"; chmod 1777 "$SLOT_DIR"
+  { echo "slots=$v"; [ "$t" = 0 ] || echo "threads=$t"; } > "$SLOT_CONF.new"
+  chmod 644 "$SLOT_CONF.new"; mv "$SLOT_CONF.new" "$SLOT_CONF"
+  slot_migrate
+  log "job slots: $v${t:+ ($( [ "$t" = 0 ] && echo "no thread limit" || echo "$t threads each"))}"
+  vm_enabled || log "the Linux VM is off: slots only matter once it is on (runner linux-vm HOST on)"
+  log "running jobs are never stopped: a lowered number takes effect as jobs finish"
+}
+
+slot_hooks_wanted() { vm_enabled && [ -x "$HOOKS_DIR/job-started.sh" ]; }
+
+slot_install_hooks() {  # SRC DESTDIR: the hook script, and the two names the runner is pointed at
+  mkdir -p "$2"
+  install -m 755 "$1" "$2/slot-hook.sh"
+  ln -sf slot-hook.sh "$2/job-started.sh"
+  ln -sf slot-hook.sh "$2/job-completed.sh"
+}
+
+# Native CI runners carry the hooks; an idle one without them is restarted to pick them up.
+vm_hooks_sync() {
+  local n
+  slot_hooks_wanted || return 0
+  for n in $(runner_names); do
+    is_ci "$n" || continue
+    if grep -q ACTIONS_RUNNER_HOOK_JOB_STARTED "$(plist_path "$n")" 2>/dev/null; then continue; fi
+    if is_busy "$n"; then continue; fi
+    log "adding the job-slot hooks to $n"
+    stop_runner "$n"; write_plist "$n" "$CI_USER"
+    native_blocked || start_runner "$n"
+  done
+}
+
+# Frees each slot whose holder has no job any more (cancelled, or the runner died before its completed hook ran).
+# STATE is what the VM probe just said (busy|idle|empty). A young slot, or a holder that cannot be asked, is left alone.
+slot_clear_stale() {
+  local state=$1 d owner who t now seen num
+  slot_migrate
+  now=$(date +%s)
+  for d in "$SLOT_DIR"/slot-*; do
+    [ -d "$d" ] || continue
+    num=${d##*-}; owner=$d/owner
+    if [ ! -s "$owner" ]; then   # between mkdir and the owner file; a crash there leaves it bare
+      seen=$(cat "$VM_DIR/slot-seen-$num" 2>/dev/null || true)
+      [[ "$seen" =~ ^[0-9]+$ ]] || { echo "$now" > "$VM_DIR/slot-seen-$num"; continue; }
+      [ $((now - seen)) -ge 30 ] || continue
+      log "linux-vm: clearing job slot $num with no owner"; rm -rf "$d" "$VM_DIR/slot-seen-$num"; continue
+    fi
+    rm -f "$VM_DIR/slot-seen-$num"
+    who=$(sed -n 's/^runner=\([^ ]*\).*/\1/p' "$owner" | head -1)
+    t=$(sed -n 's/^time=\([0-9]*\).*/\1/p; s/.* time=\([0-9]*\).*/\1/p' "$owner" | head -1)
+    if [[ "$t" =~ ^[0-9]+$ ]] && [ $((now - t)) -lt 20 ]; then continue; fi
+    if [ -d "$(runner_dir "$who")" ]; then
+      is_busy "$who" && continue
+    elif [ "$who" = "$(cat "$HOST_FILE" 2>/dev/null)-vm-1" ]; then
+      [ "$state" = idle ] || continue   # busy, or the VM could not be asked: leave it
+    fi
+    log "linux-vm: clearing job slot $num held by ${who:-nobody}: that runner has no job running"
+    rm -rf "$d"
+  done
+  # the numbered files of slots that no longer exist
+  for d in "$VM_DIR"/slot-seen-*; do [ -e "$d" ] || continue; [ -d "$SLOT_DIR/slot-${d##*-}" ] || rm -f "$d"; done
+  return 0
+}
+
+vm_want_ci() {
+  if ci_paused; then echo off
+  elif slot_full && ! vm_busy_flag; then echo off
+  else echo on
+  fi
+}
+
+# One look, every TURN_POLL seconds (from the VM loop): note whether the VM runner is in a job, then stop or
+# restart the native CI runners to match. When the VM cannot be asked the flag is left to expire (30 s), so a
+# hiccup never leaves the native runner stopped for long. Battery and `ci off` are the power watch's business:
+# nothing here starts a runner that ci_paused says must be stopped.
+vm_turns_tick() {
+  local state n
+  vm_enabled || return 0
+  state=""
+  if [ -s "$VM_DIR/ssh.config" ]; then state=$(vm_probe); fi
+  case $state in
+    busy) date +%s > "$VM_BUSY_FLAG" ;;
+    idle) rm -f "$VM_BUSY_FLAG" ;;
+  esac
+  slot_clear_stale "$state" || true
+  vm_hooks_sync || true
+  for n in $(runner_names); do
+    is_ci "$n" || continue
+    if slot_full; then
+      if is_loaded "$n" && ! is_busy "$n"; then log "every job slot is taken: stopping $n until one frees"; stop_runner "$n"; fi
+    elif ! ci_paused && ! is_loaded "$n"; then
+      log "a job slot is free: starting $n"; start_runner "$n"
+    fi
+  done
+  vm_sync_bg || true
+}
+
+# Foreground: bring the VM's CI to the Mac's current state if it is not there. Turning CI off first waits until
+# no job is running in the VM (stopping the runner service mid-job would cancel the job), so this can take a
+# long time; the applied state is written only when it is done, so a flip back meanwhile is noticed by the next call.
+cmd_vm_sync() {
+  local want waited=0 limit=${DRAIN_TIMEOUT:-21600}
+  vm_enabled || return 0
+  want=$(vm_want_ci)
+  [ "$want" != "$(cat "$VM_APPLIED" 2>/dev/null || true)" ] || return 0
+  vm_running || return 0
+  if [ "$want" = off ]; then
+    while vm_busy; do
+      [ "$(vm_want_ci)" = off ] || { log "linux-vm: CI is wanted on again; leaving it on"; return 0; }
+      [ "$waited" -lt "$limit" ] || { log "linux-vm: still in a job after ${limit}s; CI left on"; return 1; }
+      [ "$waited" -gt 0 ] || log "linux-vm: a job is running there; turning CI off when it finishes"
+      sleep 5; waited=$((waited + 5))
+    done
+  fi
+  log "linux-vm: CI $want"
+  if vm_sh <<<"$VM_BOX_HOME/linuxrunner ci $want"; then echo "$want" > "$VM_APPLIED"; else log "linux-vm: could not set CI $want inside the VM"; return 1; fi
+}
+
+# Waits until no job is running in the VM (stopping its runner service or the VM mid-job would cancel the job).
+vm_drain() {
+  local waited=0 limit=${DRAIN_TIMEOUT:-21600}
+  while vm_busy; do
+    [ "$waited" -lt "$limit" ] || return 1
+    [ "$waited" -gt 0 ] || log "linux-vm: a job is running there; waiting for it to finish"
+    sleep 5; waited=$((waited + 5))
+  done
+}
+
+# From the power loop: start a sync in the background (never two at once), so one long drain
+# does not hold up the loop that pauses the native runners.
+vm_sync_bg() {
+  vm_enabled || return 0
+  [ "$(vm_want_ci)" != "$(cat "$VM_APPLIED" 2>/dev/null || true)" ] || return 0
+  if [ -f "$VM_SYNC_PID" ] && kill -0 "$(cat "$VM_SYNC_PID")" 2>/dev/null; then return 0; fi
+  "$0" linux-vm sync >> "$LOGS/linux-vm.log" 2>&1 < /dev/null &
+  echo $! > "$VM_SYNC_PID"
+}
+
+# --- runners inside the VM ----------------------------------------------------------------
+
+# vm_put_script FILE: shell text that writes FILE into the VM as /tmp/linuxrunner.
+vm_put_script() {
+  printf 'mkdir -p %s\nbase64 -d > /tmp/linuxrunner <<'"'"'B64EOF'"'"'\n' "$VM_BOX_HOME"
+  base64 < "$1"
+  printf 'B64EOF\n'
+}
+
+# Shell text that installs the slot hook (and its two names) in the VM, for the VM's CI runner to use.
+vm_put_hooks() {
+  printf 'mkdir -p %s/hooks\nbase64 -d > %s/hooks/slot-hook.sh <<'"'"'B64EOF'"'"'\n' "$VM_BOX_HOME" "$VM_BOX_HOME"
+  base64 < "$VM_DIR/files/slot-hook.sh"
+  printf 'B64EOF\nchmod 755 %s/hooks/slot-hook.sh\nln -sf slot-hook.sh %s/hooks/job-started.sh\nln -sf slot-hook.sh %s/hooks/job-completed.sh\n' \
+    "$VM_BOX_HOME" "$VM_BOX_HOME" "$VM_BOX_HOME"
+}
+
+# vm_ensure_runner NAME REPO LABELS ci|root: registered inside the VM and on GitHub; registers it (again) if not.
+vm_ensure_runner() {
+  local name=$1 repo=$2 labels=$3 as=$4 rc=0 token
+  on_github "$repo" "$name" || rc=$?
+  if [ -f "$VM_DIR/conf/$name" ] && [ "$rc" != 1 ]; then log "$name is already registered"; return 0; fi
+  [ "$rc" != 2 ] || die "could not list runners on GitHub (token or network)"
+  token=$(mint registration "$repo") && [ -n "$token" ] || die "could not get a registration token for $repo"
+  log "registering $name to $repo with labels $labels (inside the VM, as $([ "$as" = root ] && echo root || echo runner))"
+  vm_sh <<EOS
+set -e
+d=$VM_BOX_HOME/runners/$name
+if [ -d "\$d" ]; then ( cd "\$d" && ./svc.sh stop; ./svc.sh uninstall ) >/dev/null 2>&1 || true; rm -rf "\$d"; fi
+$VM_BOX_HOME/linuxrunner add-runner '$repo' '$name' '$labels' '$token' $as
+if [ '$as' = ci ]; then   # a CI runner takes the Mac's job slot around each job
+  printf 'ACTIONS_RUNNER_HOOK_JOB_STARTED=$VM_BOX_HOME/hooks/job-started.sh\nACTIONS_RUNNER_HOOK_JOB_COMPLETED=$VM_BOX_HOME/hooks/job-completed.sh\nSLOT_OWNER=$name\nGITRUNNER_SLOT_DIR=$SLOT_DIR\n' >> "\$d/.env"
+  ( cd "\$d" && ./svc.sh stop && ./svc.sh start ) >/dev/null
+fi
+EOS
+  mkdir -p "$VM_DIR/conf"
+  printf 'REPO=%q\nLABELS=%q\nAS=%q\n' "$repo" "$labels" "$as" > "$VM_DIR/conf/$name"
+}
+
+vm_drop_runner() {  # NAME
+  local name=$1 token=""
+  # shellcheck disable=SC1090
+  token=$(. "$VM_DIR/conf/$name"; mint remove "$REPO") || token=""
+  if vm_running; then
+    vm_sh <<<"$VM_BOX_HOME/linuxrunner remove-runner '$name' '${token:--}'" ||
+      log "could not remove $name inside the VM; delete it under Settings > Actions > Runners"
+  fi
+  rm -f "$VM_DIR/conf/$name"
+  log "$name removed"
+}
+
+# Every 10 minutes (from heal): GitHub deletes a runner that has been offline for 14 days, so register
+# again any VM runner it no longer lists (only while CI may run, like the native runners).
+vm_heal() {
+  local f n
+  vm_enabled && vm_running && [ -s "$VM_DIR/ssh.config" ] || return 0
+  ! ci_paused || return 0
+  for f in "$VM_DIR"/conf/*; do
+    [ -f "$f" ] || continue
+    n=${f##*/}
+    ( # shellcheck disable=SC1090
+      . "$f"
+      rc=0; on_github "$REPO" "$n" || rc=$?
+      [ "$rc" = 1 ] || exit 0
+      log "$n is gone from $REPO on GitHub; registering it again"
+      rm -f "$f"
+      vm_ensure_runner "$n" "$REPO" "$LABELS" "$AS"
+    ) || log "could not re-register $n"
+  done
+}
+
+# --- commands ------------------------------------------------------------------------------
+
+vm_int() {  # NAME VALUE MIN MAX
+  [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -ge "$3" ] && [ "$2" -le "$4" ] || die "$1 is $3 to $4"
+}
+
+# linux-vm on [--cpus N] [--memory GB] [--disk GB] [--no-admin]
+cmd_vm_on() {
+  local cpus="" mem="" disk="" admin="" ncpu memgb host resize old_c old_m
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --cpus|--memory|--disk) [ $# -ge 2 ] || die "$1 needs a value"
+        case $1 in --cpus) cpus=$2 ;; --memory) mem=$2 ;; *) disk=$2 ;; esac; shift 2 ;;
+      --no-admin) admin=0; shift ;;
+      -*) die "unknown option $1 (linux-vm on [--cpus N] [--memory GB] [--disk GB] [--no-admin])" ;;
+      *) die "unexpected $1: one VM runner per Mac, so there is no COUNT (linux-vm on [--cpus N] [--memory GB] [--disk GB] [--no-admin])" ;;
+    esac
+  done
+  need_root linux-vm
+  [ "$(uname -m)" = arm64 ] || die "the Linux VM needs an Apple Silicon Mac"
+  ncpu=$(sysctl -n hw.ncpu); memgb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+  cpus=${cpus:-$(vm_get CPUS)}
+  if [ -z "$cpus" ]; then if [ "$ncpu" -ge 8 ]; then cpus=4; else cpus=2; fi; fi
+  mem=${mem:-$(vm_get MEMORY)}; mem=${mem:-4}
+  disk=${disk:-$(vm_get DISK)}; disk=${disk:-40}
+  admin=${admin:-$(vm_get ADMIN)}; admin=${admin:-1}
+  vm_int --cpus "$cpus" 1 "$ncpu"
+  vm_int --memory "$mem" 2 $(( memgb > 6 ? memgb - 4 : 2 ))
+  vm_int --disk "$disk" 20 500
+  have_credential || die "no GitHub token or App key on this Mac (runners could not register)"
+  [ -s "$VM_DIR/files/linuxrunner" ] && [ -s "$VM_DIR/files/linux-provision.sh" ] && [ -s "$VM_DIR/files/slot-hook.sh" ] ||
+    die "linuxrunner and linux-provision.sh are not on this Mac yet: run 'runner update $(cat "$HOST_FILE" 2>/dev/null || echo air-N)' first"
+  host=$(cat "$HOST_FILE" 2>/dev/null) && [ -n "$host" ] || die "this Mac has no name yet ($HOST_FILE)"
+  old_c=$(vm_get CPUS); old_m=$(vm_get MEMORY)
+
+  mkdir -p "$VM_DIR" "$LOGS"
+  ensure_user "$VM_USER" "$VM_HOME" "Linux VM host"
+  mkdir -p "$SLOT_DIR"; chmod 1777 "$SLOT_DIR"   # both runner users create and remove their own slot folders in it
+  [ -f "$SLOT_CONF" ] || { echo "slots=1" > "$SLOT_CONF"; chmod 644 "$SLOT_CONF"; }   # the safe default: take turns
+  slot_migrate
+  slot_install_hooks "$VM_DIR/files/slot-hook.sh" "$HOOKS_DIR"
+  vm_install_tools
+  # A running VM takes a new size only when it restarts, so wait for it to be idle; the settings are
+  # written only once that is settled (a refused change must not look applied on the next try).
+  resize=""
+  if vm_running && { [ "$old_c" != "$cpus" ] || [ "$old_m" != "$mem" ]; }; then
+    ! vm_busy || die "a job is running in the VM: change its size when it is idle"
+    resize=1
+  fi
+  printf 'CPUS=%s\nMEMORY=%s\nDISK=%s\nADMIN=%s\n' "$cpus" "$mem" "$disk" "$admin" > "$VM_SETTINGS"
+  if [ -n "$resize" ]; then
+    log "linux-vm: restarting the VM with $cpus CPUs and $mem GB"
+    vm_stop
+  fi
+  vm_install_daemon
+  log "waiting for the VM (the first start downloads an Ubuntu image: several minutes)"
+  for _ in $(seq 1 180); do vm_ready && break; sleep 5; done
+  vm_ready || die "the VM did not come up: see $LOGS/linux-vm.log"
+
+  if ! vm_sh <<<"test -e $VM_BOX_HOME/provisioned"; then
+    log "provisioning the VM (git, python, uv, Postgres 16 binaries)"
+    vm_sh < "$VM_DIR/files/linux-provision.sh" || die "provisioning failed: no runner was registered; run linux-vm on again to retry"
+  fi
+  { vm_put_script "$VM_DIR/files/linuxrunner"; echo "bash /tmp/linuxrunner bootstrap $host-vm && rm -f /tmp/linuxrunner"; vm_put_hooks; } | vm_sh
+  touch "$VM_STATE"
+  vm_hooks_sync
+  [ "$admin" != 1 ] || vm_ensure_runner "$host-vm-admin" "$(admin_repo)" "linux-admin,$host-vm" root
+  vm_ensure_runner "$host-vm-1" "$(ci_repo)" linux-ci ci
+  rm -f "$VM_APPLIED"
+  cmd_vm_sync || true
+  log "linux-vm is on: CI runner $host-vm-1 (ARM64, linux-ci), taking turns with $host"
+  vm_status
+}
+
+# linux-vm off [--purge]: CI inside the VM finishes its job and stops, then the VM stops. The runners stay
+# registered (`on` brings them back). --purge removes the runners from GitHub, deletes the VM and its files.
+cmd_vm_off() {
+  local purge="" f n
+  case ${1:-} in --purge) purge=1 ;; "") ;; *) die "linux-vm off [--purge]" ;; esac
+  need_root linux-vm
+  if vm_enabled && vm_running && [ -s "$VM_DIR/ssh.config" ]; then
+    vm_drain || die "a job is still running in the VM: try again when it finishes"
+  fi
+  rm -f "$VM_STATE" "$VM_BUSY_FLAG"   # the power watch and heal let go of it first
+  vm_remove_daemon
+  if [ -f "$VM_SETTINGS" ] && [ -x "$VM_DIR/bin/colima" ] && vm_running; then
+    if [ -s "$VM_DIR/ssh.config" ]; then
+      vm_drain || die "a job is still running in the VM: try again when it finishes"
+      vm_sh <<<"$VM_BOX_HOME/linuxrunner ci off" || true
+    fi
+    if [ -n "$purge" ]; then
+      for f in "$VM_DIR"/conf/*; do if [ -f "$f" ]; then vm_drop_runner "${f##*/}" || true; fi; done
+    fi
+    vm_stop
+  fi
+  if [ -n "$purge" ]; then
+    if [ -x "$VM_DIR/bin/colima" ]; then vm_colima delete -p "$VM_PROFILE" -f >/dev/null 2>&1 || true; fi
+    rm -rf "$VM_DIR" "$VM_HOME" "$SLOT_DIR"
+    # Idle native runners drop the hooks from their service files (HOOKS_DIR stays, so a job already running
+    # still finds its completed hook; the hooks do nothing without the slot folder).
+    for n in $(runner_names); do
+      is_ci "$n" || continue
+      if is_busy "$n"; then continue; fi
+      stop_runner "$n"; write_plist "$n" "$CI_USER"
+      ci_paused || start_runner "$n"
+    done
+    if dscl . -read "/Users/$VM_USER" >/dev/null 2>&1; then dscl . -delete "/Users/$VM_USER" >/dev/null 2>&1 || true; fi
+    log "linux-vm removed (delete any leftover runners under Settings > Actions > Runners)"
+  else
+    log "linux-vm is off (the VM is stopped; linux-vm on starts it again)"
+  fi
+}
+
+# linux-vm files DIR: keep the copies of linuxrunner and linux-provision.sh that `on` installs in the VM.
+# `runner update` calls it with the checked-out repo; a VM that is already up gets the new linuxrunner.
+cmd_vm_files() {
+  need_root linux-vm
+  local src=$1
+  local f
+  for f in linuxrunner linux-provision.sh slot-hook.sh; do
+    [ -s "$src/linux/$f" ] || die "no linux/$f in $src"
+    bash -n "$src/linux/$f" || die "linux/$f does not parse"
+  done
+  mkdir -p "$VM_DIR/files"
+  install -m 644 "$src/linux/linuxrunner" "$src/linux/linux-provision.sh" "$src/linux/slot-hook.sh" "$VM_DIR/files/"
+  if vm_enabled; then slot_install_hooks "$VM_DIR/files/slot-hook.sh" "$HOOKS_DIR"; fi
+  if vm_enabled && vm_running && [ -s "$VM_DIR/ssh.config" ]; then
+    { vm_put_script "$VM_DIR/files/linuxrunner"; echo "$VM_BOX_HOME/linuxrunner self-update /tmp/linuxrunner && rm -f /tmp/linuxrunner"; vm_put_hooks; } | vm_sh
+  fi
+  log "linux-vm: linuxrunner, linux-provision.sh and slot-hook.sh updated"
+}
+
+vm_status() {
+  local run
+  if ! vm_enabled; then echo "linux-vm: off"; return 0; fi
+  run=$(vm_state_text)
+  echo "linux-vm: $run, $(vm_get CPUS) CPUs, $(vm_get MEMORY) GB, disk $(vm_get DISK) GB (ARM64 Ubuntu via Colima), CI $(cat "$VM_APPLIED" 2>/dev/null || echo unset) (Mac wants $(vm_want_ci))"
+  if [ "$run" = running ] && [ -s "$VM_DIR/ssh.config" ]; then
+    vm_sh <<<"$VM_BOX_HOME/linuxrunner status" 2>&1 | sed 's/^/  /' || true
+  fi
+}
+
+vm_info_json() {
+  local first=1 f n up=1
+  vm_enabled || { printf '{"enabled":false}'; return 0; }
+  [ "$(cached 15 vmstate vm_state_text)" = running ] && up=0
+  printf '{"enabled":true,"running":%s,"cpus":%s,"memory_gb":%s,"ci_state":%s,"runners":[' \
+    "$(jbool "$up")" "$(jnum "$(vm_get CPUS)")" "$(jnum "$(vm_get MEMORY)")" \
+    "$(jstr "$(cat "$VM_APPLIED" 2>/dev/null || true)")"
+  for f in "$VM_DIR"/conf/*; do
+    [ -f "$f" ] || continue
+    n=${f##*/}
+    [ "$first" = 1 ] || printf ','
+    first=0
+    printf '%s' "$(jstr "$n")"
+  done
+  printf ']}'
+}
+
+vm_doctor() {  # called from doctor: prints its own check lines through `check`
+  vm_enabled || return 0
+  check "linux-vm daemon is loaded" "vm_daemon_loaded"
+  check "linux-vm is running" "vm_running"
+  if vm_running && [ -s "$VM_DIR/ssh.config" ]; then
+    check "linux-vm answers over ssh" "vm_sh <<<true >/dev/null 2>&1"
+    check "linux-vm runners pass linuxrunner doctor" "vm_sh <<<'$VM_BOX_HOME/linuxrunner doctor' >/dev/null 2>&1 || ci_paused"
+  fi
+}
+
+cmd_linux_vm() {
+  local sub=${1:-}
+  shift || true
+  case $sub in
+    on) cmd_vm_on "$@" ;;
+    off) cmd_vm_off "$@" ;;
+    status) vm_status ;;
+    run) need_root linux-vm; cmd_vm_run ;;
+    sync) need_root linux-vm; cmd_vm_sync ;;
+    files) [ $# -eq 1 ] || die "linux-vm files DIR"; cmd_vm_files "$1" ;;
+    plist) vm_plist_text ;;
+    turns) need_root linux-vm; vm_turns_tick ;;
+    *) die "linux-vm on [--cpus N] [--memory GB] [--disk GB] [--no-admin] | off [--purge] | status | files DIR" ;;
+  esac
+}
+
+# --- status ------------------------------------------------------------------------------
+
+ci_repo() {  # the repo (or org) this Mac's CI runner serves
+  local host
+  host=$(cat "$HOST_FILE" 2>/dev/null || true)
+  if [ -n "$host" ] && [ -f "$CONF/$host" ]; then
+    # shellcheck disable=SC1090
+    (. "$CONF/$host"; echo "$REPO")
+  else
+    echo "$APP_ORG"
+  fi
+}
+
+cmd_status() {
+  local n state
+  echo "host:      $(scutil --get ComputerName 2>/dev/null) ($(sw_vers -productVersion), $(sysctl -n hw.ncpu) cores)"
+  echo "power:     $(pmset -g batt | tr '\n' ' ' | sed "s/Now drawing from //; s/'//g; s/-InternalBattery-0 ([^)]*)//; s/[[:space:]]\{2,\}/ /g")"
+  echo "sleep:     disablesleep=$(pmset -g | awk '/SleepDisabled/{print $2}')  pause-on-battery=$([ -f "$BATTERY_FLAG" ] && echo yes || echo no)"
+  echo "ci:        $(if ci_paused; then echo "paused ($(ci_pause_reason))"; else echo "taking jobs"; fi)"
+  echo "thermal:   state $(thermal_state) (0 nominal, 1 fair, 2 serious, 3 critical) $(pmset -g therm 2>/dev/null | grep -iE 'CPU_Speed_Limit|warning' | tr -s ' ' | tr '\n' ' ')"
+  echo "memory:    $(( $(sysctl -n hw.memsize) / 1073741824 )) GB, $(memory_pressure -Q 2>/dev/null | sed -n 's/.*percentage: *//p') free"
+  if ! vm_enabled; then echo "slots:     not used (no Linux VM: one job at a time)"
+  elif [ "$(slot_setting)" = off ]; then echo "slots:     off (no gating between the native runner and the VM)"
+  else echo "slots:     $(slot_count) of $(slot_setting) in use"; fi
+  echo "cores:     $([ "$(max_cores)" -gt 0 ] && echo "CI jobs limited to $(max_cores) of $(sysctl -n hw.ncpu)" || echo "no limit")"
+  echo "disk:      $(df -h / | awk 'NR==2{print $4" free of "$2}'), CI uses $(du -sch "$HOME_DIR" "$CI_HOME" 2>/dev/null | awk 'END{print $1}')"
+  if [ -f "$RAM_FLAG" ]; then
+    echo "ramdisk:   $(cat "$RAM_FLAG") GB for CI workspaces, $(ram_mounted && df -h "$RAM_MNT" | awk 'NR==2{print $3" used"}' || echo "not mounted")"
+  else
+    echo "ramdisk:   off"
+  fi
+  echo "name:      $(cat "$HOST_FILE" 2>/dev/null || echo unset)"
+  echo "token:     $(credential_line "$(ci_repo)")"
+  if [ -x "$TS_BIN" ]; then
+    echo "tailscale: $(ts status --self --peers=false 2>&1 | head -1)"
+  fi
+  echo "runners:"
+  for n in $(runner_names); do
+    state=$(runner_state "$n")
+    is_busy "$n" && state="$state, in a job"
+    printf '  %-20s %-22s %s\n' "$n" "$state" \
+      "$(sed -n 's/.*"gitHubUrl": *"\([^"]*\)".*/\1/p' "$(runner_dir "$n")/.runner" 2>/dev/null | tr -d '\r')"
+  done
+  vm_status || true
+}
+
+# info: the facts `runner dashboard` shows, as one line of JSON. Every value is read fresh, so
+# it takes a second or two (system_profiler). A value that can't be read is null.
+jstr() {  # text -> a JSON string
+  printf '"%s"' "$(printf '%s' "$1" | tr -d '\000-\010\013-\037' | tr '\t\n' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+jnum() { if [[ "${1:-}" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then printf '%s' "$1"; else printf null; fi; }
+jbool() { if [ "$1" = 0 ]; then printf true; else printf false; fi; }  # exit status -> JSON
+
+# cached SECONDS KEY COMMAND...: the command's output, reused for SECONDS. The slow, slowly
+# changing values (system_profiler, the size of the CI folders) would otherwise make every
+# refresh take seconds; the dashboard asks every few seconds.
+cached() {
+  local ttl=$1 key=$2 f age out
+  shift 2
+  f=$HOME_DIR/.info-cache.$key
+  if [ -s "$f" ]; then
+    age=$(( $(date +%s) - $(stat -f %m "$f" 2>/dev/null || echo 0) ))
+    if [ "$age" -ge 0 ] && [ "$age" -lt "$ttl" ]; then cat "$f"; return 0; fi
+  fi
+  out=$("$@" 2>/dev/null || true)
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out" > "$f.$$" 2>/dev/null && mv -f "$f.$$" "$f" 2>/dev/null || true
+  fi
+  printf '%s\n' "$out"
+}
+ci_disk_used() { du -sch "$HOME_DIR" "$CI_HOME" 2>/dev/null | awk 'END { print $1 }'; }
+# thermal_state: macOS's own thermal pressure (NSProcessInfo.thermalState): 0 nominal, 1 fair,
+# 2 serious, 3 critical. Needs no root, unlike powermetrics. `pmset -g therm` prints nothing
+# useful on Apple Silicon, so this is the reliable signal. Empty when it can't be read.
+thermal_state() {
+  osascript -l JavaScript -e 'ObjC.import("Foundation"); $.NSProcessInfo.processInfo.thermalState' 2>/dev/null | head -1 || true
+}
+
+cmd_info() {
+  local hw pw batt pct n kind state busy url first=1 boot df_k ram_used="" reason
+  hw=$(cached 86400 hw system_profiler SPHardwareDataType)
+  pw=$(cached 600 power system_profiler SPPowerDataType)
+  batt=$(pmset -g batt 2>/dev/null || true)
+  field() { awk -F': *' -v k="$2" '$1 ~ "^ *"k"$" { print $2; exit }' <<<"$1"; }
+  boot=$(sysctl -n kern.boottime 2>/dev/null | sed -E 's/^[^0-9]*([0-9]+).*/\1/' || true)
+  df_k=$(df -k / | awk 'NR==2 { print int($2 / 1048576), int($4 / 1048576) }' || true)
+  pct=$(sed -n 's/.*[^0-9]\([0-9]\{1,3\}\)%.*/\1/p' <<<"$batt" | head -1 || true)
+  ram_mounted && ram_used=$(df -h "$RAM_MNT" | awk 'NR==2 { print $3 }' || true)
+  reason=$(ci_pause_reason || true)
+  printf '{"host":%s' "$(jstr "$(cat "$HOST_FILE" 2>/dev/null)")"
+  printf ',"computer_name":%s' "$(jstr "$(scutil --get ComputerName 2>/dev/null)")"
+  printf ',"model":%s,"model_id":%s' "$(jstr "$(field "$hw" 'Model Name')")" "$(jstr "$(sysctl -n hw.model 2>/dev/null)")"
+  printf ',"chip":%s' "$(jstr "$(field "$hw" Chip; field "$hw" 'Processor Name')")"
+  printf ',"cores":%s,"cores_perf":%s,"cores_eff":%s' "$(jnum "$(sysctl -n hw.ncpu 2>/dev/null)")" \
+    "$(jnum "$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null)")" "$(jnum "$(sysctl -n hw.perflevel1.physicalcpu 2>/dev/null)")"
+  printf ',"memory_gb":%s' "$(jnum $(( $(sysctl -n hw.memsize) / 1073741824 )))"
+  printf ',"macos":%s' "$(jstr "$(sw_vers -productVersion 2>/dev/null)")"
+  printf ',"uptime_s":%s' "$(jnum "$([ -n "$boot" ] && echo $(( $(date +%s) - boot )))")"
+  printf ',"disk_total_gb":%s,"disk_free_gb":%s' "$(jnum "${df_k% *}")" "$(jnum "${df_k#* }")"
+  printf ',"ci_disk_used":%s' "$(jstr "$(cached 300 du ci_disk_used)")"
+  printf ',"memory_free_pct":%s' "$(jnum "$(memory_pressure -Q 2>/dev/null | sed -n 's/.*percentage: *\([0-9]*\).*/\1/p')")"
+  printf ',"thermal_state":%s' "$(jnum "$(thermal_state)")"
+  printf ',"cpu_speed_limit":%s' "$(jnum "$(pmset -g therm 2>/dev/null | sed -n 's/.*CPU_Speed_Limit[^0-9]*\([0-9]*\).*/\1/p' | head -1)")"
+  printf ',"battery":{"present":%s' "$(grep -q InternalBattery <<<"$batt"; jbool $?)"
+  printf ',"percent":%s' "$(jnum "$pct")"
+  printf ',"source":%s' "$(jstr "$(sed -n "s/.*drawing from '\([^']*\) Power'.*/\1/p" <<<"$batt")")"
+  printf ',"charging":%s' "$(grep -q '; charging;' <<<"$batt"; jbool $?)"
+  printf ',"cycles":%s' "$(jnum "$(field "$pw" 'Cycle Count')")"
+  printf ',"condition":%s' "$(jstr "$(field "$pw" Condition)")"
+  printf ',"max_capacity_pct":%s}' "$(jnum "$(field "$pw" 'Maximum Capacity' | tr -d '%')")"
+  printf ',"settings":{"max_cores":%s,"slots":%s,"slots_held":%s,"pause_on_battery":%s' "$(max_cores)" \
+    "$(vm_enabled && jnum "$(slot_setting)" || printf null)" "$(slot_count)" "$([ -f "$BATTERY_FLAG" ]; jbool $?)"
+  printf ',"ci_enabled":%s' "$([ ! -f "$CI_OFF" ]; jbool $?)"
+  printf ',"sleep_disabled":%s' "$([ "$(pmset -g | awk '/SleepDisabled/ { print $2 }')" = 1 ]; jbool $?)"
+  printf ',"ramdisk_gb":%s' "$(jnum "$(cat "$RAM_FLAG" 2>/dev/null || echo 0)")"
+  printf ',"ramdisk_mounted":%s,"ramdisk_used":%s}' "$(ram_mounted; jbool $?)" "$(jstr "$ram_used")"
+  printf ',"ci_paused":%s,"ci_paused_reason":%s' "$([ -n "$reason" ]; jbool $?)" "$(jstr "$reason")"
+  printf ',"tailscale":%s' "$(jstr "$([ -x "$TS_BIN" ] && ts status --self --peers=false 2>&1 | head -1)")"
+  printf ',"token_stored":%s' "$(have_credential; jbool $?)"
+  printf ',"credential":%s' "$(jstr "$(credential_kind)")"
+  printf ',"macrunner_sha":%s' "$(jstr "$(shasum "$HOME_DIR/gitrunner" 2>/dev/null | cut -c1-7)")"
+  printf ',"linux_vm":%s' "$(vm_info_json)"
+  printf ',"runners":['
+  for n in $(runner_names); do
+    if is_ci "$n"; then kind="ci"; elif [ "${n%-admin}" != "$n" ]; then kind="admin"; else kind="root"; fi
+    state=$(runner_state "$n")
+    busy=0; is_busy "$n" || busy=$?
+    url=$(sed -n 's/.*"gitHubUrl": *"\([^"]*\)".*/\1/p' "$(runner_dir "$n")/.runner" 2>/dev/null | tr -d '\r' || true)
+    [ "$first" = 1 ] || printf ','
+    first=0
+    printf '{"name":%s,"kind":"%s","state":"%s","busy":%s,"repo":%s' "$(jstr "$n")" "$kind" "$state" "$(jbool "$busy")" "$(jstr "$url")"
+    printf ',"limit":{"cores":%s,"ram_mb":%s}}' "$(jnum "$(runner_limit "$n" cores)")" "$(jnum "$(runner_limit "$n" ram)")"
+  done
+  printf ']}\n'
+}
+
+cmd_logs() {  # [name|power] [lines]
+  local name=${1:-} lines=${2:-60} f
+  if [ -z "$name" ]; then
+    for f in "$LOGS"/*.log; do echo "== $f"; tail -n "$lines" "$f"; done
+    return
+  fi
+  tail -n "$lines" "$LOGS/$name.log"
+  # The runner's own diagnostics hold the job-level detail.
+  f=$(ls -t "$(runner_dir "$name")"/_diag/Runner_*.log 2>/dev/null | head -1 || true)
+  [ -n "$f" ] && { echo "== $f"; tail -n "$lines" "$f"; }
+  return 0
+}
+
+cmd_doctor() {
+  local n problems=0
+  cmd_status
+  echo "checks:"
+  check() { if eval "$2"; then echo "  ok    $1"; else echo "  FAIL  $1"; problems=$((problems + 1)); fi; }
+  check "power watch is loaded" "launchctl print system/$PLIST_PREFIX.power >/dev/null 2>&1"
+  check "github.com is reachable" "curl -fsS -o /dev/null -m 10 https://github.com"
+  if have_credential; then
+    if app_configured; then
+      check "GitHub App token can be minted (installation on $APP_ORG)" "app_ensure"
+      check "GitHub App token works" "gh_api GET '$(api_path "$(ci_repo)")/actions/runners?per_page=1' >/dev/null"
+    else
+      check "GitHub token works" "gh_api GET '$(api_path "$(ci_repo)")/actions/runners?per_page=1' >/dev/null"
+    fi
+    local repo rc
+    for n in $(runner_names); do
+      [ -f "$CONF/$n" ] || continue
+      # shellcheck disable=SC1090
+      repo=$(. "$CONF/$n"; echo "$REPO")
+      rc=0; on_github "$repo" "$n" || rc=$?
+      case $rc in
+        0) echo "  ok    $n is registered on GitHub" ;;
+        1) echo "  FAIL  $n is not registered on GitHub (re-registers within ${HEAL_EVERY}s when plugged in)"
+           problems=$((problems + 1)) ;;
+        *) echo "  --    could not ask GitHub about $n" ;;
+      esac
+    done
+  fi
+  ts_app_present && echo "  --    the Tailscale app is installed: tailscaled runs beside it in userspace networking"
+  [ -x "$TS_BIN" ] && check "tailscaled is running" "[ -S '$TS_SOCK' ]"
+  [ -f "$TS_JOINED" ] && check "tailscale is connected" "ts status >/dev/null 2>&1"
+  for n in $(runner_names); do
+    check "$n is configured" "[ -f '$(runner_dir "$n")/.runner' ]"
+    # Two listeners on one runner run two jobs in one _work folder (see docs/HANDOFF.md).
+    check "$n has at most one Runner.Listener" "[ \$(ps -axo command | grep -c -F '$(runner_dir "$n")/bin/Runner.Listener') -le 2 ]"
+    if is_ci "$n" && ci_paused; then
+      echo "  --    $n paused ($(ci_pause_reason))"
+    else
+      check "$n is running" "is_up '$n'"
+    fi
+  done
+  # A job needs about 1 GB (checkout, venv, uv cache, pytest temp); the rest is headroom for
+  # macOS itself (swap, updates), which slows down badly on a nearly full disk.
+  if [ -f "$RAM_FLAG" ]; then
+    check "RAM disk is mounted" "ram_mounted"
+    for n in $(runner_names); do
+      is_ci "$n" && check "$n's workspace is on the RAM disk" "[ -L '$(runner_dir "$n")/_work' ] && [ \"\$(runner_work_folder '$n')\" = '$RAM_MNT/$n' ]"
+    done
+  fi
+  vm_doctor
+  check "at least 5 GB free" "[ \$(df -g / | awk 'NR==2{print \$4}') -ge 5 ]"
+  echo "$problems problem(s)"
+  return "$problems"
+}
+
+# --- install / update / uninstall ------------------------------------------------------
+
+# bootstrap ENVFILE: the package's postinstall. ENVFILE carries the GitHub App id and key (GITHUB_APP_ID,
+# GITHUB_APP_KEY_B64) or else a GitHub token (RUNNER_PAT), the repos
+# and the Tailscale key; it is deleted once read. The Mac keeps the name it had if this is a
+# reinstall, and otherwise takes the lowest free air-N.
+cmd_bootstrap() {
+  need_root bootstrap
+  local envfile=$1 host
+  [ -f "$envfile" ] || die "no $envfile"
+  # shellcheck disable=SC1090
+  . "$envfile"
+  rm -f "$envfile"
+  mkdir -p "$RUNNERS" "$LOGS" "$CONF"
+  if [ -n "${GITRUNNER_ORG:-}" ]; then   # baked in at build time
+    echo "$GITRUNNER_ORG" > "$ORG_FILE"
+    APP_ORG=${GITRUNNER_APP_ORG:-$GITRUNNER_ORG}
+  fi
+  if [ -n "${GITHUB_APP_ID:-}" ] && [ -n "${GITHUB_APP_KEY_B64:-}" ]; then
+    save_app "$GITHUB_APP_ID" "$GITHUB_APP_KEY_B64" || die "the package's GitHub App key is not a PEM private key"
+    rm -f "$AUTH_HEADER"   # an older PAT is no longer needed
+    unset GITHUB_APP_KEY_B64 RUNNER_PAT
+    app_ensure || die "the package's GitHub App cannot mint a token (not installed on $APP_ORG, or its key was revoked?)"
+    gh_api GET "repos/$ADMIN_REPO" >/dev/null || die "the package's GitHub App cannot reach $ADMIN_REPO (is the repo in the App's installation?)"
+  else
+    [ -n "${RUNNER_PAT:-}" ] || die "the package carries no GitHub App key or token"
+    clear_app
+    save_token "$RUNNER_PAT"
+    unset RUNNER_PAT
+    gh_api GET "repos/$ADMIN_REPO" >/dev/null || die "the package's GitHub token does not work (expired or revoked?)"
+  fi
+  if [ -n "${HOST:-}" ]; then host=$HOST
+  elif [ -s "$HOST_FILE" ]; then host=$(cat "$HOST_FILE")
+  else host=$(next_name "${CI_REPO:-$ADMIN_REPO}" "$ADMIN_REPO")
+  fi
+  echo "$host" > "$HOST_FILE"
+  log "this Mac is $host"
+  touch "$BATTERY_FLAG"
+  pmset -c sleep 0 disksleep 0 womp 1 || log "pmset could not change sleep settings"
+  install_tailscale "${TS_AUTHKEY:-}" "$host"
+  cmd_add_runner "$ADMIN_REPO" "$host-admin" "mac-admin,$host${EXTRA_ADMIN_LABELS:+,$EXTRA_ADMIN_LABELS}" \
+    - root ${ADMIN_EPHEMERAL:+--ephemeral}
+  if [ -n "${CI_REPO:-}" ]; then
+    cmd_add_runner "$CI_REPO" "$host" "$CI_LABELS" - ci
+  fi
+  install_power_watch
+  log "bootstrap done"
+  cmd_status || true
+}
+
+# The credential files, for switching between the App and the PAT with a way back.
+CRED_FILES=("$AUTH_HEADER" "$APP_ID_FILE" "$APP_KEY_FILE" "$APP_INSTALL_FILE" "$APP_TOKEN_FILE" "$APP_EXPIRY_FILE")
+
+save_app() {  # ID KEY_B64: store the App's id and (decoded) private key; the old cached installation and token go
+  local tmp
+  tmp=$(mktemp "$HOME_DIR/.app.XXXXXX")
+  chmod 600 "$tmp"
+  if ! printf '%s' "$2" | openssl base64 -d -A > "$tmp" 2>/dev/null || ! grep -q 'PRIVATE KEY' "$tmp"; then
+    rm -f "$tmp"; return 1
+  fi
+  mv "$tmp" "$APP_KEY_FILE"
+  write_private "$APP_ID_FILE" "$1"
+  rm -f "$APP_INSTALL_FILE" "$APP_TOKEN_FILE" "$APP_EXPIRY_FILE"
+}
+
+clear_app() { rm -f "$APP_ID_FILE" "$APP_KEY_FILE" "$APP_INSTALL_FILE" "$APP_TOKEN_FILE" "$APP_EXPIRY_FILE"; }
+
+snapshot_credentials() {  # -> a private folder holding a copy of every credential file there is
+  local dir f
+  dir=$(mktemp -d "$HOME_DIR/.cred.XXXXXX")
+  for f in "${CRED_FILES[@]}"; do if [ -e "$f" ]; then cp -p "$f" "$dir/"; fi; done
+  echo "$dir"
+}
+
+restore_credentials() {  # DIR: put back exactly what snapshot_credentials saved
+  local f
+  rm -f "${CRED_FILES[@]}"
+  for f in "${CRED_FILES[@]}"; do if [ -e "$1/${f##*/}" ]; then cp -p "$1/${f##*/}" "$f"; fi; done
+  rm -rf "$1"
+}
+
+# set-token REPO|ORG: replace the stored credential with the PAT in $NEW_GITHUB_TOKEN (dropping any App key,
+# which would otherwise win), after checking it can list REPO's runners; on failure the old credential comes
+# back. The admin workflow's rotate-token passes RUNNER_PAT.
+cmd_set_token() {
+  need_root set-token
+  [ -n "${NEW_GITHUB_TOKEN:-}" ] || die "put the new token in NEW_GITHUB_TOKEN"
+  local keep
+  keep=$(snapshot_credentials)
+  clear_app
+  save_token "$NEW_GITHUB_TOKEN"
+  if gh_api GET "$(api_path "$1")/actions/runners?per_page=1" >/dev/null; then
+    log "GitHub token replaced; expires $(token_expiry "$1")"
+    rm -rf "$keep"
+  else
+    restore_credentials "$keep"
+    die "the new token cannot list $1's runners; kept the old credential"
+  fi
+}
+
+# set-app REPO|ORG: switch this Mac to a GitHub App: store the id in $NEW_APP_ID and the private key in
+# $NEW_APP_KEY_B64 (the PEM, base64 on one line: the admin workflow passes the CI_APP_ID and CI_APP_PRIVATE_KEY
+# secrets that way), check that a token can be minted and can list REPO's runners, then delete the stored PAT.
+# On failure the previous credential (PAT or older App key) comes back.
+cmd_set_app() {
+  need_root set-app
+  [ -n "${NEW_APP_ID:-}" ] && [ -n "${NEW_APP_KEY_B64:-}" ] || die "put the App id in NEW_APP_ID and its base64 key in NEW_APP_KEY_B64"
+  local keep
+  keep=$(snapshot_credentials)
+  if save_app "$NEW_APP_ID" "$NEW_APP_KEY_B64" && app_ensure &&
+    gh_api GET "$(api_path "$1")/actions/runners?per_page=1" >/dev/null; then
+    rm -f "$AUTH_HEADER"
+    rm -rf "$keep"
+    log "this Mac now mints GitHub App tokens (App $(app_id), valid until $(cut -d' ' -f2 "$APP_EXPIRY_FILE")); the stored PAT is deleted"
+  else
+    restore_credentials "$keep"
+    die "the GitHub App could not mint a token that lists $1's runners (bad key, not installed on $APP_ORG, or no network); kept the old credential"
+  fi
+}
+
+# self-update FILE: replace this script (the admin workflow passes the repo's copy).
+# The tool used to be called macrunner, and older plists, the dashboard and hands still use that
+# name: gitrunner is the file, macrunner a symlink to it. Safe to run any time; it is also how a Mac
+# whose old self-update wrote a new file over macrunner moves it to gitrunner.
+cmd_relink() {
+  need_root relink
+  if [ -f "$HOME_DIR/macrunner" ] && [ ! -L "$HOME_DIR/macrunner" ]; then
+    mv "$HOME_DIR/macrunner" "$HOME_DIR/gitrunner"
+  fi
+  [ -e "$HOME_DIR/gitrunner" ] || die "no $HOME_DIR/gitrunner"
+  ln -sf gitrunner "$HOME_DIR/macrunner"
+  ln -sf "$HOME_DIR/gitrunner" /usr/local/bin/gitrunner
+  ln -sf "$HOME_DIR/gitrunner" /usr/local/bin/macrunner
+}
+
+cmd_self_update() {
+  need_root self-update
+  local src=$1
+  bash -n "$src" || die "$src does not parse"
+  install -m 755 -o root -g wheel "$src" "$HOME_DIR/gitrunner.new"
+  mv "$HOME_DIR/gitrunner.new" "$HOME_DIR/gitrunner"
+  cmd_relink
+  log "gitrunner updated; restarting power watch"
+  launchctl kickstart -k "system/$PLIST_PREFIX.power" 2>/dev/null || true
+}
+
+cmd_uninstall() {  # uninstall: stops and deletes everything here (GitHub keeps offline entries)
+  need_root uninstall
+  local n
+  if [ -d "$VM_DIR" ]; then cmd_vm_off --purge || log "could not fully remove the Linux VM"; fi
+  for n in $(runner_names); do stop_runner "$n"; rm -f "$(plist_path "$n")"; done
+  launchctl bootout "system/$PLIST_PREFIX.power" 2>/dev/null || true
+  launchctl bootout "system/$PLIST_PREFIX.ramdisk" 2>/dev/null || true
+  rm -f "/Library/LaunchDaemons/$PLIST_PREFIX.power.plist" "/Library/LaunchDaemons/$PLIST_PREFIX.ramdisk.plist"
+  ram_unmount || true
+  pmset -a disablesleep 0 || true
+  [ -x "$TS_BIN" ] && { ts logout 2>/dev/null || true; /usr/local/bin/tailscaled uninstall-system-daemon 2>/dev/null || true; }
+  rm -f /usr/local/bin/tailscale /usr/local/bin/tailscaled /usr/local/bin/macrunner /usr/local/bin/gitrunner
+  # dscl prints its errors (e.g. "delete: Invalid Path") on stdout, so check the user exists first.
+  if dscl . -read "/Users/$CI_USER" >/dev/null 2>&1; then dscl . -delete "/Users/$CI_USER" >/dev/null 2>&1 || true; fi
+  rm -rf "$CI_HOME" "$LOGS" "$HOME_DIR"
+  pkgutil --forget "$PLIST_PREFIX" >/dev/null 2>&1 || true
+  echo "removed. Delete the runners' entries under each repo's Settings > Actions > Runners."
+}
+
+usage() {
+  cat <<'EOF'
+gitrunner: GitHub Actions runners on this Mac (run with sudo)
+
+  status                          host, power, Tailscale and every runner
+  doctor                          status plus checks; exit code = problems found
+  logs [NAME|power] [LINES]       service log and the runner's latest diagnostics
+  restart [NAME|all] [--drain]   restart runners (CI stays paused on battery); --drain waits for a running job
+  add-runner REPO|ORG NAME LABELS [TOKEN|-] [ci|root] [--ephemeral]
+                                  register a runner on OWNER/REPO, or on an ORG for all its
+                                  repos (- mints a token with the stored one)
+  remove-runner NAME [TOKEN|-]    unregister and delete
+  set-token REPO|ORG              replace the GitHub token with $NEW_GITHUB_TOKEN (checked there; drops any App key)
+  set-app REPO|ORG                switch to the GitHub App in $NEW_APP_ID and $NEW_APP_KEY_B64 (checked there; deletes the PAT)
+  next-name CI_REPO|ORG ADMIN_REPO  the name a new Mac would take
+  battery pause|run               pause CI on battery (default) or run it anyway
+  ci on|off                       CI runners take jobs (on) or finish their job and stop (off)
+  cores N|all                     CI jobs may use N cores (CI_MAX_CORES, lower priority); all = no limit
+  slots N|off [THREADS]           with the Linux VM on, N jobs at once across the native runner and the VM (default 1: they
+                                  take turns); off = no gating. Idle runners pause while every slot is held; running jobs
+                                  are never stopped. THREADS = CI_MAX_CORES for the native runner
+  limit NAME cores=<N|default> ram=<MB|default>
+                                  one runner's own limits (CI_MAX_CORES, CI_MAX_RAM_MB; RAM is advisory
+                                  here); they win over `cores`; default = back to the device-wide setting
+  relabel [NAME...]               set each runner's labels on GitHub to the ones it was installed with
+  info                            specs, settings and runners as one line of JSON (the dashboard)
+  ramdisk on [GB] | off           CI workspaces on a RAM disk (default 4 GB; 16 GB Macs only)
+  linux-vm on [--cpus N] [--memory GB] [--disk GB] [--no-admin]
+                                  an ARM64 Ubuntu VM (Colima) with one linux-ci runner <host>-vm-1 (plus the
+                                  management runner <host>-vm-admin). It follows the Mac's battery rule and takes
+                                  turns with the native runner: one job at a time on this Mac.
+                                  Needs `runner update` first (it brings linuxrunner and its provisioning script)
+  linux-vm off [--purge]          CI in the VM finishes and stops, the VM stops; --purge deletes it and its runners
+  linux-vm status                 the VM, its CI state and runners
+  linux-vm files DIR              keep the copies of linux/linuxrunner and linux/linux-provision.sh from a repo checkout
+  postgres install                Postgres 16 in /opt/postgres16 (no Homebrew), for integration tests
+  self-update FILE                install a new gitrunner
+  relink                          make macrunner (the old name) a link to gitrunner
+  uninstall                       remove runners, Tailscale daemon, service user, files
+  bootstrap ENVFILE               first install (the package does this)
+  power-watch                     the power loop (launchd runs this)
+EOF
+}
+
+cmd=${1:-help}
+shift || true
+case $cmd in
+  status) cmd_status ;;
+  doctor) cmd_doctor ;;
+  logs) cmd_logs "$@" ;;
+  restart) cmd_restart "$@" ;;
+  relabel) cmd_relabel "$@" ;;
+  add-runner) [ $# -ge 3 ] || die "add-runner REPO NAME LABELS [TOKEN|-] [ci|root] [--ephemeral]"; cmd_add_runner "$@" ;;
+  remove-runner) [ $# -ge 1 ] || die "remove-runner NAME [TOKEN|-]"; cmd_remove_runner "$@" ;;
+  set-token) [ $# -eq 1 ] || die "set-token REPO|ORG"; cmd_set_token "$1" ;;
+  set-app) [ $# -eq 1 ] || die "set-app REPO|ORG"; cmd_set_app "$1" ;;
+  next-name) [ $# -eq 2 ] || die "next-name CI_REPO ADMIN_REPO"; next_name "$1" "$2" ;;
+  battery) cmd_battery "$@" ;;
+  ci) cmd_ci "$@" ;;
+  ci-drain) need_root ci-drain; ci_drain ;;
+  cores) cmd_cores "$@" ;;
+  slots) [ $# -ge 1 ] && [ $# -le 2 ] || die "slots N|off [THREADS]"; cmd_slots "$@" ;;
+  limit) cmd_limit "$@" ;;
+  info) cmd_info ;;
+  ramdisk) cmd_ramdisk "$@" ;;
+  postgres) cmd_postgres "$@" ;;
+  linux-vm) cmd_linux_vm "$@" ;;
+  self-update) [ $# -eq 1 ] || die "self-update FILE"; cmd_self_update "$1" ;;
+  relink) cmd_relink ;;
+  uninstall) cmd_uninstall ;;
+  bootstrap) [ $# -eq 1 ] || die "bootstrap ENVFILE"; cmd_bootstrap "$1" ;;
+  power-watch) cmd_power_watch ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

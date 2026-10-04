@@ -1,0 +1,7 @@
+.git
+.claude
+out
+docs
+ci
+secrets
+*.pkg

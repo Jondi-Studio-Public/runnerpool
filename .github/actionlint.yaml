@@ -1,0 +1,9 @@
+self-hosted-runner:
+  labels:
+    - mac-admin
+    - mac-ci-heavy
+    - mac-ci
+    - win-admin
+    - win-ci
+    - linux-admin
+    - linux-ci

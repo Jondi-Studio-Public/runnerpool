@@ -1,0 +1,119 @@
+# Remote control for Linux boxes (the PC's WSL runners): the twin of admin.yml. Runs on the
+# box's admin runner (a root service), started by `runner <action> <host>` on the control PC,
+# which may mint a token and pass it in. If the box is off the job waits in the queue and
+# `runner` cancels it after two minutes. The admin runner itself is never restarted from here.
+name: Admin (Linux)
+run-name: ${{ inputs.action }} on ${{ inputs.host }} (${{ inputs.request }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "Box's name, e.g. wsl-1"
+        required: true
+      action:
+        type: choice
+        options:
+          - status
+          - doctor
+          - info
+          - logs
+          - restart-ci
+          - add-runner
+          - remove-runner
+          - update-linuxrunner
+          - ci-on
+          - ci-off
+          - cores
+          - limit
+          - slots
+          - install-postgres
+        default: status
+      token:
+        description: Registration or removal token, when the action needs one
+        required: false
+      repo:
+        description: add-runner only, owner/name or the org
+        required: false
+      labels:
+        description: add-runner only, comma-separated
+        required: false
+      name:
+        description: add-runner / remove-runner / logs, the runner's name
+        required: false
+      cores:
+        description: cores action a number or all; limit action a number or default (name is the runner)
+        required: false
+      ram:
+        description: limit action only, MB or default
+        required: false
+      slots:
+        description: "slots action only: N, N:THREADS (CPU threads per job, default 8) or off. N CI jobs may run at once"
+        required: false
+      request:
+        description: Id the control PC uses to find this run
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  admin:
+    runs-on: [self-hosted, Linux, linux-admin, "${{ inputs.host }}"]
+    timeout-minutes: 20
+    env:
+      HOST: ${{ inputs.host }}
+      ACTION: ${{ inputs.action }}
+      TOKEN: ${{ inputs.token }}
+      REPO: ${{ inputs.repo }}
+      LABELS: ${{ inputs.labels }}
+      NAME: ${{ inputs.name }}
+      CORES: ${{ inputs.cores }}
+      RAM: ${{ inputs.ram }}
+      SLOTS: ${{ inputs.slots }}
+    steps:
+      - name: Mask token
+        run: if [ -n "$TOKEN" ]; then echo "::add-mask::$TOKEN"; fi
+
+      - uses: actions/checkout@v5
+        if: inputs.action == 'update-linuxrunner'
+
+      - name: ${{ inputs.action }}
+        run: |
+          set -euo pipefail
+          lr=/opt/git-runner/linuxrunner
+          tok=${TOKEN:--}
+          nm=${NAME:-$HOST}
+          case "$ACTION" in
+            status|doctor|info) "$lr" "$ACTION" ;;
+            logs) "$lr" logs "$nm" 80 ;;
+            restart-ci) "$lr" restart ;;
+            add-runner)
+              if [ -z "$REPO" ] || [ -z "$LABELS" ] || [ -z "$NAME" ]; then echo 'add-runner needs repo, labels and name'; exit 1; fi
+              case "$NAME" in *-admin) echo 'names ending -admin are reserved'; exit 1 ;; esac
+              "$lr" add-runner "$REPO" "$NAME" "$LABELS" "$tok" ci ;;
+            remove-runner)
+              case "$NAME" in ''|*-admin) echo 'name a CI runner (not the admin runner)'; exit 1 ;; esac
+              "$lr" remove-runner "$NAME" "$tok" ;;
+            update-linuxrunner) "$lr" self-update "$GITHUB_WORKSPACE/linux/linuxrunner" ;;
+            ci-on) "$lr" ci on ;;
+            ci-off) "$lr" ci off ;;
+            cores) "$lr" cores "${CORES:-all}" ;;
+            limit)
+              case "$NAME" in ''|*-admin) echo 'name a CI runner (not the admin runner)'; exit 1 ;; esac
+              "$lr" limit "$NAME" ${CORES:+"cores=$CORES"} ${RAM:+"ram=$RAM"} ;;
+            slots)
+              # On a PC the Windows side owns this setting (`runner slots win-1 ...`) and the distro follows it;
+              # this is for a Linux box on its own.
+              [ -n "${SLOTS:-}" ] || { echo 'slots needs a number or off'; exit 1; }
+              th=''; case "$SLOTS" in *:*) th=${SLOTS#*:} ;; esac
+              "$lr" slots "${SLOTS%%:*}" ${th:+"$th"} ;;
+            install-postgres)
+              # The Postgres 16 binaries an integration job starts its own cluster from;
+              # the same step linux/linux-provision.sh runs on a fresh distro.
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql >/dev/null
+              systemctl disable --now postgresql >/dev/null 2>&1 || true
+              test -x /usr/lib/postgresql/16/bin/initdb
+              echo "postgres 16 binaries installed" ;;
+            *) echo "unknown action $ACTION"; exit 1 ;;
+          esac

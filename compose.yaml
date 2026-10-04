@@ -1,0 +1,105 @@
+name: macs-dashboard
+
+services:
+  dashboard:
+    # Built by .github/workflows/deploy.yml on merge and pulled from GHCR; the server never builds.
+    # IMAGE_TAG (the commit's first 12 characters) is set by that workflow, or by scripts/deploy.sh.
+    image: ghcr.io/${GITRUNNER_ORG:?set GITRUNNER_ORG to your GitHub org}/macs-dashboard:${IMAGE_TAG:-dev}
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: macs-dashboard
+    ports:
+      - "${MACS_DASHBOARD_PORT:-8765}:8765"
+    environment:
+      MACS_REF: main   # gh workflow run --ref main: skips the default-branch GraphQL lookup the token cannot do
+      MACS_ORG: "${GITRUNNER_ORG}"
+      # Hostnames/IPs the dashboard is served on (Host header allowlist).
+      MACS_ALLOWED_HOSTS: "${MACS_ALLOWED_HOSTS:?set MACS_ALLOWED_HOSTS, e.g. runners.example.com,192.0.2.10}"
+      # Optional: repos outside the org to show in the CI panel, and the token that can read them
+      # (OWNER=/run/secrets/gh_token_personal; empty file = not set up).
+      MACS_CI_EXTRA: "${MACS_CI_EXTRA:-}"
+      MACS_CI_TOKEN_FILES: "${MACS_CI_TOKEN_FILES:-}"
+      # Windows PCs push their health to POST /api/push-info with a per-PC token: lines `win-1=<token>`
+      # in this file (empty file = push off; see docs/dashboard-deploy.md, "PC health push").
+      MACS_PUSH_TOKENS_FILE: "/run/secrets/push_tokens"
+    # Tailnet IPs of your Macs, under the runner names the Macs give themselves (air-1, air-2, ...):
+    # the server resolves names with accept-dns off. Set MAC_1_IP / MAC_2_IP, and add a line per
+    # extra Mac. The defaults are placeholders (192.0.2.0/24 is a documentation range).
+    extra_hosts:
+      - "air-1:${MAC_1_IP:-192.0.2.11}"
+      - "air-2:${MAC_2_IP:-192.0.2.12}"
+    secrets:
+      - gh_token
+      - dashboard_token
+      - gh_token_personal
+      - push_tokens
+      - gh_app_id
+      - gh_app_key
+    restart: unless-stopped
+    mem_limit: 768m   # 256m was OOM-killed under normal use (python + gh + ssh children + threads)
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  # The CI watchdog: the dashboard's image and GitHub token, its own entrypoint and state volume.
+  watchdog:
+    image: ghcr.io/${GITRUNNER_ORG:?set GITRUNNER_ORG to your GitHub org}/macs-dashboard:${IMAGE_TAG:-dev}
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: ci-watchdog
+    entrypoint: ["sh", "/app/watchdog/entrypoint.sh"]
+    environment:
+      WATCHDOG_ORG: "${GITRUNNER_ORG}"
+      # Thresholds and schedule: every WATCHDOG_* variable in docs/watchdog.md can be set here.
+      WATCHDOG_NTFY_URL: "${WATCHDOG_NTFY_URL:-https://ntfy.sh}"
+      WATCHDOG_DIGEST_HOUR: "${WATCHDOG_DIGEST_HOUR:-7}"
+      WATCHDOG_TZ: "${WATCHDOG_TZ:-UTC}"
+    secrets:
+      - gh_token
+      - gh_app_id
+      - gh_app_key
+      - ntfy_topic
+      - ntfy_token
+    volumes:
+      - watchdog-data:/data
+    healthcheck:
+      test: ["CMD", "python3", "/app/watchdog/watchdog.py", "--healthcheck"]
+      interval: 60s
+      timeout: 5s
+      start_period: 90s
+    restart: unless-stopped
+    mem_limit: 128m
+    cpus: 0.25
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  watchdog-data:
+
+# Local runs: create these files under ./secrets (gitignored) first; gh_token_personal, push_tokens, gh_app_id, gh_app_key, ntfy_topic and ntfy_token may be empty.
+# On the server, compose.server.yaml points them at /root/macs-dashboard/secrets.
+secrets:
+  gh_token:
+    file: ./secrets/gh_token
+  dashboard_token:
+    file: ./secrets/dashboard_token
+  gh_token_personal:
+    file: ./secrets/gh_token_personal
+  push_tokens:
+    file: ./secrets/push_tokens
+  gh_app_id:
+    file: ./secrets/gh_app_id
+  gh_app_key:
+    file: ./secrets/gh_app_key
+  ntfy_topic:
+    file: ./secrets/ntfy_topic
+  ntfy_token:
+    file: ./secrets/ntfy_token

@@ -1,0 +1,165 @@
+# Remote control for the Macs. Runs on the chosen Mac's admin runner (as root), started by
+# `runner <action> <host>` on the PC, which may mint a token and pass it in; without one the
+# Mac mints its own with its stored GitHub token. If the Mac is off or asleep the job waits in
+# the queue; `runner` cancels it after two minutes and says so. The admin runner itself is restarted over SSH, never from here.
+name: Admin
+run-name: ${{ inputs.action }} on ${{ inputs.host }} (${{ inputs.request }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "Mac's runner name, e.g. air-1"
+        required: true
+      action:
+        type: choice
+        options:
+          - status
+          - doctor
+          - info
+          - logs
+          - restart-ci
+          - reregister-ci
+          - remove-ci
+          - add-runner
+          - remove-runner
+          - update-macrunner
+          - battery-pause
+          - battery-run
+          - ramdisk-on
+          - ramdisk-off
+          - postgres-install
+          - linux-vm-on
+          - linux-vm-off
+          - linux-vm-status
+          - ci-on
+          - ci-off
+          - cores
+          - limit
+          - slots
+          - tailscale-up
+          - rotate-token
+          - set-app
+        default: status
+      token:
+        description: Registration or removal token, when the action needs one
+        required: false
+      repo:
+        description: add-runner only, owner/name
+        required: false
+      labels:
+        description: add-runner only, comma-separated
+        required: false
+      name:
+        description: add-runner / remove-runner / logs, the runner's name
+        required: false
+      size:
+        description: "ramdisk-on: GB (default 4); linux-vm-on: options such as `--cpus 4 --memory 6` (--cpus, --memory, --disk, --no-admin); slots: N, N:THREADS or off"
+        required: false
+      cores:
+        description: cores action a number or all; limit action a number or default (name is the runner)
+        required: false
+      ram:
+        description: limit action only, MB or default
+        required: false
+      request:
+        description: Id the PC uses to find this run
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CI_REPO: ${{ github.repository_owner }} # org-level: the Macs' CI runners serve every repo in the org
+  CI_LABELS: mac-ci-heavy,mac-ci
+
+jobs:
+  admin:
+    runs-on: [self-hosted, macOS, mac-admin, "${{ inputs.host }}"]
+    timeout-minutes: 20
+    env:
+      HOST: ${{ inputs.host }}
+      ACTION: ${{ inputs.action }}
+      TOKEN: ${{ inputs.token }}
+      REPO: ${{ inputs.repo }}
+      LABELS: ${{ inputs.labels }}
+      NAME: ${{ inputs.name }}
+      SIZE: ${{ inputs.size }}
+      CORES: ${{ inputs.cores }}
+      RAM: ${{ inputs.ram }}
+    steps:
+      - name: Mask token
+        run: '[ -z "$TOKEN" ] || echo "::add-mask::$TOKEN"'
+
+      - uses: actions/checkout@v5
+        if: inputs.action == 'update-macrunner' || inputs.action == 'linux-vm-on'
+
+      - name: ${{ inputs.action }}
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          NEW_GITHUB_TOKEN: ${{ inputs.action == 'rotate-token' && secrets.RUNNER_PAT || '' }}
+          # set-app: the App's id and private key from the CI_APP_ID / CI_APP_PRIVATE_KEY secrets. The key is
+          # multi-line PEM, so it travels base64-encoded; neither value is ever echoed.
+          NEW_APP_ID: ${{ inputs.action == 'set-app' && secrets.CI_APP_ID || '' }}
+          APP_PRIVATE_KEY: ${{ inputs.action == 'set-app' && secrets.CI_APP_PRIVATE_KEY || '' }}
+        run: |
+          set -euo pipefail
+          gr=$(command -v gitrunner || command -v macrunner)  # gitrunner, or the old name on a Mac not yet updated
+          case "$ACTION" in
+            status) "$gr" status ;;
+            doctor) "$gr" doctor ;;
+            info) "$gr" info ;;
+            logs) "$gr" logs "${NAME:-$HOST}" 80 ;;
+            restart-ci) "$gr" restart "$HOST" ;;
+            reregister-ci) "$gr" add-runner "$CI_REPO" "$HOST" "$CI_LABELS" "${TOKEN:--}" ci ;;
+            remove-ci) "$gr" remove-runner "$HOST" "${TOKEN:--}" ;;
+            add-runner)
+              if [ -z "$REPO" ] || [ -z "$LABELS" ] || [ -z "$NAME" ]; then echo "add-runner needs repo, labels and name"; exit 1; fi
+              case "$NAME" in *-admin) echo "names ending -admin are reserved"; exit 1 ;; esac
+              "$gr" add-runner "$REPO" "$NAME" "$LABELS" "${TOKEN:--}" ci ;;
+            remove-runner)
+              case "$NAME" in ""|*-admin) echo "name a CI runner (not the admin runner)"; exit 1 ;; esac
+              "$gr" remove-runner "$NAME" "${TOKEN:--}" ;;
+            update-macrunner)
+              "$gr" self-update "$GITHUB_WORKSPACE/mac/gitrunner"
+              # an older tool wrote the new file over macrunner: move it to gitrunner (no-op when already linked)
+              /usr/local/mac-runners/macrunner relink
+              # keep the Linux VM's copies of linuxrunner and its provisioning script current (they ride along in the repo)
+              "$gr" linux-vm files "$GITHUB_WORKSPACE" ;;
+            battery-pause) "$gr" battery pause ;;
+            battery-run) "$gr" battery run ;;
+            ramdisk-on) "$gr" ramdisk on "${SIZE:-4}" && "$gr" status ;;
+            ramdisk-off) "$gr" ramdisk off && "$gr" status ;;
+            postgres-install) "$gr" postgres install ;;
+            linux-vm-on)
+              # SIZE carries the options here; it is split on spaces, never evaluated, and gitrunner validates every word.
+              "$gr" linux-vm files "$GITHUB_WORKSPACE"
+              read -ra vm_args <<< "${SIZE:-}"
+              "$gr" linux-vm on ${vm_args[@]+"${vm_args[@]}"} ;;
+            linux-vm-off) "$gr" linux-vm off ;;
+            linux-vm-status) "$gr" linux-vm status ;;
+            ci-on) "$gr" ci on ;;
+            ci-off) "$gr" ci off ;;
+            cores) "$gr" cores "${CORES:-all}" ;;
+            limit)
+              case "$NAME" in ""|*-admin) echo "name a CI runner (not the admin runner)"; exit 1 ;; esac
+              "$gr" limit "$NAME" ${CORES:+"cores=$CORES"} ${RAM:+"ram=$RAM"} ;;
+            slots)
+              # SIZE carries N, N:THREADS or off (the input list is full); gitrunner validates both words.
+              [ -n "${SIZE:-}" ] || { echo "slots needs N, N:THREADS or off"; exit 1; }
+              th=""; case "$SIZE" in *:*) th=${SIZE#*:} ;; esac
+              "$gr" slots "${SIZE%%:*}" ${th:+"$th"} && "$gr" status ;;
+            tailscale-up)
+              [ -n "$TS_AUTHKEY" ] || { echo "set the TS_AUTHKEY secret first"; exit 1; }
+              tailscale --socket=/var/run/tailscaled.socket up --auth-key="$TS_AUTHKEY" --hostname="$HOST" --ssh --accept-dns=false --reset
+              touch /usr/local/mac-runners/tailscale-joined
+              tailscale --socket=/var/run/tailscaled.socket status --self --peers=false ;;
+            rotate-token) "$gr" set-token "$CI_REPO" ;;
+            set-app)
+              if [ -z "$NEW_APP_ID" ] || [ -z "$APP_PRIVATE_KEY" ]; then echo "set the CI_APP_ID and CI_APP_PRIVATE_KEY secrets first"; exit 1; fi
+              NEW_APP_KEY_B64=$(printf '%s' "$APP_PRIVATE_KEY" | base64 | tr -d '\r\n')
+              unset APP_PRIVATE_KEY
+              export NEW_APP_KEY_B64
+              "$gr" set-app "$CI_REPO" ;;
+            *) echo "unknown action $ACTION"; exit 1 ;;
+          esac

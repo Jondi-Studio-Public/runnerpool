@@ -1,0 +1,11 @@
+#!/bin/bash
+# The mac-runners package's postinstall, run as root by Installer after it copies the payload
+# to /usr/local/mac-runners. Everything else is in gitrunner; this only hands over to it.
+set -euo pipefail
+HOME_DIR=/usr/local/mac-runners
+mkdir -p /var/log/mac-runners
+ln -sf "$HOME_DIR/gitrunner" /usr/local/bin/gitrunner
+ln -sf "$HOME_DIR/gitrunner" /usr/local/bin/macrunner
+ln -sf gitrunner "$HOME_DIR/macrunner"
+"$HOME_DIR/gitrunner" bootstrap "$HOME_DIR/bootstrap.env" 2>&1 | tee -a /var/log/mac-runners/install.log
+exit "${PIPESTATUS[0]}"

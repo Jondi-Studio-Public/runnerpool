@@ -1,0 +1,539 @@
+#!/bin/bash
+# linuxrunner: manages the GitHub Actions runners on a Linux box that runs systemd, such as the
+# PC's WSL distro `gh-runner`. Run as root, by the Admin (Linux) workflow (its runner is a root
+# service here), or by hand. It ADOPTS runners already installed by GitHub's own svc.sh
+# (units actions.runner.<scope>.<name>.service) and never re-registers them, so adopting takes
+# no CI offline. `linuxrunner help` lists the commands.
+set -euo pipefail
+
+HOME_DIR=/opt/git-runner
+[ -z "${GIT_RUNNER_HOME:-}" ] || HOME_DIR=$GIT_RUNNER_HOME   # tests point it elsewhere
+RUNNERS=$HOME_DIR/runners            # runners this tool installed (the admin runner, `add-runner`)
+HOST_FILE=$HOME_DIR/host             # this box's name, e.g. wsl-1
+CI_OFF=$HOME_DIR/ci-off              # present = CI runners are stopped and stay stopped
+CORES_FILE=$HOME_DIR/max-cores       # N = CI jobs may use N cores; absent = all
+CONF=$HOME_DIR/conf                  # NAME.limits per runner: `cores=N` / `ram=MB` lines
+SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}   # where the MemoryMax / CPUQuota drop-ins go
+ETC_DIR=${ETC_DIR:-/etc}              # where install-docker writes apt and Docker config (tests point it elsewhere)
+SLOTS_FILE=$HOME_DIR/slots           # `slots=N` / `threads=T` lines: the PC's job slots (absent = no slot cap)
+SLOT_DIR_FILE=$HOME_DIR/slot-dir     # where the slot locks live (the follower points it at the Windows side)
+FOLLOW_LAST=$HOME_DIR/follow-last    # the Windows state the follower last applied
+FOLLOW_UNIT=win-runners-follow.service
+CI_USER=${CI_USER:-runner}           # who adopted and new CI runners run as
+UNIT_GLOB='actions.runner.*.service'
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+die() { log "error: $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" = 0 ] || die "run as root (sudo linuxrunner)"; }
+
+# --- discovery ----------------------------------------------------------------------------
+
+units() { systemctl list-units "$UNIT_GLOB" --all --plain --no-legend 2>/dev/null | awk '{print $1}'; }
+unit_name() { local n=${1#actions.runner.}; n=${n%.service}; echo "${n#*.}"; }  # strip the scope
+unit_for() { local u; for u in $(units); do [ "$(unit_name "$u")" = "$1" ] && { echo "$u"; return; }; done; return 1; }
+unit_dir() { systemctl show -p WorkingDirectory --value "$1"; }
+is_admin() { [[ "$1" == *-admin ]]; }
+ci_units() { local u; for u in $(units); do is_admin "$(unit_name "$u")" || echo "$u"; done; }
+host() { [ -f "$HOST_FILE" ] && cat "$HOST_FILE" || hostname; }
+is_busy() { pgrep -f "$(unit_dir "$1")/bin/Runner.Worker" >/dev/null 2>&1; }
+state() { systemctl is-active "$1" 2>/dev/null || true; }
+runner_field() {  # DIR FIELD -> value from .runner (never prints tokens: only known fields)
+  sed -nE "s|.*\"$2\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*|\1|p" "$1/.runner" | head -1
+}
+
+# --- commands -----------------------------------------------------------------------------
+
+cmd_status() {
+  local u d
+  echo "host: $(host)  ($(. /etc/os-release && echo "$PRETTY_NAME"), $(nproc) cores, $(free -m | awk '/Mem:/{print $2}') MB RAM)"
+  [ -f "$CI_OFF" ] && echo "CI: off (linuxrunner ci on to resume)" || echo "CI: on"
+  [ -f "$CORES_FILE" ] && echo "max cores: $(cat "$CORES_FILE")" || echo "max cores: all"
+  if [ -n "$(slots_n)" ]; then
+    echo "slots: $(held_slots | wc -l) of $(slots_n) in use on the PC ($(slots_threads) threads each)"
+    for u in $(held_slots); do echo "  $(basename "$u"): $(owner_field "$u" runner) ($(owner_field "$u" side))"; done
+  else echo "slots: off"; fi
+  for u in $(units); do
+    d=$(unit_dir "$u")
+    printf '  %-28s %-9s %s %s\n' "$(unit_name "$u")" "$(state "$u")" \
+      "$(is_busy "$u" && echo busy || echo idle)" "$(runner_field "$d" gitHubUrl)"
+  done
+}
+
+cmd_doctor() {
+  local bad=0 u d
+  cmd_status
+  echo "-- checks"
+  [ "$(systemctl is-system-running 2>/dev/null || true)" != offline ] || { echo "FAIL systemd is not running"; bad=1; }
+  for u in $(units); do
+    d=$(unit_dir "$u")
+    [ -f "$d/.runner" ] || { echo "FAIL $(unit_name "$u"): no .runner in $d"; bad=1; }
+    if [ ! -f "$CI_OFF" ] && ! is_admin "$(unit_name "$u")" && [ "$(state "$u")" != active ]; then
+      echo "FAIL $(unit_name "$u") is $(state "$u")"; bad=1
+    fi
+    [ "$(pgrep -fc "$d/bin/Runner.Listener" || true)" -le 1 ] || { echo "FAIL $(unit_name "$u"): two Runner.Listener processes"; bad=1; }
+  done
+  [ -n "$(ci_units)" ] || { echo "FAIL no CI runners found"; bad=1; }
+  [ "$(df --output=pcent / | tail -1 | tr -dc 0-9)" -lt 90 ] || { echo "FAIL disk over 90% full"; bad=1; }
+  [ "$bad" = 0 ] && echo "all checks passed"
+  return "$bad"
+}
+
+jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+cmd_info() {
+  local u d first=1
+  local ram_mb
+  ram_mb=$(free -m | awk '/Mem:/{print $2}')
+  printf '{"host":%s,"kind":"linux","cores":%s,"ram_mb":%s,"memory_gb":%s,"ci_on":%s,"max_cores":%s,"slots":%s,"slot_threads":%s,"slots_held":%s,"runners":[' \
+    "$(jstr "$(host)")" "$(nproc)" "$ram_mb" "$(( (ram_mb + 512) / 1024 ))" \
+    "$([ -f "$CI_OFF" ] && echo false || echo true)" "$([ -f "$CORES_FILE" ] && cat "$CORES_FILE" || echo null)" \
+    "$(slots_n | grep . || echo null)" "$(slots_threads | grep . || echo null)" "$(held_slots | wc -l)"
+  for u in $(units); do
+    d=$(unit_dir "$u")
+    [ "$first" = 1 ] || printf ','; first=0
+    local n lc lr; n=$(unit_name "$u")
+    lc=$(runner_limit "$n" cores); lr=$(runner_limit "$n" ram)
+    printf '{"name":%s,"kind":"%s","state":%s,"busy":%s,"url":%s,"limit":{"cores":%s,"ram_mb":%s}}' "$(jstr "$n")" \
+      "$(is_admin "$n" && echo admin || echo ci)" "$(jstr "$(state "$u")")" \
+      "$(is_busy "$u" && echo true || echo false)" "$(jstr "$(runner_field "$d" gitHubUrl)")" "${lc:-null}" "${lr:-null}"
+  done
+  echo ']}'
+}
+
+cmd_logs() {  # [name] [lines]
+  local name=${1:-} n=${2:-80} u
+  if [ -z "$name" ] || [ "$name" = "$(host)" ]; then for u in $(units); do echo "== $(unit_name "$u")"; journalctl -u "$u" -n 20 --no-pager; done; return; fi
+  u=$(unit_for "$name") || die "no runner named $name"
+  journalctl -u "$u" -n "$n" --no-pager
+  ls -t "$(unit_dir "$u")"/_diag/Runner_*.log 2>/dev/null | head -1 | xargs -r tail -n 20
+}
+
+cmd_restart() {  # [name]: restarts CI runners, waiting out a running job for each
+  local u
+  for u in $( [ -n "${1:-}" ] && [ "${1:-}" != "$(host)" ] && unit_for "$1" || ci_units ); do
+    is_busy "$u" && { log "$(unit_name "$u") is busy: skipped"; continue; }
+    systemctl restart "$u"; log "restarted $(unit_name "$u")"
+  done
+}
+
+# Stops the CI runners that have no job right now; one in a job is left to finish it (stopping it would cut the job
+# short), and the next pass (the follower runs one every 2 s) stops it the moment the job ends.
+ci_stop_idle() {
+  local u
+  for u in $(ci_units); do
+    is_busy "$u" || [ "$(state "$u")" != active ] || { systemctl stop "$u" && log "CI off: stopped $(unit_name "$u")"; }
+  done
+}
+
+cmd_ci() {  # on|off: off stops idle runners now and busy ones when their job ends, then stays off across reboots
+  local u
+  case "${1:-}" in
+    off) need_root; : > "$CI_OFF"
+      for u in $(ci_units); do systemctl disable "$u" 2>/dev/null; done
+      ci_stop_idle; log "CI off" ;;
+    on) need_root; rm -f "$CI_OFF"
+      for u in $(ci_units); do systemctl enable --now "$u" 2>/dev/null; done; log "CI on" ;;
+    *) die "ci on|off" ;;
+  esac
+}
+
+# Per-runner limits (`limit`) win over the device-wide `cores`; a missing line = no per-runner limit.
+runner_limit() {  # NAME cores|ram -> its own value, or nothing
+  sed -n "s/^$2=\([0-9][0-9]*\)\$/\1/p" "$CONF/$1.limits" 2>/dev/null | head -1 || true
+}
+device_cores() { [ -f "$CORES_FILE" ] && cat "$CORES_FILE" || true; }
+
+# --- job slots ------------------------------------------------------------------------------
+# A PC allows at most N CI jobs at once across its Windows and Linux runners, each on T threads. The
+# cap is N lock directories, slot-1..slot-N, in one folder both sides can see (on the PC, the Windows
+# folder C:\ProgramData\win-runners-public\slots, here /mnt/c/...). A runner's job-started hook takes a
+# slot with mkdir (atomic) and WAITS while all are taken; its job-completed hook gives it back. The
+# slot number picks the job's block of T threads. `slot-sync` (the follower runs it every 2 s) clears
+# slots whose job is gone and stops idle runners while every slot is held, so they take no more work.
+slot_conf() { sed -n "s/^$1=\([0-9][0-9]*\)\$/\1/p" "$SLOTS_FILE" 2>/dev/null | head -1 || true; }
+slots_n() { slot_conf slots; }
+slots_threads() { slot_conf threads; }
+slot_dir() {
+  if [ -n "${SLOT_DIR:-}" ]; then echo "$SLOT_DIR"
+  elif [ -s "$SLOT_DIR_FILE" ]; then cat "$SLOT_DIR_FILE"
+  else echo "$HOME_DIR/slots.d"; fi
+}
+owner_field() { sed -n "s/^$2=//p" "$1/owner" 2>/dev/null | head -1 || true; }
+held_slots() { local d; for d in "$(slot_dir)"/slot-*; do [ -d "$d" ] && echo "$d"; done; return 0; }
+slot_age() { echo $(( $(date +%s) - $(stat -c %Y "$1" 2>/dev/null || date +%s) )); }
+
+# The T threads of slot NUM (1-based): block NUM-1 of T CPUs, wrapping if the box has fewer CPUs.
+cpu_block() {  # NUM THREADS TOTAL -> a CPU list such as 8-15, or nothing when the block is every CPU
+  local num=$1 t=$2 total=$3 start end
+  [ "$t" -lt "$total" ] || return 0
+  start=$(( ((num - 1) * t) % total )); end=$(( start + t - 1 ))
+  if [ "$end" -lt "$total" ]; then echo "$start-$end"; else echo "$start-$((total - 1)),0-$((end - total))"; fi
+}
+
+# The hook the runner runs when a job starts (acquire) or ends (release); never fails the job. It runs
+# as the runner's own user, so it only needs to read the files above.
+cmd_hook() {  # acquire|release
+  local action=${1:-} name=${GIT_RUNNER_NAME:-${RUNNER_NAME:-}} dir n t i d cpus last=0
+  [ -n "$name" ] || { log "slot hook: no runner name, skipped"; return 0; }
+  dir=$(slot_dir); n=$(slots_n); t=$(slots_threads)
+  [ -n "$n" ] || return 0
+  for d in "$dir"/slot-*; do  # a runner runs one job at a time, so any slot it still holds is left over
+    [ -d "$d" ] && [ "$(owner_field "$d" runner)" = "$name" ] && rm -rf "$d"
+  done
+  [ "$action" = acquire ] || return 0
+  mkdir -p "$dir" 2>/dev/null || true
+  while :; do
+    # N is read on every pass, so `runner slots` changes take effect at once: a raise lets a waiting job in, a
+    # lowering keeps it out until the held slots (ALL slot-* folders, whatever their number) are fewer than N.
+    n=$(slots_n); t=$(slots_threads)
+    [ -n "$n" ] || return 0
+    if [ "$(held_slots | wc -l)" -lt "$n" ]; then
+      for i in $(seq 1 "$n"); do
+        mkdir "$dir/slot-$i" 2>/dev/null || continue
+        printf 'runner=%s\nside=linux\npid=%s\njob=%s\ntime=%s\nblock=%s\n' "$name" "$$" "${GITHUB_RUN_ID:-}" "$(date +%s)" "$((i - 1))" > "$dir/slot-$i/owner"
+        if [ "$(held_slots | wc -l)" -gt "$n" ]; then  # two jobs, or a lowered N, won the same instant: back out and retry
+          rm -rf "$dir/slot-$i"; sleep "0.$((RANDOM % 5 + 1))"; continue 2
+        fi
+        cpus=$(cpu_block "$i" "${t:-8}" "$(nproc)")
+        [ -z "$cpus" ] || ! command -v taskset >/dev/null 2>&1 || taskset -a -pc "$cpus" "$PPID" >/dev/null 2>&1 || true
+        log "got PC job slot $i of $n${cpus:+ (CPUs $cpus)}"
+        return 0
+      done
+    fi
+    if [ $(( $(date +%s) - last )) -ge 30 ]; then log "waiting for a PC job slot ($(held_slots | wc -l) of $n in use)"; last=$(date +%s); fi
+    sleep "${SLOT_POLL:-3}"
+  done
+}
+
+# Clears slots held by a Linux job that is gone (cancelled, crashed), then pauses or resumes idle CI runners.
+cmd_slot_sync() {
+  local n d dir u name held age side
+  n=$(slots_n); [ -n "$n" ] || return 0
+  dir=$(slot_dir)
+  for d in $(held_slots); do
+    age=$(slot_age "$d"); side=$(owner_field "$d" side); name=$(owner_field "$d" runner)
+    if [ -z "$side" ]; then [ "$age" -gt 60 ] && rm -rf "$d"; continue; fi  # written a moment ago, or abandoned
+    [ "$side" = linux ] && [ "$age" -gt 20 ] || continue
+    u=$(unit_for "$name" 2>/dev/null) || u=
+    if [ -z "$u" ] || ! is_busy "$u"; then rm -rf "$d"; log "cleared stale slot $(basename "$d") ($name has no job)"; fi
+  done
+  if [ -f "$CI_OFF" ]; then ci_stop_idle; return 0; fi   # `ci off` wins over slots: busy runners stop as their job ends
+  [ -e "$HOME_DIR/provisioned" ] || return 0
+  held=$(held_slots | wc -l)
+  for u in $(ci_units); do
+    if [ "$held" -ge "$n" ]; then
+      is_busy "$u" || [ "$(state "$u")" != active ] || { systemctl stop "$u" && log "slots full: paused $(unit_name "$u")"; }
+    else
+      [ "$(state "$u")" = active ] || { systemctl start "$u" && log "slot free: resumed $(unit_name "$u")"; }
+    fi
+  done
+  : "$dir"
+}
+
+cmd_slots() {  # N [THREADS] | off
+  need_root
+  local v=${1:-} t=${2:-} total u hook
+  total=$(nproc)
+  if [ "$v" = off ]; then
+    rm -f "$SLOTS_FILE"
+  else
+    [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 32 ] || die "slots N [THREADS] | off (N is 1 to 32)"
+    [ -n "$t" ] || { t=$(slots_threads); t=${t:-8}; [ "$t" -le "$total" ] || t=$total; }
+    [[ "$t" =~ ^[0-9]+$ ]] && [ "$t" -ge 1 ] && [ "$t" -le "$total" ] || die "threads is 1 to $total"
+    mkdir -p "$HOME_DIR"
+    printf 'slots=%s\nthreads=%s\n' "$v" "$t" > "$SLOTS_FILE"; chmod 644 "$SLOTS_FILE"
+    for hook in start:acquire done:release; do
+      printf '#!/bin/sh\n# Job slot hook (linuxrunner hook %s): waits for a PC job slot / gives it back. Never fails the job.\n%s/linuxrunner hook %s || true\nexit 0\n' \
+        "${hook#*:}" "$HOME_DIR" "${hook#*:}" > "$HOME_DIR/slot-${hook%%:*}.sh"
+      chmod 755 "$HOME_DIR/slot-${hook%%:*}.sh"
+    done
+    mkdir -p "$(slot_dir)"; chmod 777 "$(slot_dir)" 2>/dev/null || true
+  fi
+  for u in $(ci_units); do apply_limits "$u"; done
+  write_docker_slice
+  [ -n "$(slots_n)" ] || for u in $(ci_units); do [ -f "$CI_OFF" ] || [ "$(state "$u")" = active ] || systemctl start "$u" || true; done
+  log "job slots: ${v}${t:+ ($t threads each)}"
+}
+
+# Writes unit U's limits: CI_MAX_CORES / CI_MAX_RAM_MB in the runner's .env (jobs see them; workflows
+# pass CI_MAX_CORES to pytest -n, make -j), the slot hooks when slots are on, and a drop-in with
+# MemoryMax and CPUQuota (a real cap on the whole service, jobs included). Restarts the runner when it
+# is idle; a busy one picks it up when it next restarts.
+apply_limits() {  # UNIT
+  local u=$1 name d cores ram dropin slots threads quota=
+  name=$(unit_name "$u"); d=$(unit_dir "$u")
+  slots=$(slots_n); threads=$(slots_threads)
+  cores=$(runner_limit "$name" cores); [ -n "$cores" ] || cores=$(device_cores)
+  if [ -n "$slots" ]; then
+    [ -n "$(runner_limit "$name" cores)" ] || { [ -z "$cores" ] || [ "$cores" -gt "$threads" ] && cores=$threads; }
+    quota=$((threads * 100))
+  fi
+  ram=$(runner_limit "$name" ram)
+  touch "$d/.env"; sed -i '/^CI_MAX_CORES=/d;/^CI_MAX_RAM_MB=/d;/^GIT_RUNNER_NAME=/d' "$d/.env"
+  # Only the slot hooks this tool wrote: another tool's hooks (the Mac's Linux VM sets its own) stay.
+  sed -i "\\|^ACTIONS_RUNNER_HOOK_JOB_STARTED=$HOME_DIR/slot-start.sh\$|d;\\|^ACTIONS_RUNNER_HOOK_JOB_COMPLETED=$HOME_DIR/slot-done.sh\$|d" "$d/.env"
+  [ -z "$cores" ] || echo "CI_MAX_CORES=$cores" >> "$d/.env"
+  [ -z "$ram" ] || echo "CI_MAX_RAM_MB=$ram" >> "$d/.env"
+  if [ -n "$slots" ]; then
+    { echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=$HOME_DIR/slot-start.sh"; echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=$HOME_DIR/slot-done.sh"; echo "GIT_RUNNER_NAME=$name"; } >> "$d/.env"
+  fi
+  dropin=$SYSTEMD_DIR/$u.d/limits.conf
+  if [ -n "$ram" ] || [ -n "$quota" ]; then
+    mkdir -p "$(dirname "$dropin")"
+    { echo '[Service]'; [ -z "$ram" ] || echo "MemoryMax=${ram}M"; [ -z "$quota" ] || echo "CPUQuota=${quota}%"; } > "$dropin"
+  else
+    rm -f "$dropin"; rmdir "$(dirname "$dropin")" 2>/dev/null || true
+  fi
+  systemctl daemon-reload || log "daemon-reload failed: the caps for $name apply after the next reload"
+  if is_busy "$u"; then log "$name is busy: limits apply when it next restarts"; else systemctl restart "$u"; fi
+}
+
+cmd_cores() {  # N|all
+  need_root
+  local v=${1:-} u
+  if [ "$v" = all ]; then rm -f "$CORES_FILE"; elif [[ "$v" =~ ^[1-9][0-9]*$ ]]; then echo "$v" > "$CORES_FILE"; else die "cores N|all"; fi
+  for u in $(ci_units); do apply_limits "$u"; done
+  write_docker_slice
+  log "max cores: $v"
+}
+
+# limit NAME cores=<N|default> ram=<MB|default>: this runner's own limits; either may be left out
+# (unchanged). default drops the override, so the device-wide `cores` (or nothing) applies again.
+cmd_limit() {
+  need_root
+  local name=${1:-} u arg k v total mem_mb cores ram
+  [ -n "$name" ] || die "limit NAME cores=<N|default> ram=<MB|default>"
+  shift
+  [ $# -gt 0 ] || die "limit NAME cores=<N|default> ram=<MB|default>"
+  is_admin "$name" && die "$name is an admin runner: limits are for CI runners"
+  u=$(unit_for "$name") || die "no runner named $name"
+  total=$(nproc); mem_mb=$(free -m | awk '/Mem:/{print $2}')
+  cores=$(runner_limit "$name" cores); ram=$(runner_limit "$name" ram)
+  for arg in "$@"; do
+    k=${arg%%=*}; v=${arg#*=}
+    [ "$k" != "$arg" ] || die "bad argument $arg (cores=<N|default> ram=<MB|default>)"
+    case $k in
+      cores)
+        if [ "$v" = default ]; then cores=
+        elif [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le "$total" ]; then cores=$v
+        else die "cores is 1 to $total, or default"; fi ;;
+      ram)
+        if [ "$v" = default ]; then ram=
+        elif [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 256 ] && [ "$v" -le "$mem_mb" ]; then ram=$v
+        else die "ram is 256 to $mem_mb (MB), or default"; fi ;;
+      *) die "unknown limit $k (cores, ram)" ;;
+    esac
+  done
+  mkdir -p "$CONF"
+  { [ -z "$cores" ] || echo "cores=$cores"; [ -z "$ram" ] || echo "ram=$ram"; } > "$CONF/$name.limits"
+  [ -s "$CONF/$name.limits" ] || rm -f "$CONF/$name.limits"
+  apply_limits "$u"
+  log "$name: cores ${cores:-default}, ram ${ram:-default} MB (RAM: CI_MAX_RAM_MB plus a systemd MemoryMax cap)"
+}
+
+# The runner tarball for this CPU: x86-64 boxes (the PC's WSL) take x64, ARM64 ones (the Macs' Colima VMs) arm64.
+runner_arch() { case $(uname -m) in aarch64|arm64) echo arm64 ;; *) echo x64 ;; esac; }
+
+latest_version() { curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/actions/runner/releases/latest | sed 's|.*/v||'; }
+
+cmd_add_runner() {  # REPO|ORG NAME LABELS TOKEN [ci|root]
+  need_root
+  local scope=$1 name=$2 labels=$3 token=$4 as=${5:-ci} dir=$RUNNERS/$2 url v user
+  [ "$token" != - ] || die "add-runner needs a registration token"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "bad runner name"
+  url=https://github.com/$scope
+  [ "$as" = root ] && user=root || user=$CI_USER
+  id "$user" >/dev/null 2>&1 || useradd -m -s /bin/bash "$user"
+  mkdir -p "$dir"
+  v=$(latest_version)
+  curl -fsSL "https://github.com/actions/runner/releases/download/v$v/actions-runner-linux-$(runner_arch)-$v.tar.gz" | tar xz -C "$dir"
+  [ ! -x "$dir/bin/installdependencies.sh" ] || "$dir/bin/installdependencies.sh" >/dev/null 2>&1 || log "installdependencies.sh failed (continuing)"
+  chown -R "$user" "$dir"
+  sudo -u "$user" env RUNNER_ALLOW_RUNASROOT=1 "$dir/config.sh" --unattended --replace --url "$url" --token "$token" \
+    --name "$name" --labels "$labels" --work _work >/dev/null
+  ( cd "$dir" && RUNNER_ALLOW_RUNASROOT=1 ./svc.sh install "$user" >/dev/null && ./svc.sh start >/dev/null )
+  log "added $name ($url, labels $labels)"
+  [[ ",$labels," != *,docker,* ]] || command -v docker >/dev/null || cmd_install_docker   # the label promises Docker
+}
+
+# Docker's work runs in its own cgroups, outside the runner services' drop-ins, so a job's `docker build` would escape the
+# slot caps. docker-ci.slice holds ONE slot's caps (threads x 100% CPU, RAM / slots) and dockerd, containerd and the
+# containers all sit under it (install-docker wires that up). Slots off = the device-wide `cores` cap (CPU only; cores sets no
+# RAM cap), or no cap when that is `all`. Rewritten by `slots` and `cores`; the caps apply live on daemon-reload (running containers are not restarted).
+write_docker_slice() {
+  local n t mem_mb f=$SYSTEMD_DIR/docker-ci.slice
+  [ -f "$f" ] || [ -d "$SYSTEMD_DIR/docker.service.d" ] || return 0   # Docker is not set up here
+  n=$(slots_n); t=$(slots_threads); mem_mb=$(free -m | awk '/Mem:/{print $2}')
+  { echo '[Slice]'
+    if [ -n "$n" ]; then echo "CPUQuota=$((t * 100))%"; echo "MemoryMax=$((mem_mb / n))M"
+    elif [ -n "$(device_cores)" ]; then echo "CPUQuota=$(($(device_cores) * 100))%"; fi; } > "$f"
+  systemctl daemon-reload || log "daemon-reload failed: the Docker slice caps apply after the next reload"
+}
+
+# Docker Engine from Docker's own apt repo, for the PC's WSL runners (label `docker`; the Mac VMs stay without it).
+# Needs jq (the provisioning installs it).
+# Safe to run again. Needs systemd (dockerd is the docker.service unit, enabled so it is up whenever the distro is).
+cmd_install_docker() {
+  need_root
+  [ "$(runner_arch)" = x64 ] || die "Docker is only installed on x86-64 boxes (the PC's WSL), not on this ARM64 one"
+  [ "$(systemctl is-system-running 2>/dev/null || true)" != offline ] || die "systemd is not running: dockerd would have no way to start"
+  if [ -L /usr/bin/docker ] && [[ "$(readlink /usr/bin/docker)" == */docker-desktop/* ]]; then
+    die "this distro uses Docker Desktop's WSL integration: switch it off for this distro (Docker Desktop > Settings > Resources > WSL integration)"
+  fi
+  local u user codename
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq ca-certificates curl >/dev/null
+  mkdir -p "$ETC_DIR/apt/keyrings" "$ETC_DIR/apt/sources.list.d"
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o "$ETC_DIR/apt/keyrings/docker.asc"
+  chmod a+r "$ETC_DIR/apt/keyrings/docker.asc"
+  codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+  echo "deb [arch=amd64 signed-by=$ETC_DIR/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" > "$ETC_DIR/apt/sources.list.d/docker.list"
+  apt-get update -qq
+  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null
+  # Containers (cgroup-parent), dockerd and containerd (so BuildKit steps and anything else they start) go under docker-ci.slice.
+  mkdir -p "$ETC_DIR/docker" "$SYSTEMD_DIR/docker.service.d" "$SYSTEMD_DIR/containerd.service.d"
+  [ -s "$ETC_DIR/docker/daemon.json" ] || echo '{}' > "$ETC_DIR/docker/daemon.json"
+  jq '. + {"cgroup-parent": "docker-ci.slice"}' "$ETC_DIR/docker/daemon.json" > "$ETC_DIR/docker/daemon.json.new"
+  mv "$ETC_DIR/docker/daemon.json.new" "$ETC_DIR/docker/daemon.json"
+  printf '[Service]\nSlice=docker-ci.slice\n' | tee "$SYSTEMD_DIR/docker.service.d/slice.conf" > "$SYSTEMD_DIR/containerd.service.d/slice.conf"
+  write_docker_slice
+  systemctl enable docker.service containerd.service
+  systemctl restart containerd.service docker.service   # a running dockerd would keep its old cgroups (and containers stop)
+  # Every CI runner's user may use the socket; a runner picks the group up when it restarts.
+  for user in $CI_USER $(for u in $(ci_units); do systemctl show -p User --value "$u"; done); do
+    ! id "$user" >/dev/null 2>&1 || usermod -aG docker "$user"
+  done
+  docker info >/dev/null
+  log "Docker $(docker --version | sed 's/^Docker version //; s/,.*//') is installed and running"
+  [ -f "$CI_OFF" ] || cmd_restart
+}
+
+cmd_remove_runner() {  # NAME [TOKEN|-]
+  need_root
+  local name=$1 token=${2:--} u d
+  u=$(unit_for "$name") || die "no runner named $name"
+  is_admin "$name" && die "refusing to remove an admin runner from here"
+  d=$(unit_dir "$u")
+  rm -f "$CONF/$name.limits"; rm -rf "${SYSTEMD_DIR:?}/$u.d"
+  systemctl disable --now "$u"
+  [ "$token" = - ] || sudo -u "$(stat -c %U "$d")" "$d/config.sh" remove --token "$token" >/dev/null
+  rm -f "/etc/systemd/system/$u"; systemctl daemon-reload
+  log "removed $name (its folder $d is left in place)"
+}
+
+cmd_install_admin() {  # REPO TOKEN [NAME]: the root runner the Admin (Linux) workflow runs on
+  need_root
+  local repo=$1 token=$2 name=${3:-$(host)-admin}
+  mkdir -p "$HOME_DIR"
+  [ -f "$HOST_FILE" ] || hostname > "$HOST_FILE"
+  cmd_add_runner "$repo" "$name" "linux-admin,$(host)" "$token" root
+}
+
+# Follows the Windows side of a PC (the state file win/winrunner.ps1 writes): stops CI here when the PC
+# is on battery or `runner ci win-1 off` was run, applies its core and slot settings, and keeps the job
+# slots (slot-sync). One pass; the follower service repeats it every 2 seconds.
+cmd_follow_once() {  # STATEFILE
+  local f=$1 cur ci cores slots threads last=
+  echo "$(dirname "$f")/slots" > "$SLOT_DIR_FILE"; chmod 644 "$SLOT_DIR_FILE"
+  if [ -r "$f" ]; then
+    cur=$(cat "$f"); [ ! -f "$FOLLOW_LAST" ] || last=$(cat "$FOLLOW_LAST")
+    if [ "$cur" != "$last" ]; then
+      ci=$(sed -n 's/^ci=//p' <<<"$cur"); cores=$(sed -n 's/^cores=//p' <<<"$cur")
+      slots=$(sed -n 's/^slots=//p' <<<"$cur"); threads=$(sed -n 's/^threads=//p' <<<"$cur")
+      # A box that is not provisioned (see win/linux-provision.sh) never turns CI on.
+      [ -e "$HOME_DIR/provisioned" ] || ci=off
+      if [ -n "$slots" ]; then
+        if [ "$slots" = off ]; then cmd_slots off || true; else cmd_slots "$slots" ${threads:+"$threads"} || true; fi
+      fi
+      [ -z "$ci" ] || cmd_ci "$ci" || true
+      [ -z "$cores" ] || cmd_cores "$cores" || true
+      echo "$cur" > "$FOLLOW_LAST"
+    fi
+  fi
+  cmd_slot_sync
+}
+
+cmd_follow() {  # STATEFILE
+  while :; do cmd_follow_once "$1" || true; sleep "${FOLLOW_POLL:-2}"; done
+}
+
+cmd_install_follower() {  # [STATEFILE]: the service that runs `follow`; keeps the state file of the old one
+  need_root
+  local f=${1:-} unit=/etc/systemd/system/$FOLLOW_UNIT
+  [ -n "$f" ] || f=$(sed -n 's|^ExecStart=[^ ]* \(follow \)\{0,1\}||p' "$unit" 2>/dev/null | head -1)
+  [ -n "$f" ] || die "install-follower STATEFILE"
+  printf '[Unit]\nDescription=Follow the Windows CI state\n[Service]\nExecStart=%s/linuxrunner follow %s\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' "$HOME_DIR" "$f" > "$unit"
+  rm -f "$FOLLOW_LAST"
+  systemctl daemon-reload; systemctl enable "$FOLLOW_UNIT" >/dev/null 2>&1 || true; systemctl restart "$FOLLOW_UNIT"
+  log "follower installed for $f"
+}
+
+cmd_self_update() {  # FILE
+  need_root
+  [ -s "$1" ] && bash -n "$1" || die "not a valid script: $1"
+  install -m 755 "$1" "$HOME_DIR/linuxrunner"; ln -sf "$HOME_DIR/linuxrunner" /usr/local/bin/linuxrunner
+  log "linuxrunner updated"
+  # A follower from before slots existed ran a script of its own: move it onto this one.
+  [ ! -f "/etc/systemd/system/$FOLLOW_UNIT" ] || "$HOME_DIR/linuxrunner" install-follower || log "could not update the follower"
+}
+
+cmd_bootstrap() {  # NAME: first-time setup on a box whose runners were installed by hand
+  need_root
+  mkdir -p "$HOME_DIR"; echo "${1:-$(hostname)}" > "$HOST_FILE"
+  install -m 755 "$0" "$HOME_DIR/linuxrunner"; ln -sf "$HOME_DIR/linuxrunner" /usr/local/bin/linuxrunner
+  log "host named $(host); adopted: $(for u in $(units); do unit_name "$u"; done | tr '\n' ' ')"
+}
+
+usage() {
+  cat <<'USAGE'
+linuxrunner: manage GitHub Actions runners on a systemd Linux box (adopts existing ones)
+
+  bootstrap [NAME]                   name this box (wsl-1) and install the tool; adopts running runners
+  status | doctor | info             state, checks, JSON for the dashboard
+  logs [NAME] [LINES]                service log and runner diagnostics
+  restart [NAME]                     restart idle CI runners (busy ones are skipped)
+  ci on|off                          CI runners take jobs / finish their job and stay stopped
+  cores N|all                        CI jobs may use N cores (CI_MAX_CORES)
+  limit NAME cores=<N|default> ram=<MB|default>
+                                     one runner's own limits (CI_MAX_CORES, CI_MAX_RAM_MB, systemd MemoryMax);
+                                     they win over `cores`; default = back to the device-wide setting
+  slots N [THREADS] | off            the PC's job slots: at most N CI jobs at once (lock folders), each on THREADS
+                                     CPUs (default 8). Hooks make a job wait for a free slot; slot-sync pauses idle runners
+  slot-sync                          clear dead slots, pause idle runners while every slot is held, resume them after
+  hook acquire|release               what a runner's job-started / job-completed hook runs
+  follow STATEFILE | follow-once STATEFILE | install-follower [STATEFILE]
+                                     follow the Windows side of a PC (the service `install-follower` makes)
+  add-runner REPO|ORG NAME LABELS TOKEN [ci|root]
+  remove-runner NAME [TOKEN|-]
+  install-docker                     Docker Engine from Docker's apt repo (x86-64 only), dockerd enabled, runners' users in
+                                     the docker group; add-runner does it when the labels include docker
+  install-admin REPO TOKEN [NAME]    the root runner `runner` reaches this box through
+  self-update FILE
+USAGE
+}
+
+cmd=${1:-help}; shift || true
+case $cmd in
+  status) cmd_status ;;
+  doctor) cmd_doctor ;;
+  info) cmd_info ;;
+  logs) cmd_logs "$@" ;;
+  restart) cmd_restart "$@" ;;
+  ci) cmd_ci "$@" ;;
+  cores) cmd_cores "$@" ;;
+  limit) cmd_limit "$@" ;;
+  add-runner) [ $# -ge 4 ] || die "add-runner REPO|ORG NAME LABELS TOKEN [ci|root]"; cmd_add_runner "$@" ;;
+  remove-runner) [ $# -ge 1 ] || die "remove-runner NAME [TOKEN|-]"; cmd_remove_runner "$@" ;;
+  install-docker) cmd_install_docker ;;
+  install-admin) [ $# -ge 2 ] || die "install-admin REPO TOKEN [NAME]"; cmd_install_admin "$@" ;;
+  slots) [ $# -ge 1 ] || die "slots N [THREADS] | off"; cmd_slots "$@" ;;
+  slot-sync) cmd_slot_sync ;;
+  hook) [ $# -eq 1 ] || die "hook acquire|release"; cmd_hook "$1" ;;
+  follow) [ $# -eq 1 ] || die "follow STATEFILE"; cmd_follow "$1" ;;
+  follow-once) [ $# -eq 1 ] || die "follow-once STATEFILE"; cmd_follow_once "$1" ;;
+  install-follower) cmd_install_follower "$@" ;;
+  bootstrap) cmd_bootstrap "$@" ;;
+  self-update) [ $# -eq 1 ] || die "self-update FILE"; cmd_self_update "$1" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

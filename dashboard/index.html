@@ -1,0 +1,1318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<link rel="icon" href="data:,">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>runnerpool</title>
+<style>
+:root {
+  --bg: #f4f5f7;
+  --card: #ffffff;
+  --card-2: #f8f9fb;
+  --text: #1c2129;
+  --muted: #667085;
+  --line: #e3e6ec;
+  --accent: #2f6fed;
+  --accent-ink: #ffffff;
+  --accent-soft: #e6eefd;
+  --green: #1a7f4b;   --green-bg: #dff5e8;
+  --amber: #8f5a00;   --amber-bg: #fdf0d2;
+  --grey: #5b6472;    --grey-bg: #e9ebf0;
+  --red: #b42318;     --red-bg: #fde4e1;
+  --track: #d5d9e1;
+  --switch-off: #c3c9d4;
+  --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.05);
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151a;
+    --card: #1a1e25;
+    --card-2: #20252d;
+    --text: #e6e9ef;
+    --muted: #97a0af;
+    --line: #2b313b;
+    --accent: #6b9bff;
+    --accent-ink: #0d1626;
+    --accent-soft: #1f2d4a;
+    --green: #5fd394;   --green-bg: #14301f;
+    --amber: #f2be5a;   --amber-bg: #3a2c0c;
+    --grey: #a4adbb;    --grey-bg: #2a2f38;
+    --red: #ff8f84;     --red-bg: #431a17;
+    --track: #2e3541;
+    --switch-off: #48505e;
+    --shadow: none;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  overflow-x: hidden;
+}
+.wrap { max-width: 1120px; margin: 0 auto; padding: 16px; }
+header.top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+header.top h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+header.top .stamp { color: var(--muted); font-size: 13px; }
+header.top .spacer { flex: 1; }
+h3 { font-size: 12px; color: var(--muted); margin: 18px 0 8px; font-weight: 600; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 28px 0 10px; font-weight: 600; }
+
+button {
+  font: inherit; color: var(--text); background: var(--card); border: 1px solid var(--line);
+  border-radius: 8px; padding: 6px 12px; cursor: pointer; min-height: 34px;
+  display: inline-flex; align-items: center; gap: 8px; box-shadow: var(--shadow);
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.hl { border-color: var(--accent); background: var(--accent-soft); }
+a { color: var(--accent); }
+
+.spin {
+  width: 13px; height: 13px; border-radius: 50%; flex: none;
+  border: 2px solid currentColor; border-right-color: transparent;
+  animation: spin .7s linear infinite; display: inline-block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation-duration: 2s; } .pill.busy::before { animation: none; } }
+
+.banner { border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; background: var(--red-bg); color: var(--red); border: 1px solid transparent; overflow-wrap: anywhere; }
+.banner.warn { background: var(--amber-bg); color: var(--amber); }
+.banner[hidden] { display: none; }
+
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 500px), 1fr)); align-items: start; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); padding: 16px; min-width: 0; }
+.card-head { display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
+.card-head h3 { margin: 0; font-size: 18px; letter-spacing: -.01em; }
+.card-head .sub { color: var(--muted); font-size: 13px; flex-basis: 100%; overflow-wrap: anywhere; }
+.pills { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.pill { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: 999px; background: var(--grey-bg); color: var(--grey); white-space: nowrap; }
+.pill { box-shadow: inset 0 0 0 1px color-mix(in srgb, currentColor 22%, transparent); }
+.pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.pill.busy:not(.plain)::before { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .3; } }
+.pill.online { background: var(--green-bg); color: var(--green); }
+.pill.busy { background: var(--amber-bg); color: var(--amber); }
+.pill.offline { background: var(--grey-bg); color: var(--grey); }
+.pill.error { background: var(--red-bg); color: var(--red); }
+.pill.plain::before { display: none; }
+.why { color: var(--muted); font-size: 12px; }
+.stale { opacity: .55; }
+
+.notice { margin: 12px 0 0; padding: 8px 12px; border-radius: 8px; font-size: 13px; background: var(--amber-bg); color: var(--amber); overflow-wrap: anywhere; }
+.notice.err { background: var(--red-bg); color: var(--red); }
+.notice .when { opacity: .85; }
+
+.specs { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px 16px; margin: 16px 0 0; padding: 14px 0 0; border-top: 1px solid var(--line); }
+.spec { min-width: 0; margin: 0; }
+.spec dt { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 1px; }
+.spec dd { margin: 0; font-weight: 500; overflow-wrap: anywhere; }
+.spec.wide { grid-column: 1 / -1; }
+.spec .small { display: block; color: var(--muted); font-weight: 400; font-size: 12px; }
+.spec .small.warn { color: var(--amber); } .spec .small.bad { color: var(--red); }
+.bar { height: 6px; border-radius: 4px; background: var(--track); margin-top: 5px; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+.bar > i.warn { background: #e0a020; }
+.bar > i.bad { background: #d9483b; }
+.bar > i.good { background: #2ea36a; }
+
+.controls { margin-top: 16px; padding-top: 6px; border-top: 1px solid var(--line); }
+.row { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.row .lbl { flex: 1 1 160px; min-width: 0; }
+.row .lbl b { font-weight: 500; display: block; }
+.row .lbl small { color: var(--muted); font-size: 12px; display: block; overflow-wrap: anywhere; }
+.row .ctl { display: flex; align-items: center; gap: 10px; }
+select { font: inherit; color: var(--text); background: var(--card-2); border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; min-height: 30px; }
+select:disabled { opacity: .5; }
+
+/* toggle switch drawn from a real checkbox */
+input.switch {
+  appearance: none; -webkit-appearance: none; margin: 0; flex: none; cursor: pointer;
+  width: 42px; height: 24px; border-radius: 999px; background: var(--switch-off);
+  position: relative; transition: background .15s;
+}
+input.switch::before {
+  content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px;
+  border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: transform .15s;
+}
+input.switch:checked { background: var(--accent); }
+input.switch:checked::before { transform: translateX(18px); }
+input.switch:disabled { opacity: .45; cursor: not-allowed; }
+
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.actions .upd { display: inline-flex; align-items: center; gap: 6px; }
+.badge { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 999px; background: var(--accent); color: var(--accent-ink); }
+
+details.log { margin-top: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--card-2); }
+details.log summary { cursor: pointer; padding: 8px 12px; font-weight: 500; overflow-wrap: anywhere; }
+details.log summary .tag { font-size: 12px; font-weight: 600; margin-left: 6px; }
+details.log summary .tag.ok { color: var(--green); }
+details.log summary .tag.fail { color: var(--red); }
+details.log .body { padding: 0 12px 12px; }
+details.log pre { margin: 0; font: 12px/1.5 var(--mono); max-height: 240px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+details.log .lnk { display: inline-block; margin-top: 8px; }
+
+.foot { margin-top: 14px; display: flex; gap: 8px 12px; flex-wrap: wrap; align-items: center; color: var(--muted); font-size: 12px; }
+.foot .spacer { flex: 1; }
+.foot button { font-size: 12px; min-height: 30px; padding: 4px 10px; }
+.hint { font-size: 12px; color: var(--muted); flex-basis: 100%; }
+.gh { margin-top: 12px; font-size: 12px; color: var(--muted); }
+.gh .r { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 2px 0; }
+.gh .r span.n { color: var(--text); font-weight: 500; }
+.actionerr { margin-top: 12px; }
+
+.repo { background: var(--card); border: 1px solid var(--line); border-radius: 14px; margin-bottom: 12px; box-shadow: var(--shadow); min-width: 0; }
+.repo .rh { display: flex; gap: 8px; align-items: center; padding: 10px 14px; flex-wrap: wrap; overflow-wrap: anywhere; }
+.repo .rh b { font-weight: 600; }
+.tscroll { overflow-x: auto; border-top: 1px solid var(--line); }
+table { border-collapse: collapse; width: 100%; min-width: 440px; }
+th, td { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+td.labels { color: var(--muted); font-size: 12px; }
+.empty { color: var(--muted); padding: 14px; }
+.tiles { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-bottom: 16px; }
+.tiles:empty { display: none; }
+.tile { background: var(--card); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); padding: 12px 14px; min-width: 0; }
+.tile .tl { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.tile .tv { font-size: 24px; font-weight: 600; letter-spacing: -.01em; }
+.tile .tv.good { color: var(--green); } .tile .tv.warn { color: var(--amber); } .tile .tv.bad { color: var(--red); }
+.tile .ts { color: var(--muted); font-size: 12px; }
+.spark { display: flex; align-items: flex-end; gap: 4px; height: 38px; margin-top: 6px; }
+.spark.mini { height: 22px; gap: 2px; margin-top: 4px; max-width: 90px; }
+.spark i { flex: 1; background: var(--accent); border-radius: 2px; min-height: 3px; }
+td .labels { font-size: 12px; color: var(--muted); }
+td.mono { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+#runs table { min-width: 560px; }
+#ci table { min-width: 520px; }
+#ci td.repo-name a, #ci td.repo-name span { font-weight: 600; }
+#ci .prs { display: flex; flex-direction: column; gap: 4px; }
+#ci .pr { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 13px; overflow-wrap: anywhere; }
+.gh { font-size: 13px; margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
+.gh h4 { margin: 0 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+.rn { display: flex; align-items: center; gap: 6px 12px; flex-wrap: wrap; padding: 7px 0; border-bottom: 1px solid var(--line); }
+.rn .nm { flex: 1 1 170px; min-width: 0; overflow-wrap: anywhere; }
+.rn .nm b { font-weight: 500; }
+.rn .nm small { color: var(--muted); font-size: 12px; margin-left: 6px; }
+.rn .lim { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; }
+.rn label.f { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+.rn input.num { font: inherit; width: 5.2em; color: var(--text); background: var(--card-2); border: 1px solid var(--line); border-radius: 8px; padding: 3px 7px; min-height: 30px; }
+.rn input.num.custom { border-color: var(--accent); }
+.rn input.num:disabled { opacity: .5; }
+.rn button { font-size: 12px; min-height: 28px; padding: 2px 9px; box-shadow: none; }
+.rn .saved { flex-basis: 100%; font-size: 12px; color: var(--amber); display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.rn .saved.ok { color: var(--green); }
+.rn .saved.bad { color: var(--red); }
+.rn .saved .why { overflow-wrap: anywhere; }
+.rn .act { flex-basis: 100%; font-size: 12px; color: var(--amber); overflow-wrap: anywhere; }
+.rn .act a, .admins .act a, .rdetail .act a { color: inherit; text-decoration: underline; }
+.rn .act.unk, .admins .act.unk, .rdetail .act.unk { color: var(--muted); }
+.admins .act { flex-basis: 100%; font-size: 12px; color: var(--amber); overflow-wrap: anywhere; }
+.rdetail .act { overflow-wrap: anywhere; color: var(--amber); }
+.admins { margin-top: 8px; font-size: 12px; color: var(--muted); display: flex; gap: 4px 10px; flex-wrap: wrap; align-items: center; }
+.admins .pill { font-size: 11px; padding: 1px 7px; }
+.limnote { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+/* fleet filter: search box plus status chips that carry the counts */
+.toolbar { display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: center; margin-bottom: 14px; }
+.toolbar[hidden] { display: none; }
+.toolbar input[type=search] { font: inherit; color: var(--text); background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 4px 10px; min-height: 34px; flex: 1 1 200px; min-width: 0; max-width: 340px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips button { border-radius: 999px; min-height: 30px; padding: 2px 11px; font-size: 13px; box-shadow: none; }
+.chips button b { font-weight: 600; }
+.chips button[aria-pressed=true] { border-color: var(--accent); background: var(--accent-soft); }
+/* sortable column headers */
+th button.sort { all: unset; cursor: pointer; display: inline-flex; gap: 4px; align-items: center; text-transform: inherit; letter-spacing: inherit; font: inherit; color: inherit; }
+th button.sort:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+th button.sort:hover, th[aria-sort=ascending] button.sort, th[aria-sort=descending] button.sort { color: var(--text); }
+th button.sort i { font-style: normal; font-size: 9px; opacity: .35; }
+th[aria-sort=ascending] button.sort i, th[aria-sort=descending] button.sort i { opacity: 1; }
+.repo .rh .cnt { color: var(--muted); font-weight: 400; font-size: 12px; }
+/* empty and error states */
+.state { text-align: center; padding: 22px 16px; color: var(--muted); background: var(--card); border: 1px solid var(--line); border-radius: 14px; margin-bottom: 12px; box-shadow: var(--shadow); }
+.state svg { width: 34px; height: 34px; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; opacity: .7; }
+.state.err { color: var(--red); }
+.state h4 { margin: 6px 0 2px; font-size: 14px; color: var(--text); }
+.state p { margin: 0 auto; max-width: 60ch; font-size: 13px; overflow-wrap: anywhere; }
+.state button { margin-top: 10px; }
+/* runner detail panel */
+.rdetail { flex-basis: 100%; background: var(--card-2); border: 1px solid var(--line); border-radius: 10px; padding: 4px 12px 10px; }
+.rdetail .specs { margin-top: 8px; padding-top: 10px; border-top: 0; }
+.rdetail h5 { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+.rdetail .jl { display: flex; gap: 4px 10px; align-items: center; flex-wrap: wrap; padding: 3px 0; font-size: 13px; overflow-wrap: anywhere; }
+.rdetail .jl .labels { color: var(--muted); }
+.hidden-note { color: var(--muted); font-size: 12px; margin-top: 24px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>runnerpool</h1>
+    <span class="stamp" id="stamp">Loading…</span>
+    <span class="spacer"></span>
+    <button id="refreshAll" type="button">Refresh all</button>
+    <form method="post" action="/logout" style="margin:0"><button type="submit">Sign out</button></form>
+  </header>
+  <div id="banner" class="banner" hidden role="alert"></div>
+  <main>
+    <div id="stats" class="tiles"></div>
+    <div id="fleet" class="toolbar" role="search" hidden>
+      <input id="q" type="search" placeholder="Filter runners by name, repo or label" aria-label="Filter runners">
+      <div class="chips" id="chips" role="group" aria-label="Filter by status"></div>
+    </div>
+    <div id="fleetEmpty"></div>
+    <div id="devices" class="grid"></div>
+    <h2 id="otherH" hidden>Other runners</h2>
+    <div id="other"></div>
+    <h2 id="ciH" hidden>CI</h2>
+    <div id="ci"></div>
+    <h2 id="runsH" hidden>Recent runs</h2>
+    <div id="runs"></div>
+    <h2 id="jobsH" hidden>Runner history</h2>
+    <div id="jobs"></div>
+  </main>
+</div>
+
+<script>
+"use strict";
+(function () {
+  /* Sign-in is a cookie the server sets when the page is opened with ?t=TOKEN. */
+
+  /* ---------- tiny DOM helper (text only; never innerHTML) ---------- */
+  function h(tag, attrs) {
+    var el = document.createElement(tag);
+    if (attrs) for (var k in attrs) {
+      var v = attrs[k];
+      if (v == null || v === false) continue;
+      if (k === "class") el.className = v;
+      else if (k === "text") el.textContent = v;
+      else if (k.slice(0, 2) === "on") el.addEventListener(k.slice(2), v);
+      else if (k === "style") el.style.cssText = v;
+      else if (v === true) el.setAttribute(k, "");
+      else el.setAttribute(k, v);
+    }
+    for (var i = 2; i < arguments.length; i++) add(el, arguments[i]);
+    return el;
+  }
+  function add(el, c) {
+    if (c == null || c === false) return;
+    if (Array.isArray(c)) { c.forEach(function (x) { add(el, x); }); return; }
+    el.appendChild(typeof c === "object" ? c : document.createTextNode(String(c)));
+  }
+  function spinner() { return h("span", { class: "spin", "aria-hidden": "true" }); }
+  function icon(d) {
+    var NS = "http://www.w3.org/2000/svg", svg = document.createElementNS(NS, "svg"), p = document.createElementNS(NS, "path");
+    svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("aria-hidden", "true");
+    p.setAttribute("d", d); svg.appendChild(p);
+    return svg;
+  }
+  var ICON_EMPTY = "M3 13h5l1 3h6l1-3h5M3 13l3-8h12l3 8v6H3z", ICON_ERR = "M12 4l9 16H3zM12 10v4M12 17h.01";
+  /* One look for "nothing here" and "could not load": icon, title, reason, optional action. */
+  function stateBox(kind, title, msg, actionLabel, action) {
+    return h("div", { class: "state" + (kind === "err" ? " err" : ""), role: kind === "err" ? "alert" : "status" },
+      icon(kind === "err" ? ICON_ERR : ICON_EMPTY), h("h4", { text: title }), msg ? h("p", { text: msg }) : null,
+      action ? h("button", { type: "button", onclick: action, text: actionLabel }) : null);
+  }
+  function retryAll(key) { return function () { S[key] = 0; tick(); }; }
+
+  /* A table whose columns with a value getter `v` sort on click (asc, desc, back to the given order). */
+  function cmpVal(a, b) {
+    var an = a == null || (typeof a === "number" && isNaN(a)), bn = b == null || (typeof b === "number" && isNaN(b));
+    if (an || bn) return an && bn ? 0 : an ? 1 : -1;
+    return typeof a === "number" && typeof b === "number" ? a - b : String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" });
+  }
+  function sortableTable(id, cols, rows, rowFn, redraw) {
+    var st = S.sort[id], list = rows.slice();
+    if (st && cols[st.c] && cols[st.c].v) {
+      var get = cols[st.c].v;
+      list.sort(function (a, b) {
+        var x = get(a), y = get(b);
+        return x == null || y == null ? cmpVal(x, y) : cmpVal(x, y) * st.d;
+      });
+    }
+    var tb = h("tbody");
+    list.forEach(function (r) { tb.appendChild(rowFn(r)); });
+    var tr = h("tr");
+    cols.forEach(function (c, i) {
+      var on = st && st.c === i;
+      var th = h("th", { scope: "col", "aria-sort": c.v ? (on ? (st.d > 0 ? "ascending" : "descending") : "none") : null });
+      if (!c.v) th.textContent = c.t;
+      else th.appendChild(h("button", { type: "button", class: "sort", onclick: function () {
+        S.sort[id] = !on ? { c: i, d: 1 } : st.d > 0 ? { c: i, d: -1 } : null;
+        redraw();
+      } }, c.t, h("i", { "aria-hidden": "true", text: on ? (st.d > 0 ? "▲" : "▼") : "↕" })));
+      tr.appendChild(th);
+    });
+    return h("div", { class: "repo" }, h("div", { class: "tscroll", style: "border-top:0" }, h("table", null, h("thead", null, tr), tb)));
+  }
+
+  /* ---------- formatting ---------- */
+  function isNum(v) { return typeof v === "number" && isFinite(v); }
+  function dash(v, suffix) { return v == null || v === "" || (typeof v === "number" && !isFinite(v)) ? "–" : String(v) + (suffix || ""); }
+  function fmtTime(iso) {
+    if (!iso) return "–";
+    var d = new Date(iso);
+    if (isNaN(d)) return "–";
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+  function fmtUptime(s) {
+    if (!isNum(s)) return "–";
+    var d = Math.floor(s / 86400), hr = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+    return d ? d + "d " + hr + "h" : hr ? hr + "h " + m + "m" : m + "m";
+  }
+  function safeUrl(u) { return typeof u === "string" && /^https:\/\//i.test(u) ? u : null; }
+
+  /* ---------- state ---------- */
+  var S = { ci: null, ciErr: null, ciInflight: false, nextCi: 0, runs: null, jobs: null, jobsErr: null, jobsInflight: false, nextJobs: 0, runsAt: null, runsErr: null, runsInflight: false, nextRuns: 0, data: null, dataAt: null, dataErr: null, fatal: null, macs: {}, runnersInflight: false, nextRunners: 0, f: { q: "", st: "all" }, sort: {} };
+  function M(host) {
+    if (!S.macs[host]) S.macs[host] = {
+      info: null, infoAt: null, infoVia: null, err: null, fetching: false, nextInfo: undefined,
+      busy: false, spin: null, log: null, logOpen: true, size: 4, actionErr: null, ghLoading: false
+    };
+    return S.macs[host];
+  }
+
+  /* ---------- api ---------- */
+  function api(path, opts, timeoutMs) {
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, timeoutMs || 30000);
+    var o = Object.assign({ headers: {} }, opts || {});
+    o.headers = o.body ? { "Content-Type": "application/json" } : {};
+    o.credentials = "same-origin";
+    o.signal = ctl.signal;
+    o.cache = "no-store";
+    return fetch(path, o).then(function (r) {
+      if (r.status === 403) { location.reload(); S.fatal = "Signed out. Reloading..."; throw new Error("HTTP 403"); }
+      return r.text().then(function (t) {
+        var j = null;
+        try { j = JSON.parse(t); } catch (e) { /* not json */ }
+        if (!r.ok && !j) throw new Error("HTTP " + r.status);
+        if (!j) throw new Error("Bad response from server");
+        return j;
+      });
+    }).catch(function (e) {
+      if (e && e.name === "AbortError") throw new Error("Timed out");
+      throw e;
+    }).finally(function () { clearTimeout(timer); });
+  }
+
+  /* ---------- fetchers ---------- */
+  function loadRunners() {
+    if (S.runnersInflight) return Promise.resolve();
+    S.runnersInflight = true;
+    return api("/api/runners", null, 20000).then(function (d) {
+      S.data = d; S.dataAt = d.at || new Date().toISOString(); S.dataErr = null; S.fatal = null;
+    }).catch(function (e) {
+      S.dataErr = e.message || String(e);
+    }).finally(function () {
+      S.runnersInflight = false;
+      S.nextRunners = Date.now() + 5000;
+      var key = JSON.stringify([S.data && S.data.repos, S.data && S.data.macs, S.data && S.data.devices, S.data && S.data.limit_status, S.data && S.data.runner_activity, inflightKey(), S.dataErr]);
+      if (key === S.drawn) renderHeader(); else { S.drawn = key; renderAll(); }
+    });
+  }
+
+  function loadRuns() {
+    if (S.runsInflight) return Promise.resolve();
+    S.runsInflight = true;
+    return api("/api/runs", null, 40000).then(function (d) {
+      S.runs = d; S.runsAt = d.at || new Date().toISOString(); S.runsErr = null;
+    }).catch(function (e) {
+      S.runsErr = e.message || String(e);
+    }).finally(function () {
+      S.runsInflight = false;
+      S.nextRuns = Date.now() + 30000;
+      renderRuns();
+    });
+  }
+
+  function loadJobs() {
+    if (S.jobsInflight) return Promise.resolve();
+    S.jobsInflight = true;
+    return api("/api/jobs", null, 120000).then(function (d) {
+      S.jobs = d; S.jobsErr = null;
+    }).catch(function (e) {
+      S.jobsErr = e.message || String(e);
+    }).finally(function () {
+      S.jobsInflight = false;
+      S.nextJobs = Date.now() + 30000;
+      renderJobs();
+      devices().forEach(function (d) { var o = S.macs[d.host] && S.macs[d.host].open; if (o && Object.keys(o).some(function (k) { return o[k]; })) renderMac(d.host); });
+    });
+  }
+
+  function loadCi() {
+    if (S.ciInflight) return Promise.resolve();
+    S.ciInflight = true;
+    return api("/api/ci", null, 90000).then(function (d) {
+      S.ci = d; S.ciErr = null;
+    }).catch(function (e) {
+      S.ciErr = e.message || String(e);
+    }).finally(function () {
+      S.ciInflight = false;
+      S.nextCi = Date.now() + 30000;
+      renderCi();
+    });
+  }
+
+  function loadInfo(host, via, fresh) {
+    var m = M(host);
+    if (m.fetching) return Promise.resolve();
+    m.fetching = true;
+    if (via === "actions") m.ghLoading = true;
+    renderMac(host);
+    var to = via === "actions" ? 200000 : fresh ? 70000 : 30000;
+    return api("/api/mac/" + encodeURIComponent(host) + "/info?via=" + via + (fresh ? "&fresh=1" : ""), null, to).then(function (r) {
+      if (r && r.info) {
+        // The server keeps the Macs warm and sends its last good info, with the error if the latest try failed.
+        m.info = r.info; m.infoAt = r.info_at || r.at || new Date().toISOString(); m.infoVia = r.via || via;
+        m.infoRunUrl = r.run_url || null;
+        if (r.ok) { m.err = null; m.reason = null; } else { m.err = r.error || "Unknown error"; m.errAt = r.at; m.reason = r.reason || null; }
+      } else {
+        m.err = (r && r.error) || "Unknown error"; m.errAt = new Date().toISOString(); m.reason = (r && r.reason) || null;
+        if (r && r.run_url) m.infoRunUrl = r.run_url;
+      }
+    }).catch(function (e) {
+      m.err = e.message || String(e); m.errAt = new Date().toISOString();
+    }).finally(function () {
+      m.fetching = false; m.ghLoading = false;
+      m.nextInfo = Date.now() + (via === "actions" ? 60000 : 5000);
+      // The card is rebuilt on a change only, so a dropdown or text selection survives the 5 s polling.
+      var key = JSON.stringify([m.info, m.err && String(m.err).replace(/\d+ s\b/, "N s"), m.infoVia, m.info && Math.floor((m.info.uptime_s || 0) / 60)]).replace(/"uptime_s":\d+,?/, "");
+      var el = cardEls[host];
+      if (el && key === m.drawn && !m.ghLoading) {
+        var stamp = el.querySelector(".info-at");
+        if (stamp) stamp.textContent = infoStamp(m);
+      } else { m.drawn = key; renderMac(host); }
+      renderHeader();
+    });
+  }
+
+  // Hosts whose info the page keeps loading: every Mac, and every PC (which pushes its own info to the server).
+  function infoHosts() {
+    var hosts = ((S.data && S.data.macs) || []).slice();
+    devices().forEach(function (d) { if (d.kind === "pc" && hosts.indexOf(d.host) < 0) hosts.push(d.host); });
+    return hosts;
+  }
+  function infoStamp(m) {
+    if (!m.info) return "No info";
+    if (m.infoVia === "push") {
+      var s = Math.max(0, Math.round((Date.now() - Date.parse(m.infoAt)) / 1000));
+      return "Reported " + (isNaN(s) ? "–" : s < 120 ? s + " s" : fmtUptime(s)) + " ago";
+    }
+    return "Info " + fmtTime(m.infoAt) + " via " + (m.infoVia || "ssh");
+  }
+
+  /* What the server is running for HOST (a PC's wsl-N admin host counts too): {action, since_s, queued} or null. */
+  function inflightOf(host) {
+    var all = (S.data && S.data.actions_in_flight) || {};
+    var wsl = /^win-(\d+)$/.exec(host);
+    return all[host] || (wsl && all["wsl-" + wsl[1]]) || null;
+  }
+  function inflightKey() {
+    var all = (S.data && S.data.actions_in_flight) || {};
+    return Object.keys(all).map(function (k) { return [k, all[k].action, all[k].queued, Math.floor(all[k].since_s / 10)]; });
+  }
+  /* The one-line status for the card, or null when nothing is running. */
+  function actionStatus(host, m) {
+    var r = inflightOf(host);
+    var secs = r ? " (" + r.since_s + " s)" : "";
+    if (m.busy && r && r.action !== m.action) return "Queued behind " + r.action + secs + "…";
+    if (r) return "Running " + r.action + secs + "…" + (r.queued > 1 ? " " + (r.queued - 1) + " queued" : "");
+    if (m.busy) return "Sending " + (m.action || "action") + "…";
+    return null;
+  }
+
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  var OPT = {
+    "ci-on": function (s) { s.ci_enabled = true; },
+    "ci-off": function (s) { s.ci_enabled = false; },
+    "battery-pause": function (s) { s.pause_on_battery = true; },
+    "battery-run": function (s) { s.pause_on_battery = false; },
+    "ramdisk-on": function (s, b) { s.ramdisk_gb = b.size; },
+    "ramdisk-off": function (s) { s.ramdisk_gb = 0; },
+    "cores": function (s, b) { s.max_cores = b.cores === "all" ? 0 : b.cores; }
+  };
+
+  function runAction(host, control, body) {
+    var m = M(host);
+    if (m.busy) return;
+    m.busy = true; m.spin = control; m.action = body.action; m.actionErr = null;
+    renderMac(host);
+    return api("/api/mac/" + encodeURIComponent(host) + "/action",
+      { method: "POST", body: JSON.stringify(body) }, 1900000)   // it may wait its turn behind another action, then run
+      .catch(function (e) { return { ok: false, via: null, output: "", error: e.message || String(e), run_url: null }; })
+      .then(function (res) {
+        res = res || {};
+        var ok = !!res.ok;
+        if (ok && m.info && m.info.settings && OPT[body.action]) OPT[body.action](m.info.settings, body);
+        if (!ok) m.actionErr = res.error || "Action failed";
+        m.log = { action: body.action, ok: ok, via: res.via, at: new Date().toISOString(),
+                  output: res.output || "", error: res.error || "", run_url: safeUrl(res.run_url) };
+        m.logOpen = true;
+        m.spin = null;
+        renderMac(host);
+        return waitIdle(m).then(function () { return loadInfo(host, "ssh", true); });
+      })
+      .finally(function () { m.busy = false; m.spin = null; renderMac(host); });
+  }
+  function waitIdle(m) {
+    if (!m.fetching) return Promise.resolve();
+    return sleep(300).then(function () { return waitIdle(m); });
+  }
+
+  /* ---------- scheduler ---------- */
+  function tick() {
+    if (document.hidden) return;
+    var now = Date.now();
+    if (now >= S.nextRunners) loadRunners();
+    if (now >= S.nextRuns) loadRuns();
+    if (now >= S.nextCi) loadCi();
+    if (now >= S.nextJobs) loadJobs();
+    infoHosts().forEach(function (host) {
+      var m = M(host);
+      if (m.nextInfo === undefined) m.nextInfo = now;
+      if (now >= m.nextInfo && !m.fetching && !m.busy) {
+        loadInfo(host, "ssh");
+      }
+    });
+  }
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) tick(); });
+  setInterval(tick, 1000);
+
+  document.getElementById("refreshAll").addEventListener("click", function () {
+    S.nextRunners = 0; S.nextRuns = 0; S.nextCi = 0; S.nextJobs = 0;
+    infoHosts().forEach(function (host) { loadInfo(host, "ssh", true); });
+    tick();
+  });
+
+  /* ---------- derive ---------- */
+  function devices() { return (S.data && S.data.devices) || []; }
+  function deviceOf(host) {
+    var d = devices().filter(function (x) { return x.host === host; })[0];
+    return d || { host: host, kind: "mac", runners: [] };
+  }
+  function stateOf(r) { return r.status !== "online" ? "offline" : r.busy ? "busy" : "online"; }
+  function pillFor(list) {
+    var any = list.some(function (r) { return r.status === "online"; });
+    if (!any) return { cls: "offline", text: "offline" };
+    var busy = list.some(function (r) { return r.status === "online" && r.busy; });
+    return busy ? { cls: "busy", text: "busy" } : { cls: "online", text: "online" };
+  }
+  function shortRepo(r) { return String(r).replace(/^.*\//, ""); }
+
+  /* ---------- fleet filter: text and status ---------- */
+  function filtering() { return !!S.f.q || S.f.st !== "all"; }
+  function runnerMatch(r, host) {
+    if (S.f.st !== "all" && stateOf(r) !== S.f.st) return false;
+    var q = S.f.q.trim().toLowerCase();
+    return !q || [r.name, r.repo, host, (r.labels || []).join(" ")].join(" ").toLowerCase().indexOf(q) >= 0;
+  }
+  function deviceShown(dev) {
+    if (!filtering()) return true;
+    var q = S.f.q.trim().toLowerCase();
+    return dev.runners.some(function (r) { return runnerMatch(r, dev.host); }) || (S.f.st === "all" && !!q && dev.host.toLowerCase().indexOf(q) >= 0);
+  }
+  function allRunners() {
+    var out = [];
+    devices().forEach(function (d) { out = out.concat(d.runners); });
+    return out.concat((S.data && S.data.other) || []);
+  }
+  var CHIPS = [["all", "All"], ["online", "Online"], ["busy", "Busy"], ["offline", "Offline"]];
+  function renderFleet() {
+    var bar = document.getElementById("fleet"), chips = document.getElementById("chips"), fe = document.getElementById("fleetEmpty");
+    fe.textContent = "";
+    bar.hidden = !S.data;
+    if (!S.data) {
+      if (S.dataErr) fe.appendChild(stateBox("err", "Could not load runners", S.dataErr, "Retry", retryAll("nextRunners")));
+      return;
+    }
+    var all = allRunners(), n = { all: all.length, online: 0, busy: 0, offline: 0 };
+    all.forEach(function (r) { n[stateOf(r)]++; });
+    if (!chips.firstChild) CHIPS.forEach(function (c) {
+      chips.appendChild(h("button", { type: "button", "data-st": c[0], onclick: function () { S.f.st = c[0]; renderFleet(); renderAll(); } },
+        c[1] + " ", h("b", { text: "0" })));
+    });
+    Array.prototype.forEach.call(chips.children, function (b) {
+      var k = b.getAttribute("data-st");
+      b.setAttribute("aria-pressed", S.f.st === k ? "true" : "false");
+      b.lastChild.textContent = String(n[k]);
+    });
+    var shown = devices().filter(deviceShown).length + ((S.data.other || []).filter(function (r) { return runnerMatch(r, ""); }).length ? 1 : 0);
+    if (filtering() && !shown) fe.appendChild(stateBox("empty", "No runners match", "Nothing matches the current filter.", "Clear filter", function () {
+      S.f = { q: "", st: "all" }; document.getElementById("q").value = ""; renderFleet(); renderAll();
+    }));
+  }
+  document.getElementById("q").addEventListener("input", function (e) { S.f.q = e.target.value; renderFleet(); renderAll(); });
+
+  /* ---------- render ---------- */
+  var macsEl = document.getElementById("devices");
+  var cardEls = {};
+
+  function renderHeader() {
+    var st = document.getElementById("stamp");
+    st.textContent = S.dataAt ? "Updated " + fmtTime(S.dataAt) + (S.dataErr ? " (stale)" : "") : (S.dataErr ? "Failed to load" : "Loading…");
+    var b = document.getElementById("banner");
+    var msg = S.fatal, warn = false;
+    if (!msg && S.dataErr) { msg = "Could not refresh runner list: " + S.dataErr + (S.data ? ". Showing data from " + fmtTime(S.dataAt) + "." : ""); warn = !!S.data; }
+    b.hidden = !msg;
+    b.textContent = msg || "";
+    b.className = "banner" + (warn ? " warn" : "");
+  }
+
+  function renderAll() {
+    renderHeader();
+    var hosts = devices().map(function (d) { return d.host; });
+    // remove cards for vanished devices
+    Object.keys(cardEls).forEach(function (k) {
+      if (hosts.indexOf(k) < 0) { cardEls[k].remove(); delete cardEls[k]; }
+    });
+    hosts.forEach(function (host) { renderMac(host); });
+    if (S.data && !hosts.length && !macsEl.firstChild) macsEl.appendChild(h("div", { class: "empty", text: "No devices found." }));
+    if (hosts.length) { var e = macsEl.querySelector(":scope > .empty"); if (e) e.remove(); }
+    renderFleet();
+    renderOther();
+    renderRuns();
+  }
+
+  function kv(label, value, extra, cls) {
+    return h("div", { class: "spec" + (cls ? " " + cls : "") }, h("dt", { text: label }),
+      h("dd", null, value, extra));
+  }
+  function bar(pct, tone) {
+    var p = isNum(pct) ? Math.max(0, Math.min(100, pct)) : 0;
+    var i = h("i", { class: tone || "" });
+    i.style.width = p + "%";
+    return h("div", { class: "bar", role: "presentation" }, i);
+  }
+
+  function renderMac(host) {
+    if (!S.data) return;
+    var m = M(host);
+    var list = devices();
+    var idx = list.map(function (d) { return d.host; }).indexOf(host);
+    if (idx < 0) return;
+    var old = cardEls[host];
+    // Never rebuild a card while a limit is being typed into it.
+    var ae = document.activeElement;
+    if (old && ae && ae.tagName === "INPUT" && ae.classList.contains("num") && old.contains(ae)) return;
+    var card = buildCard(host, m);
+    card.hidden = !deviceShown(list[idx]);
+    if (old) old.replaceWith(card);
+    else {
+      var empty = macsEl.querySelector(":scope > .empty"); if (empty) empty.remove();
+      var before = null;
+      for (var i = idx + 1; i < list.length && !before; i++) before = cardEls[list[i].host] || null;
+      macsEl.insertBefore(card, before);
+    }
+    cardEls[host] = card;
+  }
+
+  function buildCard(host, m) {
+    var info = m.info, s = info && info.settings ? info.settings : null;
+    var dev = deviceOf(host);
+    var pc = dev.kind === "pc";   // a Windows PC: its info is pushed by the PC, and some Mac-only rows and buttons do not apply
+    var p = pillFor(dev.runners);
+    var ghStale = !!S.dataErr;
+    var stale = !!(m.err && info);
+    var noInfo = !info;
+    var card = h("article", { class: "card", "aria-labelledby": "h-" + host });
+
+    // head
+    var pills = h("div", { class: "pills" + (ghStale ? " stale" : "") }, h("span", { class: "pill " + p.cls, text: p.text }));
+    if (p.cls === "offline") {
+      var why = m.reason || (info && info.ci_paused ? "CI paused" + (info.ci_paused_reason ? ": " + info.ci_paused_reason : "")
+        : info ? (pc ? "PC is up but its runner is not connected to GitHub" : "Mac is up but its runner is not connected to GitHub") : "");
+      if (why) pills.appendChild(h("span", { class: "why", text: why, title: m.err || "" }));
+    }
+    if (info && info.ci_paused) pills.appendChild(h("span", { class: "pill busy plain", text: "CI paused" + (info.ci_paused_reason ? ": " + info.ci_paused_reason : "") }));
+    if (pc) pills.appendChild(h("span", { class: "pill plain", text: "PC" }));
+    var head = h("div", { class: "card-head" }, h("h3", { id: "h-" + host, text: host }), pills);
+    if (info && info.computer_name) head.appendChild(h("div", { class: "sub", text: info.computer_name }));
+    card.appendChild(head);
+    card.appendChild(runnersSection(dev, m, ghStale));
+
+    // notices
+    if (m.err) {
+      var n = h("div", { class: "notice" + (noInfo ? " err" : ""), role: "status" },
+        (noInfo ? "No info yet. " : m.infoVia === "push" ? "Not reporting. " : "Latest refresh failed. "), h("span", { text: m.err }));
+      if (info) n.appendChild(h("span", { class: "when", text: " Showing last good data from " + fmtTime(m.infoAt) + " (" + (m.infoVia || "ssh") + ")." }));
+      card.appendChild(n);
+    }
+    if (m.infoRunUrl && m.infoVia === "actions" && safeUrl(m.infoRunUrl)) {
+      card.appendChild(h("div", { class: "foot" }, h("a", { href: safeUrl(m.infoRunUrl), target: "_blank", rel: "noopener noreferrer", text: "view run on GitHub" })));
+    }
+
+    // specs
+    var body = h("div", { class: stale ? "stale" : "" });
+    if (info) {
+      var b = info.battery;
+      var disk = h("div", null);
+      var used = isNum(info.disk_total_gb) && isNum(info.disk_free_gb) && info.disk_total_gb > 0 ? Math.round((1 - info.disk_free_gb / info.disk_total_gb) * 100) : null;
+      var freePct = used == null ? null : 100 - used;
+      var diskTone = freePct == null ? "" : freePct < 10 ? "bad" : freePct < 20 ? "warn" : "";
+      var thermal = !pc || isNum(info.thermal_state) || isNum(info.cpu_speed_limit);   // a PC shows it only when it reports one
+      var specs = h("dl", { class: "specs" },
+        kv("Model", dash(info.model) + (info.model_id ? " (" + info.model_id + ")" : "")),
+        kv("Chip", dash(info.chip)),
+        kv("Cores", isNum(info.cores_perf) && isNum(info.cores_eff) ? info.cores_perf + "P + " + info.cores_eff + "E" : dash(info.cores)),
+        kv("Memory", dash(info.memory_gb, " GB"), h("span", { class: "small", text: "Free " + dash(info.memory_free_pct, "%") })),
+        kv("Disk free", dash(info.disk_free_gb, " GB") + " / " + dash(info.disk_total_gb, " GB"),
+          [bar(used, diskTone), info.ci_disk_used ? h("span", { class: "small", text: "CI uses " + info.ci_disk_used }) : null]),
+        pc ? (info.windows ? kv("Windows", info.windows) : null) : kv("macOS", dash(info.macos)),
+        kv("Uptime", fmtUptime(info.uptime_s)),
+        thermal ? kv("Thermal", thermalText(info), thermalTone(info) ? h("span", { class: "small " + thermalTone(info), text: "thermal pressure" }) : null) : null
+      );
+      if (pc && Array.isArray(info.runners) && info.runners.length) {
+        specs.appendChild(kv("Runner services", info.runners.map(function (r) {
+          return r.name + " " + (r.state || "–") + (r.busy ? " (busy)" : "");
+        }).join(" · "), null, "wide"));
+      }
+      if (b && b.present && pc) {   // Windows reports only the charge and the power source
+        var wt = !isNum(b.percent) ? "" : b.percent < 20 ? "bad" : b.percent < 40 ? "warn" : "good";
+        specs.appendChild(kv("Battery", dash(b.percent, "%") + " · " + (b.source || "–"), bar(b.percent, wt)));
+      } else if (b && b.present) {
+        var bt = !isNum(b.percent) ? "" : b.percent < 20 ? "bad" : b.percent < 40 ? "warn" : "good";
+        specs.appendChild(kv("Battery", dash(b.percent, "%") + " · " + (b.source || "–") + (b.charging ? ", charging" : ""),
+          [bar(b.percent, bt), h("span", { class: "small", text: dash(b.cycles) + " cycles · " + dash(b.condition) + " · max " + dash(b.max_capacity_pct, "%") })]));
+      } else if (b) {
+        // no battery (a desktop): nothing to show
+      } else if (!pc) {
+        specs.appendChild(kv("Battery", "–"));
+      }
+      if (info.tailscale) specs.appendChild(kv("Tailscale", info.tailscale, null, "wide"));
+      body.appendChild(specs);
+    } else {
+      body.appendChild(h("div", { class: "empty", style: "padding:16px 0 0", text: m.fetching ? "Loading…" : "Waiting for info…" }));
+    }
+
+    // what is running on this device right now
+    var status = actionStatus(host, m);
+    if (status) card.appendChild(h("div", { class: "notice working", role: "status" }, spinner(), " ", h("span", { text: status })));
+
+    // controls
+    var controls = h("div", { class: "controls" });
+    var locked = m.busy || !s;
+    function toggle(key, label, note, checked, disabled, onFlip, extra) {
+      var cb = h("input", { type: "checkbox", class: "switch", id: "t-" + host + "-" + key, role: "switch" });
+      cb.checked = !!checked;
+      cb.disabled = !!disabled;
+      cb.addEventListener("change", function () {
+        var want = cb.checked;
+        cb.checked = !want;               // stays put until the action succeeds
+        onFlip(want);
+      });
+      return h("div", { class: "row" },
+        h("label", { class: "lbl", for: cb.id }, h("b", { text: label }), note ? h("small", { text: note }) : null),
+        h("div", { class: "ctl" }, extra, m.spin === key ? spinner() : null, cb));
+    }
+    function doConfirm(msg) { return window.confirm(msg); }
+
+    controls.appendChild(toggle("ci", "CI takes jobs", s ? null : "Waiting for info", s && s.ci_enabled, locked, function (want) {
+      if (!want && !doConfirm("Turn CI off on " + host + "? It will stop taking jobs.")) return;
+      runAction(host, "ci", { action: want ? "ci-on" : "ci-off", via: "auto" });
+    }));
+    var hasBattery = !!(info && info.battery && info.battery.present);   // a desktop has none: no control, no row
+    if (hasBattery) controls.appendChild(toggle("battery", "Pause CI on battery", null, s && s.pause_on_battery, locked, function (want) {
+      runAction(host, "battery", { action: want ? "battery-pause" : "battery-run", via: "auto" });
+    }));
+    var lowMem = info && isNum(info.memory_gb) && info.memory_gb < 16;
+    var ramOn = !!(s && isNum(s.ramdisk_gb) && s.ramdisk_gb > 0);
+    var sel = h("select", { "aria-label": "RAM disk size in GB" });
+    for (var g = 1; g <= 8; g++) sel.appendChild(h("option", { value: g, text: g + " GB" }));
+    sel.value = String(ramOn ? Math.min(8, s.ramdisk_gb) : m.size);
+    sel.disabled = locked || ramOn || lowMem;
+    sel.addEventListener("change", function () { m.size = parseInt(sel.value, 10) || 4; });
+    var ramNote = lowMem ? "Needs 16 GB or more memory (this Mac has " + info.memory_gb + " GB)"
+      : ramOn ? "Mounted" + (s.ramdisk_mounted === false ? " (not mounted)" : "") + (s.ramdisk_used ? ", " + s.ramdisk_used + " used" : "")
+      : (s ? "Uses memory; CI work dir lives in RAM" : "Waiting for info");
+    if (!pc) controls.appendChild(toggle("ramdisk", "RAM disk for CI", ramNote, ramOn, locked || (lowMem && !ramOn), function (want) {
+      var size = parseInt(sel.value, 10) || 4;
+      if (!doConfirm(want ? "Create a " + size + " GB RAM disk on " + host + "?" : "Remove the RAM disk on " + host + "?")) return;
+      var body = want ? { action: "ramdisk-on", size: size, via: "auto" } : { action: "ramdisk-off", via: "auto" };
+      runAction(host, "ramdisk", body);
+    }, sel));
+    var total = info && isNum(info.cores) && info.cores > 0 ? Math.floor(info.cores) : 0;
+    var curMax = s && isNum(s.max_cores) && s.max_cores > 0 ? s.max_cores : 0;
+    var coreSel = h("select", { "aria-label": "Max cores for CI" });
+    coreSel.appendChild(h("option", { value: "all", text: "All cores" }));
+    var steps = [1, 2, 4, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64].filter(function (n) { return n <= total; });
+    if (curMax && steps.indexOf(curMax) < 0) { steps.push(curMax); steps.sort(function (a, b) { return a - b; }); }
+    steps.forEach(function (n) { coreSel.appendChild(h("option", { value: n, text: n + (n === 1 ? " core" : " cores") })); });
+    coreSel.value = curMax ? String(curMax) : "all";
+    coreSel.disabled = locked;
+    coreSel.addEventListener("change", function () {
+      var v = coreSel.value === "all" ? "all" : parseInt(coreSel.value, 10);
+      runAction(host, "cores", { action: "cores", cores: v, via: "auto" });
+    });
+    controls.appendChild(h("div", { class: "row" },
+      h("label", { class: "lbl" }, h("b", { text: "Max cores for CI" }),
+        h("small", { text: s ? "Jobs get CI_MAX_CORES and run at lower priority; applies after the running job." : "Waiting for info" })),
+      h("div", { class: "ctl" }, m.spin === "cores" ? spinner() : null, coreSel)));
+    body.appendChild(controls);
+    card.appendChild(body);
+
+    // buttons
+    var upd = !!(info && info.macrunner_sha && S.data.macrunner_sha && info.macrunner_sha !== S.data.macrunner_sha);
+    function btn(key, label, act, opts) {
+      opts = opts || {};
+      var b = h("button", { type: "button", class: opts.cls || "", disabled: m.busy || (opts.needInfo && !s) },
+        m.spin === key ? spinner() : null, label, opts.extra);
+      b.addEventListener("click", function () {
+        if (opts.confirm && !window.confirm(opts.confirm)) return;
+        runAction(host, key, Object.assign({ action: act, via: opts.via || "auto" }, opts.body || {}));
+      });
+      return b;
+    }
+    card.appendChild(h("div", { class: "actions" },
+      btn("restart-ci", "Restart CI runner", "restart-ci"),
+      btn("doctor", "Doctor", "doctor"),
+      btn("logs", "Logs", "logs"),
+      pc ? null : btn("update-macrunner", "Update macrunner", "update-macrunner", {
+        via: "actions", cls: upd ? "hl" : "",
+        confirm: "Update macrunner on " + host + " through GitHub? This can take a few minutes.",
+        extra: upd ? h("span", { class: "badge", text: "update available" }) : null }),
+      pc ? null : btn("tailscale-up", "Tailscale up", "tailscale-up", { via: "actions" })
+    ));
+
+    if (m.actionErr) card.appendChild(h("div", { class: "notice err actionerr", role: "alert" }, h("b", { text: "Action failed: " }), h("span", { text: m.actionErr })));
+
+    // log
+    if (m.log) {
+      var L = m.log;
+      var det = h("details", { class: "log" });
+      if (m.logOpen) det.open = true;
+      det.addEventListener("toggle", function () { m.logOpen = det.open; });
+      det.appendChild(h("summary", null, "Log: " + L.action,
+        h("span", { class: "tag " + (L.ok ? "ok" : "fail"), text: (L.ok ? "ok" : "failed") + (L.via ? " via " + L.via : "") + " · " + fmtTime(L.at) })));
+      var lb = h("div", { class: "body" });
+      var txt = (L.output || "") + (L.error && !L.ok ? (L.output ? "\n" : "") + "error: " + L.error : "");
+      lb.appendChild(h("pre", { text: txt || "(no output)" }));
+      if (L.run_url) lb.appendChild(h("a", { class: "lnk", href: L.run_url, target: "_blank", rel: "noopener noreferrer", text: "view run on GitHub" }));
+      det.appendChild(lb);
+      card.appendChild(det);
+    }
+
+    // footer
+    var foot = h("div", { class: "foot" },
+      h("span", { class: "info-at", text: infoStamp(m) }),
+      m.fetching && !m.busy ? spinner() : null,
+      h("span", { class: "spacer" }),
+      h("button", { type: "button", disabled: m.busy || m.ghLoading, onclick: function () { loadInfo(host, "actions"); } },
+        m.ghLoading ? spinner() : null, "Refresh through GitHub"),
+      h("div", { class: "hint", text: m.ghLoading ? "Asking GitHub… this can take a couple of minutes." : pc ? "Use when the PC has stopped reporting; it can take a couple of minutes." : "Use when SSH is down; it can take a couple of minutes." })
+    );
+    card.appendChild(foot);
+    return card;
+  }
+
+  /* ---------- per-runner limits (saved on the dashboard, then applied to the device) ---------- */
+  function fmtGb(mb) { return isNum(mb) ? String(Math.round(mb / 1024 * 100) / 100) : ""; }
+  function postLimit(host, runner, body) {
+    var m = M(host);
+    m.limitErr = null;
+    var payload = Object.assign({ host: host, runner: runner }, body);
+    m.applying = m.applying || {};
+    m.applying[runner.toLowerCase()] = true;
+    renderMac(host);
+    // The server saves first, then applies on the device (SSH for a Mac, the Admin workflow for a PC
+    // or when SSH is down), which can take a couple of minutes.
+    return api("/api/runner-limits", { method: "POST", body: JSON.stringify(payload) }, 600000).then(function (r) {
+      if (!r.ok) throw new Error(r.error || "Could not save");
+      S.nextRunners = 0;
+      return loadRunners();
+    }).catch(function (e) {
+      m.limitErr = (runner + ": " + (e.message || String(e)));
+    }).finally(function () { m.applying[runner.toLowerCase()] = false; renderMac(host); });
+  }
+
+  // What the server last did to put a runner's saved override on the device: {applied, error} or null.
+  /* What a busy runner is working on, from /api/runners runner_activity (matched case-insensitively). */
+  function secsSince(iso) { var t = Date.parse(iso); return isNaN(t) ? null : Math.max(0, Math.round((Date.now() - t) / 1000)); }
+  function activityOf(r) {
+    var a = S.data && S.data.runner_activity;
+    if (!a) return null;
+    var k = Object.keys(a).filter(function (n) { return n.toLowerCase() === r.name.toLowerCase(); })[0];
+    return k ? a[k] : null;
+  }
+  function activityLine(r) {
+    if (r.status !== "online" || !r.busy) return null;
+    var a = activityOf(r);
+    if (!a) return h("div", { class: "act unk", text: "↳ busy (job details unavailable)" });
+    var label = a.repo + " · " + (a.workflow ? a.workflow + " / " : "") + (a.job || "running"), u = safeUrl(a.job_url) || safeUrl(a.run_url);
+    var el = secsSince(a.started_at);
+    return h("div", { class: "act", role: "status" }, "↳ ",
+      u ? h("a", { href: u, target: "_blank", rel: "noopener noreferrer", text: label }) : label,
+      el == null ? null : h("span", { "data-since": a.started_at, text: " (" + fmtDur(el) + ")" }),
+      a.branch ? h("span", { class: "why", text: " · " + a.branch }) : null);
+  }
+  setInterval(function () {
+    Array.prototype.forEach.call(document.querySelectorAll("[data-since]"), function (e) {
+      var el = secsSince(e.getAttribute("data-since"));
+      if (el != null) e.textContent = " (" + fmtDur(el) + ")";
+    });
+  }, 1000);
+
+  function limitStatus(host, runner) {
+    var st = S.data && S.data.limit_status;
+    return st && st[host] && st[host][runner.toLowerCase()] || null;
+  }
+
+  function limitRow(dev, r, m) {
+    var host = dev.host, mac = dev.kind === "mac";
+    var ov = r.override || {}, eff = r.limits || {}, def = r.default || {};
+    var custom = ov.cores != null || ov.ram_mb != null;
+    function field(key, label, min, step, toVal, fromVal, title) {
+      var inp = h("input", { type: "number", class: "num" + (ov[key] != null ? " custom" : ""), min: min, step: step,
+        "aria-label": label + " for " + r.name, title: title });
+      inp.value = eff[key] != null ? fromVal(eff[key]) : "";
+      inp.placeholder = def[key] != null ? fromVal(def[key]) : "–";
+      inp.addEventListener("keydown", function (ev) { if (ev.key === "Enter") inp.blur(); });
+      inp.addEventListener("change", function () {
+        var raw = inp.value.trim(), body = {};
+        if (raw === "") body[key] = null;
+        else {
+          var v = toVal(parseFloat(raw));
+          var lo = key === "cores" ? 1 : 256, hi = key === "cores" ? 256 : 1048576;
+          if (!isFinite(v) || v < lo || v > hi || Math.floor(v) !== v) { m.limitErr = r.name + ": " + label + " must be between " + fromVal(lo) + " and " + fromVal(hi); inp.blur(); renderMac(host); return; }
+          body[key] = v;
+        }
+        inp.blur();
+        postLimit(host, r.name, body);
+      });
+      return h("label", { class: "f" }, label, inp, key === "cores" ? null : "GB");
+    }
+    var stN = stateOf(r), key = r.name.toLowerCase(), open = !!(m.open && m.open[key]);
+    var row = h("div", { class: "rn" },
+      h("div", { class: "nm" }, h("b", { text: r.name }), h("small", { text: shortRepo(r.repo) })),
+      h("span", { class: "pill " + stN, text: stN }),
+      h("button", { type: "button", "aria-expanded": open ? "true" : "false", title: "Labels, limits and recent jobs of " + r.name,
+        onclick: function () { m.open = m.open || {}; m.open[key] = !open; renderMac(host); } }, open ? "Hide" : "Details"),
+      h("div", { class: "lim" },
+        field("cores", "Cores", 1, 1, function (x) { return x; }, function (x) { return String(x); }, "CPU cores this runner may use"),
+        field("ram_mb", mac ? "RAM (advisory)" : "RAM", 0.25, 0.25, function (x) { return Math.round(x * 1024); }, fmtGb,
+          mac ? "macOS cannot enforce a per-runner memory cap; this is a target, not a limit" : "RAM this runner may use"),
+        h("button", { type: "button", disabled: !custom, title: "Use the default: 80% of the device split between its CI runners",
+          onclick: function () { postLimit(host, r.name, { reset: true }); } }, "reset to default")));
+    var st = limitStatus(host, r.name), applying = m.applying && m.applying[r.name.toLowerCase()];
+    function resend(label) {
+      return h("button", { type: "button", onclick: function () {
+        postLimit(host, r.name, { cores: ov.cores != null ? ov.cores : null, ram_mb: ov.ram_mb != null ? ov.ram_mb : null });
+      } }, label);
+    }
+    var act = activityLine(r);
+    if (act) row.appendChild(act);
+    if (open) row.appendChild(runnerDetail(dev, r));
+    if (applying) row.appendChild(h("div", { class: "saved", role: "status", text: "Applying to the device… this can take a couple of minutes." }));
+    else if (st && st.applied) {
+      row.appendChild(h("div", { class: "saved ok", role: "status" }, "Applied to the device" +
+        (mac ? " (a busy runner picks it up after its job)." : ".")));
+    } else if (st) {
+      row.appendChild(h("div", { class: "saved bad", role: "alert" },
+        h("span", { class: "why", text: "Saved, but not applied: " + (st.error || "unknown error") }), resend("Retry")));
+    } else if (custom) {
+      row.appendChild(h("div", { class: "saved" }, "Saved; not yet confirmed on the device.", resend("Apply")));
+    }
+    return row;
+  }
+
+  /* Everything the dashboard knows about one runner, from data it already has. */
+  function runnerDetail(dev, r) {
+    var ov = r.override || {}, eff = r.limits || {}, def = r.default || {}, me = r.name.toLowerCase();
+    var pills = h("div", { class: "pills" });
+    (r.labels || []).forEach(function (l) { pills.appendChild(h("span", { class: "pill plain", text: l })); });
+    if (!pills.firstChild) pills.textContent = "none";
+    function lim(key, fmt, unit) {
+      var src = ov[key] != null ? "custom" : "default";
+      return eff[key] == null ? "–" : fmt(eff[key]) + unit + " (" + src + (ov[key] != null && def[key] != null ? ", default " + fmt(def[key]) + unit : "") + ")";
+    }
+    var st = stateOf(r);
+    var box = h("div", { class: "rdetail" }, h("dl", { class: "specs" },
+      kv("Status", h("span", { class: "pill " + st, text: st })),
+      kv("Scope", r.repo),
+      kv("Device", dev.host + (dev.kind === "pc" ? " (PC)" : " (Mac)")),
+      kv("Cores", lim("cores", String, "")),
+      kv("RAM", lim("ram_mb", fmtGb, " GB")),
+      kv("Labels", pills, null, "wide")));
+    var act = activityLine(r);
+    if (act) box.appendChild(h("div", { class: "why" }, "Working on: ", act));
+    box.appendChild(h("h5", { text: "Recent jobs" }));
+    var J = S.jobs;
+    if (!J) box.appendChild(h("div", { class: "why", text: S.jobsErr ? "Runner history is not available: " + S.jobsErr : "Runner history is still loading." }));
+    else {
+      var jobs = J.jobs.filter(function (j) { return String(j.runner).toLowerCase() === me; });
+      var sum = J.runners.filter(function (x) { return String(x.runner).toLowerCase() === me; })[0];
+      if (!jobs.length) box.appendChild(h("div", { class: "why", text: "No finished jobs seen on this runner yet." }));
+      else {
+        if (sum) box.appendChild(h("div", { class: "why", text: sum.jobs + " jobs, " + sum.failed + " failed, avg " + fmtDur(sum.avg_duration_s) }));
+        jobs.slice(0, 5).forEach(function (j) {
+          var s2 = runState({ status: "completed", conclusion: j.conclusion }), u = safeUrl(j.url);
+          box.appendChild(h("div", { class: "jl" }, h("span", { class: "pill " + s2.cls, text: s2.text }),
+            u ? h("a", { href: u, target: "_blank", rel: "noopener noreferrer", text: j.name }) : j.name,
+            h("span", { class: "labels", text: shortRepo(j.repo) + " · " + fmtDur(j.duration_s) + " · " + fmtAgo(j.completed) })));
+        });
+      }
+    }
+    return box;
+  }
+
+  function runnersSection(dev, m, stale) {
+    var allCi = dev.runners.filter(function (r) { return r.kind === "ci"; });
+    var ci = allCi.filter(function (r) { return runnerMatch(r, dev.host); });
+    var admin = dev.runners.filter(function (r) { return r.kind !== "ci" && runnerMatch(r, dev.host); });
+    var box = h("div", { class: "gh" + (stale ? " stale" : "") });
+    box.appendChild(h("h4", { text: "CI runners" + (allCi.length ? " (" + (ci.length === allCi.length ? ci.length : ci.length + " of " + allCi.length) + ")" : "") }));
+    if (!ci.length) box.appendChild(h("div", { class: "why", text: allCi.length ? "None match the filter." : "None listed." }));
+    ci.forEach(function (r) { box.appendChild(limitRow(dev, r, m)); });
+    if (allCi.length) {
+      var unk = !isNum(dev.cores) && !isNum(dev.ram_mb);
+      box.appendChild(h("div", { class: "limnote", text: "Default is 80% of the device split between its CI runners" +
+        (isNum(dev.cores) ? " (" + dev.cores + " cores" : " (size unknown") + (isNum(dev.ram_mb) ? ", " + fmtGb(dev.ram_mb) + " GB RAM)" : ")") +
+        (unk ? ", so no default is shown" : "") + ". Edits are saved here and applied to the device." + (dev.kind === "mac" ? " On macOS RAM is advisory." : "") }));
+    }
+    if (m.limitErr) box.appendChild(h("div", { class: "notice err", role: "alert", text: m.limitErr }));
+    if (admin.length) {
+      var line = h("div", { class: "admins" }, "Admin:");
+      admin.forEach(function (r) {
+        var st = stateOf(r);
+        line.appendChild(h("span", { title: (r.labels || []).join(", ") }, r.name + " ", h("span", { class: "pill " + st, text: st })));
+        var act = activityLine(r);
+        if (act) line.appendChild(act);
+      });
+      box.appendChild(line);
+    }
+    return box;
+  }
+
+  // macOS thermal pressure: 0 nominal, 1 fair, 2 serious, 3 critical (older macrunner: speed limit only).
+  var THERMAL = ["Nominal", "Fair", "Serious", "Critical"];
+  function thermalText(info) {
+    var t = isNum(info.thermal_state) ? THERMAL[info.thermal_state] || "–" : null;
+    var lim = isNum(info.cpu_speed_limit) && info.cpu_speed_limit < 100 ? "throttled to " + info.cpu_speed_limit + "%" : null;
+    if (t == null && lim == null) return isNum(info.cpu_speed_limit) ? "Normal" : "–";
+    return [t, lim].filter(Boolean).join(" · ");
+  }
+  function thermalTone(info) {
+    if (isNum(info.thermal_state) ? info.thermal_state >= 3 : false) return "bad";
+    if ((isNum(info.thermal_state) && info.thermal_state >= 2) || (isNum(info.cpu_speed_limit) && info.cpu_speed_limit < 100)) return "warn";
+    return "";
+  }
+
+  function renderOther() {
+    var box = document.getElementById("other"), hd = document.getElementById("otherH");
+    var rows = ((S.data && S.data.other) || []).filter(function (r) { return runnerMatch(r, ""); });
+    var errs = ((S.data && S.data.repos) || []).filter(function (r) { return r.error; });
+    box.textContent = "";
+    hd.hidden = !rows.length && !errs.length;
+    errs.forEach(function (r) { box.appendChild(h("div", { class: "notice err", text: r.repo + ": " + r.error })); });
+    if (!rows.length) return;
+    var t = sortableTable("other", [
+      { t: "Name", v: function (r) { return r.name; } }, { t: "Scope", v: function (r) { return shortRepo(r.repo); } },
+      { t: "Status", v: stateOf }, { t: "Labels" }], rows, function (r) {
+      return h("tr", null,
+        h("td", { text: r.name }), h("td", { text: shortRepo(r.repo) }),
+        h("td", null, h("span", { class: "pill " + stateOf(r), text: stateOf(r) })),
+        h("td", { class: "labels", text: (r.labels || []).join(", ") }));
+    }, renderOther);
+    if (S.dataErr) t.classList.add("stale");
+    box.appendChild(t);
+  }
+
+  /* ---------- stats and recent runs ---------- */
+  function fmtDur(s) {
+    if (!isNum(s)) return "–";
+    if (s < 60) return s + "s";
+    var m = Math.floor(s / 60);
+    return m < 60 ? m + "m " + (s % 60) + "s" : Math.floor(m / 60) + "h " + (m % 60) + "m";
+  }
+  function fmtAgo(iso) {
+    var t = Date.parse(iso);
+    if (isNaN(t)) return "–";
+    var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.floor(s / 60) + "m ago";
+    if (s < 86400) return Math.floor(s / 3600) + "h ago";
+    return Math.floor(s / 86400) + "d ago";
+  }
+  function runState(r) {
+    if (r.status !== "completed") return r.status === "in_progress" ? { cls: "busy", text: "running" } : { cls: "offline", text: r.status || "queued" };
+    if (r.conclusion === "success") return { cls: "online", text: "passed" };
+    if (r.conclusion === "failure" || r.conclusion === "timed_out" || r.conclusion === "startup_failure") return { cls: "error", text: r.conclusion === "failure" ? "failed" : r.conclusion.replace("_", " ") };
+    return { cls: "offline", text: r.conclusion || "done" };
+  }
+  function tile(label, value, sub, tone) {
+    return h("div", { class: "tile" }, h("div", { class: "tl", text: label }),
+      h("div", { class: "tv" + (tone ? " " + tone : ""), text: value }), sub ? h("div", { class: "ts", text: sub }) : null);
+  }
+  function renderRuns() {
+    var box = document.getElementById("runs"), hd = document.getElementById("runsH"), st = document.getElementById("stats");
+    var R = S.runs;
+    hd.hidden = !R;
+    st.textContent = ""; box.textContent = "";
+    if (!R) { if (S.runsErr) box.appendChild(stateBox("err", "Could not load runs", S.runsErr, "Retry", retryAll("nextRuns"))); return; }
+    var k = R.stats;
+    var runners = [];
+    ((S.data && S.data.repos) || []).forEach(function (r) { runners = runners.concat(r.runners || []); });
+    var online = runners.filter(function (r) { return r.status === "online"; });
+    var busy = online.filter(function (r) { return r.busy; });
+    var rate = k.success_rate;
+    var max = Math.max.apply(null, k.per_day.map(function (d) { return d.runs; }).concat([1]));
+    var spark = h("div", { class: "spark", role: "img", "aria-label": "Runs per day, last 7 days: " + k.per_day.map(function (d) { return d.runs; }).join(", ") });
+    k.per_day.forEach(function (d) {
+      var i = h("i", { title: d.day + ": " + d.runs + " runs" });
+      i.style.height = Math.max(4, Math.round(d.runs / max * 100)) + "%";
+      spark.appendChild(i);
+    });
+    st.appendChild(tile("Success rate", rate == null ? "–" : rate + "%", k.success + " of " + k.decided + " finished runs", rate == null ? "" : rate >= 90 ? "good" : rate >= 70 ? "warn" : "bad"));
+    st.appendChild(tile("Avg duration", fmtDur(k.avg_duration_s), "finished runs"));
+    st.appendChild(tile("Running · queued", k.running + " · " + k.queued, "workflow runs now"));
+    st.appendChild(tile("Runners online", online.length + " / " + runners.length, busy.length + " busy"));
+    st.appendChild(h("div", { class: "tile" }, h("div", { class: "tl", text: "Runs per day (7d)" }), spark));
+    if (S.runsErr) box.appendChild(h("div", { class: "notice", text: "Runs not refreshed: " + S.runsErr }));
+    (R.repos || []).filter(function (r) { return r.error; }).forEach(function (r) {
+      box.appendChild(h("div", { class: "notice err", text: r.repo + ": " + r.error }));
+    });
+    box.appendChild(R.runs.length ? sortableTable("runs", [
+      { t: "Result", v: function (r) { return runState(r).text; } }, { t: "Run", v: function (r) { return r.title || r.workflow; } },
+      { t: "Repo", v: function (r) { return shortRepo(r.repo); } }, { t: "Branch", v: function (r) { return r.branch; } },
+      { t: "Took", v: function (r) { return r.duration_s; } }, { t: "Started", v: function (r) { return Date.parse(r.created); } }], R.runs, function (r) {
+      var s2 = runState(r), u = safeUrl(r.url);
+      return h("tr", null,
+        h("td", null, h("span", { class: "pill " + s2.cls, text: s2.text })),
+        h("td", null, u ? h("a", { href: u, target: "_blank", rel: "noopener noreferrer", text: r.title || r.workflow }) : (r.title || r.workflow),
+          h("div", { class: "labels", text: r.workflow + " · " + r.event })),
+        h("td", { text: shortRepo(r.repo) }), h("td", { class: "mono", text: r.branch }),
+        h("td", { text: fmtDur(r.duration_s) }), h("td", { text: fmtAgo(r.created) }));
+    }, renderRuns) : stateBox("empty", "No runs yet", "Workflow runs on the listed repos show up here."));
+    box.appendChild(h("div", { class: "hint", style: "margin-top:4px", text: "Latest " + R.runs.length + " runs; stats cover the last " + k.runs + " runs across the repos. Updated " + fmtTime(R.at) + "." }));
+  }
+
+  /* ---------- runner history: who ran what, and how fast ---------- */
+  function trendBars(xs) {
+    var max = Math.max.apply(null, xs.concat([1]));
+    var sp = h("span", { class: "spark mini", role: "img", "aria-label": "Recent durations, oldest first: " + xs.map(fmtDur).join(", ") });
+    xs.forEach(function (x) {
+      var i = h("i", { title: fmtDur(x) });
+      i.style.height = Math.max(8, Math.round(x / max * 100)) + "%";
+      sp.appendChild(i);
+    });
+    return sp;
+  }
+  function renderJobs() {
+    var box = document.getElementById("jobs"), hd = document.getElementById("jobsH");
+    var J = S.jobs;
+    hd.hidden = !J && !S.jobsErr;
+    box.textContent = "";
+    if (!J) { if (S.jobsErr) box.appendChild(stateBox("err", "Could not load runner history", S.jobsErr, "Retry", retryAll("nextJobs"))); return; }
+    if (S.jobsErr) box.appendChild(h("div", { class: "notice", text: "Runner history not refreshed: " + S.jobsErr }));
+    (J.repos || []).filter(function (r) { return r.error; }).forEach(function (r) {
+      box.appendChild(h("div", { class: "notice err", text: r.repo + ": " + r.error }));
+    });
+    function table(cols, tb) {
+      return h("div", { class: "repo" }, h("div", { class: "tscroll", style: "border-top:0" }, h("table", null,
+        h("thead", null, h("tr", null, cols.map(function (c) { return h("th", { text: c }); }))), tb)));
+    }
+    // per runner
+    if (J.runners.length) {
+      box.appendChild(sortableTable("jrunners", [
+        { t: "Runner", v: function (r) { return r.runner; } }, { t: "Jobs", v: function (r) { return r.jobs; } },
+        { t: "Failed", v: function (r) { return r.failed; } }, { t: "Avg job time", v: function (r) { return r.avg_duration_s; } }], J.runners, function (r) {
+        return h("tr", null, h("td", { text: r.runner }), h("td", { text: String(r.jobs) }),
+          h("td", { text: String(r.failed) }), h("td", { text: fmtDur(r.avg_duration_s) }));
+      }, renderJobs));
+    }
+    // same job on different runners
+    var names = [];
+    J.compare.forEach(function (c) { Object.keys(c.runners).forEach(function (n) { if (names.indexOf(n) < 0) names.push(n); }); });
+    names.sort();
+    box.appendChild(h("h3", { text: "Same job, different runners" }));
+    if (J.compare.length) {
+      var cb = h("tbody");
+      J.compare.forEach(function (c) {
+        var best = Infinity;
+        Object.keys(c.runners).forEach(function (n) { best = Math.min(best, c.runners[n].median_s); });
+        var row = h("tr", null, h("td", null, h("div", { text: c.job }), h("div", { class: "labels", text: shortRepo(c.repo) })));
+        names.forEach(function (n) {
+          var x = c.runners[n];
+          row.appendChild(x ? h("td", null,
+            h("b", { text: fmtDur(x.median_s) }), x.median_s === best ? h("span", { class: "pill online plain", text: "fastest", style: "margin-left:6px" }) : null,
+            h("div", { class: "labels", text: x.n + " run" + (x.n === 1 ? "" : "s") + " · last " + fmtDur(x.last_s) }),
+            trendBars(x.trend)) : h("td", { class: "labels", text: "–" }));
+        });
+        cb.appendChild(row);
+      });
+      box.appendChild(table(["Job"].concat(names), cb));
+    } else {
+      box.appendChild(h("div", { class: "empty", text: "No job has passed on more than one runner yet." }));
+    }
+    // newest jobs
+    box.appendChild(h("h3", { text: "Recent jobs" }));
+    box.appendChild(J.jobs.length ? sortableTable("jobs", [
+      { t: "Result", v: function (j) { return j.conclusion; } }, { t: "Job", v: function (j) { return j.name; } },
+      { t: "Repo", v: function (j) { return shortRepo(j.repo); } }, { t: "Runner", v: function (j) { return j.runner; } },
+      { t: "Took", v: function (j) { return j.duration_s; } }, { t: "Finished", v: function (j) { return Date.parse(j.completed); } }], J.jobs.slice(0, 40), function (j) {
+      var u = safeUrl(j.url), st = runState({ status: "completed", conclusion: j.conclusion });
+      return h("tr", null,
+        h("td", null, h("span", { class: "pill " + st.cls, text: st.text })),
+        h("td", null, u ? h("a", { href: u, target: "_blank", rel: "noopener noreferrer", text: j.name }) : j.name),
+        h("td", { text: shortRepo(j.repo) }), h("td", { text: j.runner }),
+        h("td", { text: fmtDur(j.duration_s) }), h("td", { text: fmtAgo(j.completed) }));
+    }, renderJobs) : stateBox("empty", "No finished jobs yet", "Jobs that ran on a runner show up here."));
+    box.appendChild(h("div", { class: "hint", style: "margin-top:4px", text: "Job time is the job's own run time, not queueing. Medians use passing jobs only, from the latest finished runs. Updated " + fmtTime(J.at) + "." }));
+  }
+
+  /* ---------- CI: the ci-ok check per repo ---------- */
+  var CI_PILL = { passed: "online", failed: "error", running: "busy", queued: "busy", missing: "offline", skipped: "offline", cancelled: "offline", other: "offline", unknown: "error" };
+  function ciPill(c, check) {
+    if (!c) return h("span", { class: "pill offline", text: "–" });
+    var text = c.state === "missing" ? "no " + check : c.state, u = safeUrl(c.url);
+    var pill = h("span", { class: "pill " + (CI_PILL[c.state] || "offline"), text: text, title: c.error || (c.at ? fmtTime(c.at) : null) });
+    return u ? h("a", { href: u, target: "_blank", rel: "noopener noreferrer", style: "text-decoration:none" }, pill) : pill;
+  }
+  function renderCi() {
+    var box = document.getElementById("ci"), hd = document.getElementById("ciH");
+    var C = S.ci;
+    hd.hidden = !C && !S.ciErr;
+    box.textContent = "";
+    if (!C) { if (S.ciErr) box.appendChild(stateBox("err", "Could not load CI", S.ciErr, "Retry", retryAll("nextCi"))); return; }
+    if (S.ciErr) box.appendChild(h("div", { class: "notice", text: "CI not refreshed: " + S.ciErr }));
+    if (C.error) box.appendChild(h("div", { class: "notice err", text: "Repo list: " + C.error }));
+    var CI_RANK = { failed: 0, running: 1, queued: 2, passed: 3 };
+    box.appendChild(C.repos.length ? sortableTable("ci", [
+      { t: "Repo", v: function (r) { return shortRepo(r.repo); } },
+      { t: "Main", v: function (r) { return r.main ? CI_RANK[r.main.state] == null ? 9 : CI_RANK[r.main.state] : null; } },
+      { t: "Open PRs", v: function (r) { return (r.prs || []).length; } },
+      { t: "Running · queued", v: function (r) { return r.running; } }], C.repos, function (r) {
+      var u = safeUrl(r.url);
+      var prs = h("div", { class: "prs" });
+      (r.prs || []).forEach(function (p) {
+        var pu = safeUrl(p.url);
+        prs.appendChild(h("div", { class: "pr" }, ciPill(p.ci, C.check),
+          pu ? h("a", { href: pu, target: "_blank", rel: "noopener noreferrer", text: "#" + p.number }) : "#" + p.number,
+          h("span", { text: p.title + (p.draft ? " (draft)" : "") })));
+      });
+      if (!(r.prs || []).length && !r.error) prs.appendChild(h("span", { class: "labels", text: "none open" }));
+      if (r.error) prs.appendChild(h("div", { class: "notice err", style: "margin:0", text: r.error }));
+      var live = r.running == null ? "–" : r.running + " · " + r.queued;
+      return h("tr", null,
+        h("td", { class: "repo-name" }, u ? h("a", { href: u + "/actions", target: "_blank", rel: "noopener noreferrer", text: shortRepo(r.repo) }) : h("span", { text: shortRepo(r.repo) }),
+          h("div", { class: "labels", text: r.repo.split("/")[0] })),
+        h("td", null, ciPill(r.main, C.check), h("div", { class: "labels", text: r.branch || "" })),
+        h("td", null, prs),
+        h("td", { text: live }));
+    }, renderCi) : stateBox("empty", "No repos found", "No repo with a " + C.check + " check was listed."));
+    box.appendChild(h("div", { class: "hint", style: "margin-top:4px", text: "Each repo's " + C.check + " check on its default branch and on up to 10 open PRs. Updated " + fmtTime(C.at) + "." }));
+  }
+
+  /* ---------- go ---------- */
+  renderHeader();
+  tick();
+})();
+</script>
+</body>
+</html>
