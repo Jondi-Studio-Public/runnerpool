@@ -48,9 +48,9 @@ poll_health() {
   return 1
 }
 
-# The personal-repo token, the PC push tokens, the GitHub App id and key and the watchdog's ntfy topic and token are optional, but compose needs the files: create them empty if absent.
+# The personal-repo token, the PC push tokens, the GitHub App id and key and the watchdog's ntfy topic and token and the webhook secret are optional, but compose needs the files: create them empty if absent.
 ensure_personal_token() {
-  ssh -o BatchMode=yes "$SERVER" 'for n in gh_token_personal push_tokens gh_app_id gh_app_key ntfy_topic ntfy_token; do f=/root/macs-dashboard/secrets/$n; [ -e "$f" ] ||
+  ssh -o BatchMode=yes "$SERVER" 'for n in gh_token_personal push_tokens gh_app_id gh_app_key ntfy_topic ntfy_token webhook_secret; do f=/root/macs-dashboard/secrets/$n; [ -e "$f" ] ||
     { umask 077; : > "$f"; chown 1000:1000 "$f"; chmod 400 "$f"; }; done'
 }
 

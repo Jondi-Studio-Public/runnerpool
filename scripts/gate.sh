@@ -12,7 +12,8 @@ shell_checks() {
   for f in "${scripts[@]}"; do bash -n "$f"; done
   sh -n dashboard/entrypoint.sh
   sh -n watchdog/entrypoint.sh
-  shellcheck -S warning "${scripts[@]}" dashboard/entrypoint.sh watchdog/entrypoint.sh
+  sh -n webhook/entrypoint.sh
+  shellcheck -S warning "${scripts[@]}" dashboard/entrypoint.sh watchdog/entrypoint.sh webhook/entrypoint.sh
   echo "shell: ok"
   ps_checks
 }
@@ -36,7 +37,7 @@ python_checks() {
   # Pinned; keep in sync with the ruff version used elsewhere in your org.
   uvx ruff@0.15.20 format --check .
   uvx ruff@0.15.20 check .
-  python3 -m py_compile ci/ci_shard.py .github/actions/steal/steal.py dashboard/server.py dashboard/gh_app_token.py watchdog/watchdog.py
+  python3 -m py_compile ci/ci_shard.py .github/actions/steal/steal.py dashboard/server.py dashboard/gh_app_token.py dashboard/ci_store.py watchdog/watchdog.py webhook/receiver.py
   # PyJWT[crypto] is the version dashboard/requirements.txt installs into the image.
   if command -v uvx >/dev/null; then uvx --with "$(grep -i ^pyjwt dashboard/requirements.txt)" pytest -q tests; else python3 -m pytest -q tests; fi
 }

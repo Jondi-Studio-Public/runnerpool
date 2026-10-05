@@ -66,6 +66,10 @@ Settings are environment variables on the `watchdog` service in `compose.yaml`:
 | `WATCHDOG_RERUN_MAX_AGE_MINUTES` | `120`: a lost job older than this is left alone |
 | `WATCHDOG_RERUN_MAX_TRIES` | `5` refused re-run requests before it alerts |
 | `WATCHDOG_API_FAIL_ALERT_CYCLES` | `10` failed polls in a row before "CI watchdog is blind" |
+| `CI_STORE` | `0`: poll GitHub as before. `1`: store mode, see below |
+| `CI_DB` | `/ci/ci.db`: the shared SQLite store (store mode) |
+| `WATCHDOG_RECONCILE_SECONDS` | `300`: how often store mode re-reads GitHub to catch missed webhooks |
+| `WATCHDOG_STORE_MAX_AGE` | `900`: the store is trusted only if reconciled this recently, else the cycle polls |
 | `WATCHDOG_ORG`, `WATCHDOG_REPOS` | `example-org`, every unarchived org repo (or a space-separated list) |
 
 ## Deploy
@@ -88,3 +92,27 @@ at the configured hour, or lower `WATCHDOG_QUEUE_MINUTES` temporarily and queue 
 
 The state volume `watchdog-data` survives redeploys; deleting it forgets sightings, re-run records
 and sent alerts, so do not delete it while a lost-runner failure is recent.
+
+## Store mode (`CI_STORE=1`)
+
+Unset or `0` the watchdog polls exactly as described above. With `CI_STORE=1` it opens the shared
+SQLite store (`CI_DB`) that the webhook receiver fills, and the rules read from it:
+
+- **Reads from the store:** queued jobs (long queue, pool offline) and failed or cancelled runs with
+  their jobs (lost runner). No GitHub calls for them.
+- **Reconcile** every `WATCHDOG_RECONCILE_SECONDS` (first cycle at once): per repo it lists live
+  (queued, in progress) runs and the latest 30, fetches jobs for live runs, for failed or cancelled runs
+  within the re-run window whose jobs are not held complete, and for runs whose jobs are still held as
+  unfinished. A run the store holds as live that GitHub no longer lists as live is fetched by id and
+  stored with its jobs (it finished while the event was missed). Then the store is marked reconciled.
+  A GitHub error leaves it unmarked and the loop carries on.
+- **Trust:** the store is used only while the last reconcile is younger than `WATCHDOG_STORE_MAX_AGE`;
+  otherwise that cycle polls GitHub as before.
+- **Still polled:** the org runner list (no webhook for runner status), the repo list, job annotations,
+  the re-run POST and the daily digest.
+- **ETags:** every GET sends `If-None-Match` from a bounded per-URL cache; a 304 costs no quota.
+- **Rate limit:** `X-RateLimit-*` of every response is kept, a log line is written once each time
+  remaining drops below 500, and the store meta keys `ratelimit` (JSON) and `reconcile_seconds` are
+  written after every cycle for the dashboard. The store is pruned once per cycle.
+
+With the GitHub App webhook on (`CI_STORE=1`) the watchdog reads runs and jobs from the shared store instead of polling GitHub every minute: see [webhook.md](webhook.md).

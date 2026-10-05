@@ -10,10 +10,14 @@
 #   push_tokens      the PCs' health-push tokens (lines `win-1=<token>`), copied from 1Password (Example-Vault/Mac
 #                    Dashboard PC push tokens, field token or credential) when that item exists, else
 #                    an empty file (push off). Only with --push, or when the file is still missing.
+#   webhook_secret   the CI GitHub App's webhook secret, copied from 1Password (Example-Vault/CI GitHub App,
+#                    field webhook_secret) when that field exists, else an empty file (the webhook receiver
+#                    then refuses to start; docs/webhook.md). Only with --webhook, or when the file is still empty.
 #   dashboard_token  generated on the server; read it there once to sign in:
 #                    ssh "$DEPLOY_HOST" cat /root/macs-dashboard/secrets/dashboard_token
 # Run from Git Bash with Windows OpenSSH first on PATH. Existing files are kept, unless:
 #   --push    re-copy push_tokens from 1Password (after adding a PC or changing a token); restart after.
+#   --webhook re-copy webhook_secret from 1Password (after rotating it); restart the webhook container after.
 #   --gh      re-copy both GitHub tokens and the GitHub App id and key from 1Password (after a token is edited or replaced);
 #             the dashboard password is untouched. Restart the container (or deploy) after.
 #   --rotate  replace everything, the dashboard password included.
@@ -21,13 +25,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 SERVER="${DEPLOY_HOST:?set DEPLOY_HOST, the ssh target of the dashboard server, e.g. root@192.0.2.10}"
 DIR=/root/macs-dashboard/secrets
-ROTATE=0; GH=0; PUSH=0
+ROTATE=0; GH=0; PUSH=0; WEBHOOK=0
 case "${1:-}" in
   --rotate) ROTATE=1; GH=1 ;;
   --gh) GH=1 ;;
   --push) PUSH=1 ;;
+  --webhook) WEBHOOK=1 ;;
   "") ;;
-  *) echo "usage: scripts/provision-secrets.sh [--gh|--push|--rotate]" >&2; exit 2 ;;
+  *) echo "usage: scripts/provision-secrets.sh [--gh|--push|--webhook|--rotate]" >&2; exit 2 ;;
 esac
 remote() { ssh -o BatchMode=yes "$SERVER" "$1"; }
 
@@ -93,7 +98,21 @@ if [ "$PUSH" = 1 ] || ! remote "test -e $DIR/push_tokens"; then
   fi
 fi
 
-remote "chown 1000:1000 $DIR/gh_token $DIR/dashboard_token $DIR/gh_token_personal $DIR/push_tokens $DIR/gh_app_id $DIR/gh_app_key && chmod 400 $DIR/gh_token $DIR/dashboard_token $DIR/gh_token_personal $DIR/push_tokens $DIR/gh_app_id $DIR/gh_app_key"
+# copy_webhook: the webhook secret, piped from 1Password, never printed; moved into place only when non-empty.
+copy_webhook() {
+  agent-run --env-file dashboard/webhook-secret.env.op -- bash -c \
+    "test -n \"\$WEBHOOK_SECRET\" && printf '%s' \"\$WEBHOOK_SECRET\" | ssh -o BatchMode=yes $SERVER 'umask 077; cat > $DIR/webhook_secret.new && mv $DIR/webhook_secret.new $DIR/webhook_secret'" 2>/dev/null
+}
+
+if [ "$WEBHOOK" = 1 ] || ! remote "test -s $DIR/webhook_secret"; then
+  if copy_webhook; then echo "webhook_secret: copied from 1Password (Example-Vault/CI GitHub App)"; else
+    remote "rm -f $DIR/webhook_secret.new; [ -e $DIR/webhook_secret ] || { umask 077; : > $DIR/webhook_secret; }"
+    echo "webhook_secret: no value in 1Password item 'Example-Vault/CI GitHub App' (field webhook_secret) yet, left as it was: the webhook receiver will not start"
+  fi
+fi
+
+SECRET_FILES="gh_token dashboard_token gh_token_personal push_tokens gh_app_id gh_app_key webhook_secret"
+remote "cd $DIR && chown 1000:1000 $SECRET_FILES && chmod 400 $SECRET_FILES"
 for f in gh_token dashboard_token; do
   remote "test -s $DIR/$f" || { echo "ERROR: $DIR/$f on the server is empty" >&2; exit 1; }
 done

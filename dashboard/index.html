@@ -275,6 +275,7 @@ th[aria-sort=ascending] button.sort i, th[aria-sort=descending] button.sort i { 
     <h2 id="jobsH" hidden>Runner history</h2>
     <div id="jobs"></div>
   </main>
+  <div id="storeLine" class="hidden-note" hidden></div>
 </div>
 
 <script>
@@ -459,6 +460,37 @@ th[aria-sort=ascending] button.sort i, th[aria-sort=descending] button.sort i { 
     });
   }
 
+  /* One muted line: where run data comes from (the CI store fed by webhooks, or polling GitHub). */
+  function mins(s) { return s == null ? "never" : s < 90 ? Math.round(s) + " s ago" : Math.round(s / 60) + " min ago"; }
+  function renderStore() {
+    var el = document.getElementById("storeLine"), c = S.store;
+    if (!el) return;
+    if (!c) { el.hidden = true; return; }
+    var parts = [];
+    if (c.mode !== "on") parts.push("Run data: polling GitHub");
+    else {
+      parts.push(c.trusted ? "Run data: webhooks" : "Run data: polling GitHub (webhook store not up to date)");
+      parts.push("webhook last seen " + mins(c.webhook_ago_s));
+    }
+    var r = c.ratelimit;
+    if (r && r.remaining != null && r.limit != null) parts.push("GitHub quota " + r.remaining + "/" + r.limit);
+    el.textContent = parts.join(" · ");
+    el.hidden = false;
+  }
+  function loadStore() {
+    if (S.storeInflight) return Promise.resolve();
+    S.storeInflight = true;
+    return api("/api/info", null, 20000).then(function (d) {
+      S.store = d && d.ci_store ? d.ci_store : null;
+    }).catch(function () {
+      S.store = null;
+    }).finally(function () {
+      S.storeInflight = false;
+      S.nextStore = Date.now() + 30000;
+      renderStore();
+    });
+  }
+
   function loadInfo(host, via, fresh) {
     var m = M(host);
     if (m.fetching) return Promise.resolve();
@@ -574,6 +606,7 @@ th[aria-sort=ascending] button.sort i, th[aria-sort=descending] button.sort i { 
     if (now >= S.nextRuns) loadRuns();
     if (now >= S.nextCi) loadCi();
     if (now >= S.nextJobs) loadJobs();
+    if (now >= (S.nextStore || 0)) loadStore();
     infoHosts().forEach(function (host) {
       var m = M(host);
       if (m.nextInfo === undefined) m.nextInfo = now;
@@ -586,7 +619,7 @@ th[aria-sort=ascending] button.sort i, th[aria-sort=descending] button.sort i { 
   setInterval(tick, 1000);
 
   document.getElementById("refreshAll").addEventListener("click", function () {
-    S.nextRunners = 0; S.nextRuns = 0; S.nextCi = 0; S.nextJobs = 0;
+    S.nextRunners = 0; S.nextRuns = 0; S.nextCi = 0; S.nextJobs = 0; S.nextStore = 0;
     infoHosts().forEach(function (host) { loadInfo(host, "ssh", true); });
     tick();
   });

@@ -12,8 +12,9 @@ RUN apt-get update \
  && useradd --uid 1000 --create-home --shell /bin/bash macs
 
 WORKDIR /app
-# State of the CI watchdog (same image, second container; see docs/watchdog.md).
-RUN mkdir /data && chown macs:macs /data
+# State of the CI watchdog (same image, second container; see docs/watchdog.md) and the shared CI store
+# (/ci/ci.db, docs/webhook.md). A new named volume copies the owner of its mount point, so both stay uid 1000.
+RUN mkdir /data /ci && chown macs:macs /data /ci
 # PyJWT (with cryptography) signs the GitHub App's JWT; see dashboard/gh_app_token.py.
 COPY dashboard/requirements.txt ./dashboard/requirements.txt
 RUN pip install --no-cache-dir -r dashboard/requirements.txt
@@ -21,6 +22,7 @@ COPY macs ./runner
 COPY mac/gitrunner ./mac/gitrunner
 COPY dashboard ./dashboard
 COPY watchdog ./watchdog
+COPY webhook ./webhook
 
 ENV MACS_BIND=0.0.0.0 MACS_PORT=8765 MACS_SCRIPT=/app/runner MACS_BASH=/bin/bash PYTHONUNBUFFERED=1
 USER macs

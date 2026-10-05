@@ -188,3 +188,7 @@ Remove-Item "$env:TEMP\push-token.txt"
 version of winrunner: `.\runner.cmd update win-1` from the control PC. Without the json file nothing
 is sent. The server answers 401 for an unknown token, 403 if the info names another host, 429 when a PC
 pushes more than once per 5 s (or after 20 bad tokens in a minute), and 503 while the secret is empty.
+
+## Webhook receiver
+
+A third container, `ci-webhook`, takes the GitHub App's `workflow_job` and `workflow_run` webhooks into a shared store so the dashboard stops polling GitHub: setup, Funnel and rollback are in [webhook.md](webhook.md).

@@ -56,7 +56,7 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${DEPLOY_HOST#*@}" >> ~/.ssh/known_hosts
           echo "SSH=ssh -i $HOME/.ssh/deploy_key -o BatchMode=yes $DEPLOY_HOST" >> "$GITHUB_ENV"
-      # What scripts/deploy.sh does before every deploy: compose needs all eight secret files (six
+      # What scripts/deploy.sh does before every deploy: compose needs all nine secret files (seven
       # are optional, so create them empty), and the dashboard cannot start without the first two.
       - name: Deploy
         env:
@@ -67,7 +67,7 @@ jobs:
           $SSH bash -s -- "$SERVER_DIR" "$TAG" "${GITHUB_REPOSITORY_OWNER,,}" "$MACS_ALLOWED_HOSTS" <<'REMOTE'
           set -euo pipefail
           cd "$1"
-          for n in gh_token_personal push_tokens gh_app_id gh_app_key ntfy_topic ntfy_token; do
+          for n in gh_token_personal push_tokens gh_app_id gh_app_key ntfy_topic ntfy_token webhook_secret; do
             f=secrets/$n
             [ -e "$f" ] || { umask 077; : > "$f"; chown 1000:1000 "$f"; chmod 400 "$f"; }
           done

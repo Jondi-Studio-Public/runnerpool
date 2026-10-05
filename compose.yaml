@@ -23,6 +23,9 @@ services:
       # Windows PCs push their health to POST /api/push-info with a per-PC token: lines `win-1=<token>`
       # in this file (empty file = push off; see docs/dashboard-deploy.md, "PC health push").
       MACS_PUSH_TOKENS_FILE: "/run/secrets/push_tokens"
+      # The shared CI store the webhook receiver fills (docs/webhook.md). 0 = keep polling GitHub.
+      CI_DB: /ci/ci.db
+      CI_STORE: "${CI_STORE:-0}"
     # Tailnet IPs of your Macs, under the runner names the Macs give themselves (air-1, air-2, ...):
     # the server resolves names with accept-dns off. Set MAC_1_IP / MAC_2_IP, and add a line per
     # extra Mac. The defaults are placeholders (192.0.2.0/24 is a documentation range).
@@ -36,6 +39,8 @@ services:
       - push_tokens
       - gh_app_id
       - gh_app_key
+    volumes:
+      - ci-state:/ci
     restart: unless-stopped
     mem_limit: 768m   # 256m was OOM-killed under normal use (python + gh + ssh children + threads)
     cpus: 0.5
@@ -59,6 +64,8 @@ services:
       WATCHDOG_NTFY_URL: "${WATCHDOG_NTFY_URL:-https://ntfy.sh}"
       WATCHDOG_DIGEST_HOUR: "${WATCHDOG_DIGEST_HOUR:-7}"
       WATCHDOG_TZ: "${WATCHDOG_TZ:-UTC}"
+      CI_DB: /ci/ci.db
+      CI_STORE: "${CI_STORE:-0}"
     secrets:
       - gh_token
       - gh_app_id
@@ -67,6 +74,7 @@ services:
       - ntfy_token
     volumes:
       - watchdog-data:/data
+      - ci-state:/ci
     healthcheck:
       test: ["CMD", "python3", "/app/watchdog/watchdog.py", "--healthcheck"]
       interval: 60s
@@ -81,10 +89,51 @@ services:
         max-size: "5m"
         max-file: "3"
 
+  # The GitHub webhook receiver: the only piece reachable from the internet (Tailscale Funnel on the
+  # host, /webhook only). Same image, no GitHub credentials, only the webhook secret. Host loopback only.
+  webhook:
+    image: ghcr.io/${GITRUNNER_ORG:?set GITRUNNER_ORG to your GitHub org}/macs-dashboard:${IMAGE_TAG:-dev}
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: ci-webhook
+    entrypoint: ["sh", "/app/webhook/entrypoint.sh"]
+    environment:
+      WEBHOOK_PORT: "8766"
+      WEBHOOK_ORG: "${GITRUNNER_ORG}"
+      CI_DB: /ci/ci.db
+    ports:
+      - "127.0.0.1:8766:8766"
+    secrets:
+      - webhook_secret
+    volumes:
+      - ci-state:/ci
+    healthcheck:
+      test: ["CMD", "python3", "/app/webhook/receiver.py", "--healthcheck"]
+      interval: 60s
+      timeout: 5s
+      start_period: 20s
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: on-failure
+    mem_limit: 64m
+    cpus: 0.25
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
 volumes:
   watchdog-data:
+  ci-state:
 
-# Local runs: create these files under ./secrets (gitignored) first; gh_token_personal, push_tokens, gh_app_id, gh_app_key, ntfy_topic and ntfy_token may be empty.
+# Local runs: create these files under ./secrets (gitignored) first; gh_token_personal, push_tokens, gh_app_id, gh_app_key, ntfy_topic, ntfy_token and webhook_secret may be empty (an empty webhook_secret makes the receiver refuse to start).
 # On the server, compose.server.yaml points them at /root/macs-dashboard/secrets.
 secrets:
   gh_token:
@@ -103,3 +152,5 @@ secrets:
     file: ./secrets/ntfy_topic
   ntfy_token:
     file: ./secrets/ntfy_token
+  webhook_secret:
+    file: ./secrets/webhook_secret
