@@ -81,7 +81,7 @@ IDLE_AFTER = 300
 # Which job each busy runner is on: read only while some runner is busy, every ACTIVITY_EVERY s, one gh
 # call at a time. An entry older than ACTIVITY_MAX_AGE s is no longer shown.
 ACTIVITY_EVERY = 15
-ACTIVITY_MAX_AGE = 90
+ACTIVITY_MAX_AGE = 300  # a walk over every repo can take minutes; the 90 s it had expired mid-walk
 ACTIVITY_RUNS = 30  # in-progress runs read per repo
 HERE = Path(__file__).resolve().parent
 HOST_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
@@ -557,12 +557,13 @@ def ci_repos():
     return found + [(r, None) for r in CI_EXTRA if r.lower() not in seen], error
 
 
-def build_activity(repos, want=None, fetch=None):
+def build_activity(repos, want=None, fetch=None, progress=None):
     """In-progress jobs -> ({runner name lowercased: what it is running}, {repo: error}).
 
     repos is [(repo, token)]. Calls are serial (one gh process at a time). A repo that cannot be read (403,
     404) is skipped and reported in the errors. want, when given, is the set of lowercased busy runner names:
-    the walk stops once all are found."""
+    the walk stops once all are found. progress(found, errors), when given, is called after each repo so a
+    long walk shows what it has so far."""
     fetch = fetch or gh_json
     found, errors = {}, {}
     for repo, token in repos:
@@ -594,6 +595,8 @@ def build_activity(repos, want=None, fetch=None):
                 have = found.get(name.lower())
                 if not have or (entry["started_at"] or "") >= (have["started_at"] or ""):
                     found[name.lower()] = entry
+        if progress:
+            progress(dict(found), dict(errors))
     return found, errors
 
 
@@ -1077,9 +1080,16 @@ class State:
         with self.lock:
             names = [r["repo"] for r in (self.ci or {}).get("repos", [])]
         names += [r for r in REPOS if r.lower() not in {n.lower() for n in names}]
-        found, errors = build_activity([(r, owner_token(r)) for r in names], want)
         with self.lock:
-            self.activity, self.activity_errors, self.activity_at = found, errors, time.time()
+            hot = {v["repo"] for v in self.activity.values()}
+        names.sort(key=lambda n: n not in hot)  # repos that had a job last time first (stable)
+
+        def publish(found, errors):
+            with self.lock:
+                self.activity, self.activity_errors, self.activity_at = found, errors, time.time()
+
+        found, errors = build_activity([(r, owner_token(r)) for r in names], want, progress=publish)
+        publish(found, errors)
 
     def current_activity(self):
         """The activity of runners that are busy right now and were read recently enough."""
@@ -1140,6 +1150,7 @@ class State:
             "limit_status": status,
             "actions_in_flight": self.actions_in_flight(),
             "runner_activity": self.current_activity(),
+            "activity_errors": dict(self.activity_errors),
         }
 
     def known_mac(self, host):
