@@ -872,6 +872,7 @@ function Sync-RunState([string[]]$busy) {
         if (-not (Test-Ci $n)) { continue }
         $s = Get-Service-For $n
         if (-not $s) { continue }
+        if ($s.Status -eq 'Running') { $script:StartFailedAt.Remove($n) }  # started by hand (winrunner restart): forget the failure
         $isBusy = $busy -contains $n
         if (-not $reason -and (-not $hold -or $isBusy)) {
             if ($s.Status -ne 'Running') {

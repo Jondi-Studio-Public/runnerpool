@@ -204,6 +204,20 @@ def test_a_service_that_fails_to_start_is_left_alone_until_the_retry_wait_passes
     assert sum("could not start win-1 " in line for line in lines) == 2, out
 
 
+def test_a_service_started_by_hand_forgets_its_failure_so_a_later_stop_is_recovered(tmp_path):
+    out = controller(
+        tmp_path,
+        {},
+        busy=[],
+        running=[],
+        extra='function Start-Runner($n) { Write-Output "START $n"; throw "logon failure" }',
+        # the operator starts both services (`winrunner restart`), a poll sees them running, then they stop again
+        tail="$script:running = @('win-1','win-1-ci-2'); Sync-RunState $busy; $script:running = @(); Sync-RunState $busy",
+    )
+    lines = out.splitlines()
+    assert lines.count("START win-1") == 2 and lines.count("START win-1-ci-2") == 2, out
+
+
 # --- something outside the runners holding a slot as a lease (slots-hold / slots-release) -----------------
 
 
