@@ -58,7 +58,7 @@ Settings are environment variables on the `watchdog` service in `compose.yaml`:
 |---|---|
 | `WATCHDOG_NTFY_URL` | `https://ntfy.sh` |
 | `WATCHDOG_NTFY_TOPIC` | the `ntfy_topic` secret file (the variable wins if set) |
-| `WATCHDOG_POLL_SECONDS` | `60` |
+| `WATCHDOG_POLL_SECONDS` | `120` |
 | `WATCHDOG_POOL_OFFLINE_MINUTES` | `30` |
 | `WATCHDOG_QUEUE_MINUTES` | `15` |
 | `WATCHDOG_STALE_DAYS` | `3` |
