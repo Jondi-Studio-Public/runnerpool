@@ -428,13 +428,6 @@ class Watchdog:
         except GitHubError as e:
             log(f"reconcile failed, store not marked: {e}")  # retried next cycle; readers fall back to polling
 
-    @staticmethod
-    def _held_complete(held, run):
-        """The store holds every job of this run's current attempt and all of them finished."""
-        attempt = run.get("run_attempt") or 1
-        mine = [j for j in held if (j.get("run_attempt") or 1) == attempt]
-        return bool(mine) and all(j.get("status") == "completed" for j in mine)
-
     def reconcile(self, now):
         """Make the store correct even if webhooks were missed. Raises GitHubError (and then does not
         mark the store reconciled) when GitHub cannot be read."""
@@ -457,7 +450,8 @@ class Watchdog:
                     and (parse_ts(run.get("updated_at")) or 0) >= horizon
                 )
                 stuck = not is_live and any(j.get("status") != "completed" for j in held)  # a job event was missed
-                if is_live or stuck or (failed and not self._held_complete(held, run)):
+                # a stored subset of a failed run can hide a job whose event was missed, so failed runs are always read
+                if is_live or stuck or failed:
                     jobs += self.poll_jobs(repo, run["id"])
             store.upsert_many(repo, runs.values(), jobs)
         # Runs the store holds as live that GitHub no longer lists as live finished while we missed the event.

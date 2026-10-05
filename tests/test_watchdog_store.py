@@ -222,6 +222,20 @@ def test_reconcile_catches_run_that_finished_while_event_missed(env):
     assert store.get_meta("reconcile_seconds") == "300"
 
 
+def test_reconcile_reads_a_failed_run_whose_stored_jobs_are_only_a_subset(env):
+    wd, gh, sink, clock, store = env
+    failed_run = {
+        "id": 4, "name": "CI", "status": "completed", "conclusion": "failure", "run_attempt": 1,
+        "created_at": iso(clock.t - 600), "updated_at": iso(clock.t - 60),
+    }  # fmt: skip
+    gh.latest = [failed_run]
+    held = T.job(41, "lint", "completed", "success", run_id=4, created_at=iso(clock.t - 500))
+    store.upsert_many(REPO, [failed_run], [held])  # the event for job 42 was missed
+    gh.jobs[4] = [held, T.job(42, "unit", "completed", "failure", run_id=4, created_at=iso(clock.t - 500))]
+    wd.cycle()
+    assert sorted(j["id"] for j in store.jobs(run_id=4)) == [41, 42]
+
+
 def test_reconcile_stores_live_and_latest_runs_with_jobs(env):
     wd, gh, sink, clock, store = env
     gh.runs[(REPO, "queued")] = [
