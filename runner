@@ -402,7 +402,7 @@ case $cmd in
     is_win "$1" && die "ramdisk is for Macs and the PC's WSL runners (wsl-N); $1 is a native Windows runner"
     [[ "${3:-4}" =~ ^[0-9]+$ ]] || die "GB is a whole number"
     case $2 in
-      on) admin "$1" ramdisk-on "size=${3:-4}" ;;
+      on) if is_wsl "$1"; then admin "$1" ramdisk-on "slots=${3:-4}"; else admin "$1" ramdisk-on "size=${3:-4}"; fi ;;   # the Linux workflow is at GitHub's 10-input limit: it reuses `slots`
       off) admin "$1" ramdisk-off ;;
       *) die "ramdisk HOST on [GB]|off" ;;
     esac ;;

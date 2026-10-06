@@ -50,10 +50,7 @@ on:
         description: limit action only, MB or default
         required: false
       slots:
-        description: "slots action only: N, N:THREADS (CPU threads per job, default 8) or off. N CI jobs may run at once"
-        required: false
-      size:
-        description: "ramdisk-on only: GB per runner for the RAM workspace (a cap, not a reservation)"
+        description: "slots action: N, N:THREADS (CPU threads per job, default 8) or off, N CI jobs at once. ramdisk-on: GB per runner for the RAM workspace (a cap, default 4)"
         required: false
       request:
         description: Id the control PC uses to find this run
@@ -77,7 +74,6 @@ jobs:
       CORES: ${{ inputs.cores }}
       RAM: ${{ inputs.ram }}
       SLOTS: ${{ inputs.slots }}
-      SIZE: ${{ inputs.size }}
     steps:
       - name: Mask token
         run: if [ -n "$TOKEN" ]; then echo "::add-mask::$TOKEN"; fi
@@ -116,8 +112,8 @@ jobs:
               th=''; case "$SLOTS" in *:*) th=${SLOTS#*:} ;; esac
               "$lr" slots "${SLOTS%%:*}" ${th:+"$th"} ;;
             ramdisk-on)
-              case "${SIZE:-4}" in *[!0-9]*|'') echo 'size is a whole number of GB'; exit 1 ;; esac
-              "$lr" ramdisk on "$(( ${SIZE:-4} * 1024 ))" ;;
+              case "${SLOTS:-4}" in *[!0-9]*|'') echo 'size is a whole number of GB'; exit 1 ;; esac
+              "$lr" ramdisk on "$(( ${SLOTS:-4} * 1024 ))" ;;
             ramdisk-off) "$lr" ramdisk off ;;
             install-postgres)
               # The Postgres 16 binaries an integration job starts its own cluster from;
