@@ -236,6 +236,20 @@ def test_reconcile_reads_a_failed_run_whose_stored_jobs_are_only_a_subset(env):
     assert sorted(j["id"] for j in store.jobs(run_id=4)) == [41, 42]
 
 
+def test_reconcile_stores_a_failed_run_older_than_the_latest_30(env):
+    wd, gh, sink, clock, store = env
+    old_failure = {
+        "id": 77, "name": "CI", "status": "completed", "conclusion": "failure", "run_attempt": 1,
+        "created_at": iso(clock.t - 3000), "updated_at": iso(clock.t - 600),
+    }  # fmt: skip
+    gh.latest = []  # more than 30 newer runs pushed it out of the latest page
+    gh.runs[(REPO, "failure")] = [old_failure]
+    gh.jobs[77] = [T.job(771, "unit", "completed", "failure", run_id=77, created_at=iso(clock.t - 2900))]
+    wd.cycle()
+    assert [r["id"] for r in store.runs(REPO)] == [77]
+    assert [j["id"] for j in store.jobs(run_id=77)] == [771]
+
+
 def test_failed_runs_from_the_store_are_limited_per_conclusion_not_together(env):
     wd, gh, sink, clock, store = env
 

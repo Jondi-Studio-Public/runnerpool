@@ -440,6 +440,11 @@ class Watchdog:
             latest = self.runs(repo, per_page=30)
             live_ids.update(r["id"] for r in live)
             runs = {r["id"]: r for r in latest}
+            for status in (
+                "failure",
+                "cancelled",
+            ):  # a failure older than the latest 30 runs still needs its jobs examined
+                runs.update({r["id"]: r for r in self.runs(repo, status=status)})
             runs.update({r["id"]: r for r in live})
             jobs = []
             for run in runs.values():
