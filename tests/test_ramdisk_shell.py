@@ -5,6 +5,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 LINUXRUNNER = ROOT / "linux" / "linuxrunner"
 STUBS = {
@@ -233,7 +235,8 @@ def test_release_hook_ignores_a_work_path_that_is_not_a_work_folder(tmp_path):
     assert (keep / "f").exists()
 
 
-def test_a_runner_added_while_ram_mode_is_on_is_mounted_and_gets_the_wipe_hook(tmp_path):
+@pytest.mark.parametrize("run_as", ["ci", "root"])  # a CI runner added as root is a CI runner too
+def test_a_runner_added_while_ram_mode_is_on_is_mounted_and_gets_the_wipe_hook(tmp_path, run_as):
     env, home, units, etc = setup(tmp_path)
     run(env, "ramdisk", "on", "1024")
     bindir = tmp_path / "bin"
@@ -269,7 +272,7 @@ chmod +x "$d/svc.sh" "$d/config.sh"
         )
     )
     env["STUB_HOME"] = str(home)
-    r = run(env, "add-runner", "o/r", "new-1", "linux-ci", "TOKEN")
+    r = run(env, "add-runner", "o/r", "new-1", "linux-ci", "TOKEN", run_as)
     assert r.returncode == 0, r.stderr
     work = f"{home}/runners/new-1/_work"
     assert f"tmpfs {work} tmpfs size=1024m" in (etc / "fstab").read_text()

@@ -377,8 +377,10 @@ cmd_add_runner() {  # REPO|ORG NAME LABELS TOKEN [ci|root]
   sudo -u "$user" env RUNNER_ALLOW_RUNASROOT=1 "$dir/config.sh" --unattended --replace --url "$url" --token "$token" \
     --name "$name" --labels "$labels" --work _work >/dev/null
   ( cd "$dir" && RUNNER_ALLOW_RUNASROOT=1 ./svc.sh install "$user" >/dev/null )
-  if [ "$as" != root ] && [ -s "$RAMDISK_FILE" ]; then   # RAM workspace is on here: mount it and wire the wipe hook BEFORE the
-    u=$(unit_for "$name")                                # runner can take a job, so nothing is stopped or deleted under one
+  # RAM workspace is on: any CI runner (whoever it runs as; never an admin one) gets its workspace mounted and the wipe hook
+  # wired BEFORE it can take a job, so nothing is stopped or deleted under one.
+  if ! is_admin "$name" && [ -s "$RAMDISK_FILE" ]; then
+    u=$(unit_for "$name")
     ramdisk_apply_unit "$u" "$(cat "$RAMDISK_FILE")"
     APPLY_NO_RESTART=1 apply_limits "$u"
   fi
