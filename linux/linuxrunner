@@ -8,14 +8,15 @@ set -euo pipefail
 
 # WSL runs a `wsl -u root` session in a mount namespace of its own, while systemd and the runner services live in PID 1's: a
 # tmpfs mounted from such a session is invisible to the runners. So a root command from there re-runs itself in PID 1's.
-# nsenter -m resets the working directory, so the script goes by its absolute path. (LINUXRUNNER_NS1 lets the tests stand in
-# for PID 1's namespace.)
-NS1=${LINUXRUNNER_NS1:-/proc/1/ns/mnt}
-if { [ "$EUID" = 0 ] || [ -n "${LINUXRUNNER_NS1:-}" ]; } && [ -z "${LINUXRUNNER_IN_NS:-}" ] && [ -r "$NS1" ] &&
+# nsenter -m resets the working directory, so the script goes by its absolute path, checked to exist over there first.
+# (LINUXRUNNER_NS1, with LINUXRUNNER_NS_TEST=1, lets the tests stand in for PID 1's namespace.)
+NS1=/proc/1/ns/mnt
+[ "${LINUXRUNNER_NS_TEST:-}" != 1 ] || NS1=${LINUXRUNNER_NS1:-$NS1}
+if { [ "$EUID" = 0 ] || [ "${LINUXRUNNER_NS_TEST:-}" = 1 ]; } && [ -z "${LINUXRUNNER_IN_NS:-}" ] && [ -r "$NS1" ] &&
   command -v nsenter >/dev/null 2>&1 && [ "$(readlink "$NS1")" != "$(readlink /proc/self/ns/mnt)" ]; then
   self=$(readlink -f -- "$0" 2>/dev/null || true)
-  if [ -f "$self" ]; then exec env LINUXRUNNER_IN_NS=1 nsenter -t 1 -m -- bash "$self" "$@"; fi
-  echo "linuxrunner: warning: cannot find this script by an absolute path, so it runs in this session's mount namespace" >&2
+  if [ -f "$self" ] && nsenter -t 1 -m -- test -f "$self"; then exec env LINUXRUNNER_IN_NS=1 nsenter -t 1 -m -- bash "$self" "$@"; fi
+  echo "linuxrunner: warning: this script is not reachable by an absolute path in PID 1's mount namespace, so it runs in this session's" >&2
 fi
 unset LINUXRUNNER_IN_NS
 
@@ -572,6 +573,7 @@ ramdisk_unit_ram_path() {  # UNIT
 ramdisk_sweep() {
   local u w
   maint_live || true   # clears a marker its process left behind (killed), so slot-sync does not stay paused
+  compgen -G "$SYSTEMD_DIR/*.d/ramdisk.conf" >/dev/null || return 0   # RAM mode is off everywhere: nothing to sweep
   for u in $(ci_units); do
     w=$(ramdisk_unit_ram_path "$u")
     [ -n "$w" ] && [ -e "$w/.hook-waiting" ] || continue
@@ -649,6 +651,8 @@ ramdisk_finish() {
     if [ -n "$free" ]; then [ "$free" -gt 0 ] || continue; free=$((free - 1)); fi
     systemctl start "$u" || true
   done
+  # A failed `off` may have removed the sweep units while RAM mode is still on somewhere: put them back.
+  if [ "$rc" != 0 ] && [ -s "$RAMDISK_FILE" ]; then write_sweep_units || true; fi
   [ "$rc" = 0 ] || log "ramdisk did not finish: the runners it stopped were started again; running it again completes it"
 }
 

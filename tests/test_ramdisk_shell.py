@@ -731,7 +731,9 @@ def test_a_work_folder_under_a_symlinked_parent_is_refused(tmp_path):
 
 def test_root_commands_rerun_in_pid_1s_namespace_by_absolute_path_even_when_called_relatively(tmp_path):
     env, home, units = setup(tmp_path)
-    (tmp_path / "ns1").write_text("")  # readlink gives nothing for it: not this namespace  # stands in for PID 1's namespace, which differs from this one
+    (tmp_path / "ns1").write_text(
+        ""
+    )  # readlink gives nothing for it: not this namespace  # stands in for PID 1's namespace, which differs from this one
     (tmp_path / "bin/nsenter").write_text(
         '#!/bin/sh\necho "nsenter $*" >> "$STUB_DIR/nsenter.log"\nwhile [ "$1" != -- ]; do shift; done; shift\nexec "$@"\n'
     )
@@ -739,7 +741,7 @@ def test_root_commands_rerun_in_pid_1s_namespace_by_absolute_path_even_when_call
     r = subprocess.run(
         ["bash", "linuxrunner", "help"],
         cwd=LINUXRUNNER.parent,
-        env={**env, "LINUXRUNNER_NS1": str(tmp_path / "ns1")},
+        env={**env, "LINUXRUNNER_NS_TEST": "1", "LINUXRUNNER_NS1": str(tmp_path / "ns1")},
         capture_output=True,
         text=True,
         timeout=30,
@@ -747,7 +749,8 @@ def test_root_commands_rerun_in_pid_1s_namespace_by_absolute_path_even_when_call
     assert r.returncode == 0, r.stderr
     log = (tmp_path / "nsenter.log").read_text()
     assert f"-t 1 -m -- bash {LINUXRUNNER}" in log  # absolute: nsenter -m resets the working directory
-    assert log.count("nsenter") == 1  # re-runs once, never loops
+    assert log.count("-- bash") == 1  # re-runs once, never loops
+    assert f"-t 1 -m -- test -f {LINUXRUNNER}" in log  # checked to exist over there first
 
 
 def test_the_sweep_takes_the_work_folder_from_the_root_owned_drop_in_not_from_runner(tmp_path):
@@ -798,3 +801,11 @@ def test_each_runner_start_rearms_the_sweep_watch_and_removing_a_runner_rewrites
     assert run(env, "remove-runner", "ci-1").returncode == 0
     text = path.read_text()
     assert f"{tmp_path}/ci-1/_work" not in text and f"PathExists={tmp_path}/ci-2/_work/.hook-waiting" in text
+
+
+def test_a_failed_off_puts_the_sweep_units_back(tmp_path):
+    env, home, units = setup(tmp_path)
+    run(env, "ramdisk", "on", "1024")
+    (tmp_path / "um").write_text("")
+    assert run({**env, "STUB_UMOUNT_FAIL": str(tmp_path / "um")}, "ramdisk", "off").returncode != 0
+    assert (home / "ramdisk").exists() and (units / "runnerpool-ramdisk-sweep.path").exists()
