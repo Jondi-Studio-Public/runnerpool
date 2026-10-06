@@ -309,6 +309,7 @@ apply_limits() {  # UNIT
     rm -f "$dropin"; rmdir "$(dirname "$dropin")" 2>/dev/null || true
   fi
   systemctl daemon-reload || log "daemon-reload failed: the caps for $name apply after the next reload"
+  if [ -n "${APPLY_NO_RESTART:-}" ]; then return 0; fi   # the caller (ramdisk) restarts what it stopped itself
   if is_busy "$u"; then log "$name is busy: limits apply when it next restarts"; else systemctl restart "$u"; fi
 }
 
@@ -480,6 +481,7 @@ cmd_ramdisk() {  # on [MB] | off
   esac
   trap ramdisk_finish EXIT
   ramdisk_drain
+  APPLY_NO_RESTART=1   # a runner that was stopped (ci off, slots full) must stay stopped; ramdisk_finish restarts the drained ones
   mkdir -p "$HOME_DIR"
   if [ "$v" = on ]; then
     echo "$mb" > "$RAMDISK_FILE"

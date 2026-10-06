@@ -277,3 +277,17 @@ def test_a_failure_part_way_restarts_the_runners_it_stopped(tmp_path):
         assert f"stop {unit}" in log and f"start {unit}" in log
     assert log.index("stop actions.runner.o-r.ci-1.service") < log.index("start actions.runner.o-r.ci-1.service")
     assert not (home / "maintenance").exists()
+
+
+def test_runners_that_were_paused_stay_stopped_through_a_change(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    bindir = tmp_path / "bin"
+    sc = (bindir / "systemctl").read_text()
+    sc = sc.replace("is-active) echo active ;;", "is-active) echo inactive ;;")  # ci off: every runner is stopped
+    (bindir / "systemctl").write_text(sc)
+    (home / "ci-off").write_text("")
+    for action in (("on", "1024"), ("off",)):
+        (tmp_path / "systemctl.log").write_text("")
+        assert run(env, "ramdisk", *action).returncode == 0
+        log = (tmp_path / "systemctl.log").read_text().splitlines()
+        assert not [ln for ln in log if ln.startswith(("start ", "restart ", "stop "))]
