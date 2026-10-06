@@ -203,12 +203,14 @@ def test_release_hook_empties_the_workspace_but_keeps_tool_caches(tmp_path):
         (work / d).mkdir(parents=True)
         (work / d / "f").write_text("x")
     (work / "_temp/_runner_file_commands").mkdir()
+    for d in ("_scratch", "_PipelineMapping", "_temp/_leftover"):
+        (work / d).mkdir(parents=True, exist_ok=True)
     hook_env = {**env, "GIT_RUNNER_NAME": "ci-1", "GIT_RUNNER_WORK": str(work)}
     r = subprocess.run(
         ["bash", str(LINUXRUNNER), "hook", "release"], env=hook_env, capture_output=True, text=True, timeout=20
     )
     assert r.returncode == 0, r.stderr
-    assert sorted(p.name for p in work.iterdir()) == ["_actions", "_temp", "_tool"]
+    assert sorted(p.name for p in work.iterdir()) == ["_PipelineMapping", "_actions", "_temp", "_tool"]
     assert [p.name for p in (work / "_temp").iterdir()] == ["_runner_file_commands"]
 
 
@@ -256,3 +258,22 @@ def test_a_runner_added_while_ram_mode_is_on_is_mounted_and_gets_the_wipe_hook(t
     e = (home / "runners/new-1/.env").read_text().split("\n")
     assert f"GIT_RUNNER_WORK={work}" in e
     assert f"ACTIONS_RUNNER_HOOK_JOB_COMPLETED={home}/slot-done.sh" in e
+
+
+def test_a_failure_part_way_restarts_the_runners_it_stopped(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    bindir = tmp_path / "bin"
+    (bindir / "mount").write_text("#!/bin/sh\nexit 1\n")  # the mount fails after the runners were drained
+    sc = (bindir / "systemctl").read_text()  # stop and start now change what is-active reports
+    sc = sc.replace(
+        "is-active) echo active ;;", 'is-active) [ -e "$STUB_DIR/stopped.$2" ] && echo inactive || echo active ;;'
+    )
+    hooks = 'case "$1" in\n  stop) touch "$STUB_DIR/stopped.$2" ;;\n  start) rm -f "$STUB_DIR/stopped.$2" ;;'
+    (bindir / "systemctl").write_text(sc.replace('case "$1" in', hooks, 1))
+    r = run(env, "ramdisk", "on", "1024")
+    assert r.returncode != 0
+    log = (tmp_path / "systemctl.log").read_text().splitlines()
+    for unit in ("actions.runner.o-r.ci-1.service", "actions.runner.o-r.ci-2.service"):
+        assert f"stop {unit}" in log and f"start {unit}" in log
+    assert log.index("stop actions.runner.o-r.ci-1.service") < log.index("start actions.runner.o-r.ci-1.service")
+    assert not (home / "maintenance").exists()

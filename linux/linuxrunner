@@ -174,13 +174,14 @@ cpu_block() {  # NUM THREADS TOTAL -> a CPU list such as 8-15, or nothing when t
 
 # Empties the RAM workspace when a job ends (set by `ramdisk on`; GIT_RUNNER_WORK is the runner's _work folder): the
 # checkout and everything the job wrote next to it, and the job's own temp files. `_tool` and `_actions` stay (toolchain
-# and action caches the next job reuses; they go when the distro stops), as do the runner's own underscore files.
+# and action caches the next job reuses; they go when the distro stops), as do the runner's own bookkeeping paths. Only
+# those named paths survive: any other entry, underscore or not, is the job's and goes.
 wipe_work() {  # WORKDIR
   local w=${1:-}
   case $w in */_work) ;; *) return 0 ;; esac
   [ -d "$w" ] || return 0
-  find "$w" -mindepth 1 -maxdepth 1 ! -name '_*' -exec rm -rf {} + 2>/dev/null || true
-  [ ! -d "$w/_temp" ] || find "$w/_temp" -mindepth 1 -maxdepth 1 ! -name '_*' -exec rm -rf {} + 2>/dev/null || true
+  find "$w" -mindepth 1 -maxdepth 1 ! -name _tool ! -name _actions ! -name _temp ! -name _PipelineMapping -exec rm -rf {} + 2>/dev/null || true
+  [ ! -d "$w/_temp" ] || find "$w/_temp" -mindepth 1 -maxdepth 1 ! -name _runner_file_commands ! -name _github_workflow ! -name _github_home -exec rm -rf {} + 2>/dev/null || true
   return 0
 }
 
@@ -444,12 +445,21 @@ ramdisk_drain() {
     done
     [ -n "$left" ] || return 0
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      for u in $DRAINED; do [ -f "$CI_OFF" ] || systemctl start "$u" || true; done
       die "a runner is still running a job after ${RAMDISK_WAIT:-1800}s: nothing was changed"
     fi
     [ "$noted" = 1 ] || { log "waiting for running jobs to finish:$left"; noted=1; }
     sleep "${RAMDISK_POLL:-2}"
     pending=$left
+  done
+}
+
+# Runs on every exit of `ramdisk`, success or not (a failed mount, a cancelled workflow): lets slot-sync work again and
+# starts the runners this change stopped, so a failure never strands them.
+ramdisk_finish() {
+  local u
+  rm -f "$MAINT_FILE"
+  for u in $DRAINED; do
+    [ -f "$CI_OFF" ] || [ "$(state "$u")" = active ] || systemctl start "$u" || true
   done
 }
 
@@ -468,7 +478,7 @@ cmd_ramdisk() {  # on [MB] | off
     off) ;;
     *) die "ramdisk on [MB] | off" ;;
   esac
-  trap 'rm -f "$MAINT_FILE"' EXIT
+  trap ramdisk_finish EXIT
   ramdisk_drain
   mkdir -p "$HOME_DIR"
   if [ "$v" = on ]; then
@@ -481,7 +491,6 @@ cmd_ramdisk() {  # on [MB] | off
     for u in $(ci_units); do ramdisk_remove_unit "$u"; apply_limits "$u"; done
     log "RAM workspace off"
   fi
-  for u in $DRAINED; do [ -f "$CI_OFF" ] || [ "$(state "$u")" = active ] || systemctl start "$u"; done
 }
 
 # Docker's work runs in its own cgroups, outside the runner services' drop-ins, so a job's `docker build` would escape the
