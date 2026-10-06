@@ -45,11 +45,11 @@ folder (`.runner`'s `workFolder`, normally `_work`), so checkouts and test temp 
   the runner service's `MemoryMax`. The mount is `nosuid,nodev`, so jobs that `mknod` (debootstrap) fail there.
 - **Emptied after every job, checked before the next.** The job-completed hook deletes everything under the work folder,
   toolchain and action caches included (`_tool`, `_actions`), and empties the runner's own `_temp` folders; the job-started hook
-  cleans anything a crash left. Files a Docker action created as root are removed through a throwaway container (no pull) and, if
-  that fails, by the root `slot-sync` loop while the started hook waits; a job fails, with the reason in its log, only if neither
-  works within 90 s. Toolchains are therefore downloaded again by each job.
+  cleans anything a crash left. Files a Docker action created as root are removed by the root `slot-sync` loop (the follower
+  service runs it every 2 s, slots on or off) while the started hook waits; a job fails, with the reason in its log, only if that
+  does not happen within 90 s (a Linux box without the follower service). Toolchains are therefore downloaded again by each job.
 - **No fstab entry.** Each runner's unit runs `linuxrunner ramdisk-mount` as root (`ExecStartPre=+`) on every start, which mounts
-  the tmpfs and empties it, so a boot or a crash also starts clean. A work folder that is a symlink is refused, so a job cannot
+  the tmpfs and empties it, so a boot or a crash also starts clean. A work folder that is a symlink, sits under one or has `..` in its path is refused, so a job cannot
   redirect the mount. `add-runner` mounts a new runner before its service starts; `remove-runner` unmounts it. A CI runner
   adopted some other way after `on` is picked up by the next `ramdisk on`, `slots` or `limit`.
 - It never interrupts a job: idle runners are stopped at once (after a second look), busy ones are waited for (up to 15 minutes,

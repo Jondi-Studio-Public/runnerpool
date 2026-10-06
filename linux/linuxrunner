@@ -29,11 +29,12 @@ log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
 die() { log "error: $*" >&2; exit 1; }
 need_root() { [ "$(id -u)" = 0 ] || die "run as root (sudo linuxrunner)"; }
 # Runs a command that changes runners under the lock, held until this process exits. Only the command dispatch below takes it:
-# the follower service calls cmd_slots and friends itself, in one long-lived process, and so never holds it.
+# the follower service calls cmd_slots and friends itself, in one long-lived process, and so never holds it; ramdisk-mount
+# (each unit's ExecStartPre, run while `ramdisk on` holds the lock), the hooks and slot-sync never take it either.
 locked() {
   mkdir -p "$HOME_DIR"
   exec 9>"$LOCK_FILE"
-  flock -w "${LOCK_WAIT:-60}" 9 || die "another linuxrunner change is in progress: try again in a minute"
+  flock -w "${LOCK_WAIT:-30}" 9 || die "another linuxrunner change is in progress: try again when it finishes (a ramdisk change waits for running jobs)"
   "$@"
 }
 
@@ -188,9 +189,8 @@ cpu_block() {  # NUM THREADS TOTAL -> a CPU list such as 8-15, or nothing when t
 # go too; anything that is a symlink or a plain file where a folder belongs is replaced. find never follows symlinks and
 # stays on the workspace's filesystem (-xdev).
 #   WIPE_SH takes WORKDIR and `list` (print the first leftover under each level, nothing deleted) or `wipe`.
-# Files a Docker action created as root cannot be deleted by the runner's user: the hooks fall back to a throwaway container
-# (the runner's user is in the docker group), and as a last resort a root loop (`slot-sync`) wipes while the job's start
-# hook waits (.hook-waiting).
+# Files a Docker action created as root cannot be deleted by the runner's user: the root loop (`slot-sync`, which the follower
+# service runs every 2 s whether slots are on or not) wipes them while the next job's start hook waits (.hook-waiting).
 WIPE_SH='w=$1; mode=$2
 run() { if [ "$mode" = list ]; then find "$@" -print -quit; else find "$@" -exec rm -rf -- {} +; fi; }
 bad() { [ -L "$1" ] || { [ -e "$1" ] && [ ! -d "$1" ]; }; }
@@ -211,24 +211,13 @@ fi'
 work_is_ram() { [ -n "${1:-}" ] && [ -d "$1" ] && [ ! -L "$1" ] && mountpoint -q "$1"; }
 work_junk() { work_is_ram "$1" && sh -c "$WIPE_SH" _ "$1" list || true; }
 
-# A throwaway container as root, from an image that is already here (never pulls at the end of a job), for what the runner's
-# user cannot delete. Skipped when there is no docker or no image.
-wipe_work_docker() {  # WORKDIR
-  local img
-  command -v docker >/dev/null 2>&1 || return 0
-  img=$(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>' | head -1 || true)
-  [ -n "$img" ] || return 0
-  timeout 120 docker run --rm --network none --pull never --entrypoint sh -v "$1:/w" "$img" -c "$WIPE_SH" _ /w wipe >/dev/null 2>&1 || true
-}
-
-# As the runner's user: delete the job's files (read-only directories made writable first), then the container fallback for
-# anything left. Returns 0 either way: the caller checks work_junk.
+# As the runner's user: delete the job's files (read-only directories made writable first). Returns 0 either way: the caller
+# checks work_junk.
 wipe_work() {  # WORKDIR
   local w=${1:-}
   work_is_ram "$w" || return 0
   find "$w" -xdev -mindepth 1 -maxdepth 1 -type d -exec chmod -R u+rwX -- {} + 2>/dev/null || true
   sh -c "$WIPE_SH" _ "$w" wipe 2>/dev/null || true
-  [ -z "$(work_junk "$w")" ] || wipe_work_docker "$w"
   return 0
 }
 
@@ -497,8 +486,8 @@ maint_live() {  # a `ramdisk` change is running (its PID is alive and the marker
 cmd_ramdisk_mount() {  # WORKDIR MB UID GID
   need_root
   local w=${1:-} mb=${2:-} uid=${3:-} gid=${4:-}
-  [[ "$w" =~ $RAM_PATH_RE ]] && [[ "$mb" =~ ^[0-9]+$ ]] && [[ "$uid" =~ ^[0-9]+$ ]] && [[ "$gid" =~ ^[0-9]+$ ]] || die "ramdisk-mount WORKDIR MB UID GID"
-  [ -d "$w" ] && [ ! -L "$w" ] || die "$w is not a real directory (a symlink?): refusing to mount over it"
+  [[ "$w" =~ $RAM_PATH_RE ]] && [[ "$w" != *..* ]] && [[ "$mb" =~ ^[0-9]+$ ]] && [[ "$uid" =~ ^[0-9]+$ ]] && [[ "$gid" =~ ^[0-9]+$ ]] || die "ramdisk-mount WORKDIR MB UID GID"
+  [ -d "$w" ] && [ ! -L "$w" ] && [ "$(realpath -e "$w")" = "$w" ] || die "$w is not a real directory (a symlink, or under one?): refusing to mount over it"
   if mountpoint -q "$w"; then mount -o "remount,size=${mb}m" "$w"
   else
     find "$w" -xdev -mindepth 1 -delete   # mounting over a full folder only hides it: the disk space must really come back
@@ -523,10 +512,10 @@ ramdisk_apply_unit() {  # UNIT SIZE_MB: the unit is stopped (or about to start):
   local u=$1 mb=$2 d w user uid gid dropin
   d=$(unit_dir "$u"); w=$(ramdisk_unit_path "$u")
   [[ "$w" =~ $RAM_PATH_RE ]] || die "$(unit_name "$u"): the work folder path $w has characters this tool does not mount over"
-  case $w in */../*|*/..) die "$(unit_name "$u"): the work folder path $w climbs out of the runner folder" ;; esac
+  [[ "$w" != *..* ]] || die "$(unit_name "$u"): the work folder path $w has .. in it"
   [ ! -L "$w" ] || die "$(unit_name "$u"): $w is a symlink: refusing to mount over it"
   mkdir -p "$w"
-  [ -d "$w" ] && [ ! -L "$w" ] || die "$(unit_name "$u"): $w is not a real directory"
+  [ -d "$w" ] && [ ! -L "$w" ] && [ "$(realpath -e "$w")" = "$w" ] || die "$(unit_name "$u"): $w is not a real directory (a symlink, or under one?)"
   user=$(ramdisk_unit_user "$u"); uid=$(id -u "$user"); gid=$(id -g "$user")
   cmd_ramdisk_mount "$w" "$mb" "$uid" "$gid"
   dropin=$(ramdisk_dropin "$u")

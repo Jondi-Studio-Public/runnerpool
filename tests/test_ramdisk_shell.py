@@ -646,3 +646,22 @@ def test_the_drain_wait_fits_inside_the_admin_workflows_timeout_and_sizes_are_de
     default_wait = int(re.search(r"RAMDISK_WAIT:-(\d+)", LINUXRUNNER.read_text()).group(1))
     assert default_wait < timeout_s
     assert "10#$SLOTS" in workflow  # 08 and 010 are not octal
+
+
+def test_on_completes_with_stopped_runners_whose_start_would_mount_under_the_lock(tmp_path):
+    env, home, units = setup(tmp_path)
+    (tmp_path / "alloff").write_text("")  # stopped, CI not off: ExecStartPre (ramdisk-mount) never takes the lock
+    r = run({**env, "LOCK_WAIT": "1"}, "ramdisk", "on", "1024")
+    assert r.returncode == 0, r.stderr
+    assert len(mounts(tmp_path)) == 2
+    assert run({**env, "LOCK_WAIT": "1"}, "ramdisk-mount", f"{tmp_path}/ci-1/_work", "1024", "0", "0").returncode == 0
+
+
+def test_a_work_folder_under_a_symlinked_parent_is_refused(tmp_path):
+    env, home, units = setup(tmp_path)
+    real = tmp_path / "real"
+    (real / "_work").mkdir(parents=True)
+    (tmp_path / "via").symlink_to(real)
+    r = run(env, "ramdisk-mount", f"{tmp_path}/via/_work", "1024", "0", "0")
+    assert r.returncode != 0 and "symlink" in r.stderr and mounts(tmp_path) == set()
+    assert run(env, "ramdisk-mount", f"{tmp_path}/ci-1/../ci-1", "1024", "0", "0").returncode != 0
