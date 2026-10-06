@@ -585,6 +585,8 @@ def build_activity(repos, want=None, fetch=None, progress=None):
         runs, err = fetch(f"repos/{repo}/actions/runs?status=in_progress&per_page={ACTIVITY_RUNS}", token)
         if err:
             errors[repo] = err
+            if progress:
+                progress(dict(found), dict(errors))
             continue
         for r in (runs or {}).get("workflow_runs", []):
             jobs, err = fetch(f"repos/{repo}/actions/runs/{r.get('id')}/jobs?per_page=100&filter=latest", token)

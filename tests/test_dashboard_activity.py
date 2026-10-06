@@ -126,3 +126,14 @@ def test_a_long_walk_publishes_progress_and_keeps_entries_fresh():
     s.build_activity([("o/a", None), ("o/b", None)], fetch=fake(table), progress=lambda f, e: seen.append(1))
     assert len(seen) == 2
     assert s.ACTIVITY_MAX_AGE >= 300
+
+
+def test_a_failed_repo_fetch_is_published_at_once():
+    s = load()
+    seen = []
+    table = {
+        "repos/o/a/actions/runs?status=in_progress&per_page=%d" % s.ACTIVITY_RUNS: "HTTP 403",
+        "repos/o/b/actions/runs?status=in_progress&per_page=%d" % s.ACTIVITY_RUNS: "HTTP 403",
+    }
+    s.build_activity([("o/a", None), ("o/b", None)], fetch=fake(table), progress=lambda f, e: seen.append(dict(e)))
+    assert seen == [{"o/a": "HTTP 403"}, {"o/a": "HTTP 403", "o/b": "HTTP 403"}]
