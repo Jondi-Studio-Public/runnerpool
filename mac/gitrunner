@@ -1831,7 +1831,10 @@ cmd_bootstrap() {
   cmd_add_runner "$ADMIN_REPO" "$host-admin" "mac-admin,$host${EXTRA_ADMIN_LABELS:+,$EXTRA_ADMIN_LABELS}" \
     - root ${ADMIN_EPHEMERAL:+--ephemeral}
   if [ -n "${CI_REPO:-}" ]; then
-    cmd_add_runner "$CI_REPO" "$host" "$CI_LABELS" - ci
+    # CI_HOST_LABELS (HOST=label[,label];...) adds labels for one Mac, e.g. host-a=gpu.
+    local extra
+    extra=$(tr ';' '\n' <<<"${CI_HOST_LABELS:-}" | sed -n "s/^$host=//p")
+    cmd_add_runner "$CI_REPO" "$host" "$CI_LABELS${extra:+,$extra}" - ci
   fi
   install_power_watch
   log "bootstrap done"

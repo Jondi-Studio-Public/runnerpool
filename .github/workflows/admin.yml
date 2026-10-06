@@ -72,6 +72,7 @@ permissions:
 env:
   CI_REPO: ${{ github.repository_owner }} # org-level: the Macs' CI runners serve every repo in the org
   CI_LABELS: mac-ci-heavy,mac-ci
+  CI_HOST_LABELS: ${{ vars.CI_HOST_LABELS }} # optional repo variable: extra CI labels for one Mac, HOST=label[,label];...  e.g. host-a=gpu
 
 jobs:
   admin:
@@ -112,7 +113,9 @@ jobs:
             info) "$gr" info ;;
             logs) "$gr" logs "${NAME:-$HOST}" 80 ;;
             restart-ci) "$gr" restart "$HOST" ;;
-            reregister-ci) "$gr" add-runner "$CI_REPO" "$HOST" "$CI_LABELS" "${TOKEN:--}" ci ;;
+            reregister-ci)
+              extra=$(tr ';' '\n' <<<"$CI_HOST_LABELS" | sed -n "s/^$HOST=//p")
+              "$gr" add-runner "$CI_REPO" "$HOST" "$CI_LABELS${extra:+,$extra}" "${TOKEN:--}" ci ;;
             remove-ci) "$gr" remove-runner "$HOST" "${TOKEN:--}" ;;
             add-runner)
               if [ -z "$REPO" ] || [ -z "$LABELS" ] || [ -z "$NAME" ]; then echo "add-runner needs repo, labels and name"; exit 1; fi
