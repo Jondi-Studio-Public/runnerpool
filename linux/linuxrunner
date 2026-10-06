@@ -6,6 +6,13 @@
 # no CI offline. `linuxrunner help` lists the commands.
 set -euo pipefail
 
+# WSL runs a `wsl -u root` session in a mount namespace of its own, while systemd and the runner services live in PID 1's: a
+# tmpfs mounted from such a session is invisible to the runners. So a root command from there re-runs itself in PID 1's.
+if [ "$EUID" = 0 ] && [ -z "${LINUXRUNNER_IN_NS:-}" ] && [ -r /proc/1/ns/mnt ] && command -v nsenter >/dev/null 2>&1 &&
+  [ "$(readlink /proc/1/ns/mnt)" != "$(readlink /proc/self/ns/mnt)" ]; then
+  exec env LINUXRUNNER_IN_NS=1 nsenter -t 1 -m -- bash "$0" "$@"
+fi
+
 HOME_DIR=/opt/git-runner
 [ -z "${GIT_RUNNER_HOME:-}" ] || HOME_DIR=$GIT_RUNNER_HOME   # tests point it elsewhere
 RUNNERS=$HOME_DIR/runners            # runners this tool installed (the admin runner, `add-runner`)
@@ -189,8 +196,11 @@ cpu_block() {  # NUM THREADS TOTAL -> a CPU list such as 8-15, or nothing when t
 # go too; anything that is a symlink or a plain file where a folder belongs is replaced. find never follows symlinks and
 # stays on the workspace's filesystem (-xdev).
 #   WIPE_SH takes WORKDIR and `list` (print the first leftover under each level, nothing deleted) or `wipe`.
-# Files a Docker action created as root cannot be deleted by the runner's user: the root loop (`slot-sync`, which the follower
-# service runs every 2 s whether slots are on or not) wipes them while the next job's start hook waits (.hook-waiting).
+# Only the job-completed hook wipes: by the time the job-started hook runs, the runner has already downloaded the job's actions
+# into _actions and made its workspace, so a wipe there would break the job. Files a Docker action created as root cannot be
+# deleted by the runner's user: the completed hook then marks the folder (.hook-waiting) and waits, the runner still busy with
+# this job, while a root systemd path unit (`ramdisk on` installs it) wipes it. A crashed job's files go when the service
+# next starts (ramdisk-mount empties the folder).
 WIPE_SH='w=$1; mode=$2
 run() { if [ "$mode" = list ]; then find "$@" -print -quit; else find "$@" -exec rm -rf -- {} +; fi; }
 bad() { [ -L "$1" ] || { [ -e "$1" ] && [ ! -d "$1" ]; }; }
@@ -221,7 +231,7 @@ wipe_work() {  # WORKDIR
   return 0
 }
 
-# As root (the slot-sync loop), only while a job's start hook is waiting on a workspace its user could not clean.
+# As root (the sweep path unit, or slot-sync), only while a job's completed hook is waiting on a workspace its user could not clean.
 wipe_work_root() {  # WORKDIR
   local w=${1:-}
   work_is_ram "$w" || return 0
@@ -230,33 +240,30 @@ wipe_work_root() {  # WORKDIR
   return 0
 }
 
-# The job-started hook's part: a workspace left dirty by a crash or by files nobody could delete is cleaned before the job
-# starts (it waits for the root sweep for up to RAMDISK_SWEEP_WAIT seconds). Returns 75, which fails the job with the reason in
-# its log, only when it still cannot: a job must never run over the previous job's files.
-ensure_clean_work() {  # WORKDIR
+# The job-completed hook's part. Never fails the job (it has finished): files that are still there after the root sweep's wait
+# are logged, and go when the service next starts.
+wipe_after_job() {  # WORKDIR
   local w=${1:-} deadline
   work_is_ram "$w" || return 0
   wipe_work "$w"
   [ -n "$(work_junk "$w")" ] || return 0
   : > "$w/.hook-waiting" 2>/dev/null || true
-  log "RAM workspace $w holds files this user cannot delete: waiting for the root sweep"
+  log "RAM workspace $w holds files this user cannot delete (root-owned, from a Docker action?): waiting for the root sweep"
   deadline=$(( $(date +%s) + ${RAMDISK_SWEEP_WAIT:-90} ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    sleep "${RAMDISK_SWEEP_POLL:-2}"
-    [ -z "$(work_junk "$w")" ] && { rm -f "$w/.hook-waiting"; return 0; }
+    sleep "${RAMDISK_SWEEP_POLL:-1}"
+    [ -n "$(work_junk "$w")" ] || { rm -f "$w/.hook-waiting"; log "the root sweep cleaned $w"; return 0; }
   done
   rm -f "$w/.hook-waiting"
-  log "error: the previous job left files in $w that could not be deleted (root-owned, from a Docker action?) and no root sweep cleaned them in ${RAMDISK_SWEEP_WAIT:-90}s (is the follower service running?). This job is stopped rather than run over them; the next start of the runner service clears the folder."
-  return 75
+  log "warning: files in $w could not be deleted and no root sweep came in ${RAMDISK_SWEEP_WAIT:-90}s (is runnerpool-ramdisk-sweep.path enabled?); they go when the runner service next starts"
+  return 0
 }
 
 # The hook the runner runs when a job starts (acquire) or ends (release); never fails the job. It runs
 # as the runner's own user, so it only needs to read the files above.
 cmd_hook() {  # acquire|release
   local action=${1:-} name=${GIT_RUNNER_NAME:-${RUNNER_NAME:-}} dir n t i d cpus last=0
-  if [ -n "${GIT_RUNNER_WORK:-}" ]; then   # RAM mode: the workspace is emptied after a job and checked before the next one
-    if [ "$action" = release ]; then wipe_work "$GIT_RUNNER_WORK"; else ensure_clean_work "$GIT_RUNNER_WORK" || return $?; fi
-  fi
+  [ "$action" != release ] || [ -z "${GIT_RUNNER_WORK:-}" ] || wipe_after_job "$GIT_RUNNER_WORK"   # RAM mode
   [ -n "$name" ] || { log "slot hook: no runner name, skipped"; return 0; }
   dir=$(slot_dir); n=$(slots_n); t=$(slots_threads)
   [ -n "$n" ] || return 0
@@ -319,7 +326,7 @@ write_hook_scripts() {
   local hook
   mkdir -p "$HOME_DIR"
   for hook in start:acquire done:release; do
-    printf '#!/bin/sh\n# Job hook (linuxrunner hook %s): waits for a PC job slot / gives it back, and empties the RAM workspace. Fails the job only when it cannot leave a clean one.\n%s/linuxrunner hook %s\nrc=$?\n[ "$rc" -ne 75 ] || exit 1\nexit 0\n' \
+    printf '#!/bin/sh\n# Job hook (linuxrunner hook %s): waits for a PC job slot / gives it back, and empties the RAM workspace. Never fails the job.\n%s/linuxrunner hook %s || true\nexit 0\n' \
       "${hook#*:}" "$HOME_DIR" "${hook#*:}" > "$HOME_DIR/slot-${hook%%:*}.sh"
     chmod 755 "$HOME_DIR/slot-${hook%%:*}.sh"
   done
@@ -451,6 +458,7 @@ cmd_add_runner() {  # REPO|ORG NAME LABELS TOKEN [ci|root]
     u=$(unit_for "$name")
     ramdisk_apply_unit "$u" "$(cat "$RAMDISK_FILE")"
     APPLY_NO_RESTART=1 apply_limits "$u"
+    write_sweep_units
   fi
   ( cd "$dir" && ./svc.sh start >/dev/null )
   log "added $name ($url, labels $labels)"
@@ -541,15 +549,36 @@ ramdisk_sweep() {
   for u in $(ci_units); do
     w=$(ramdisk_unit_path "$u")
     [ -e "$w/.hook-waiting" ] || continue
-    wipe_work_root "$w" && log "$(unit_name "$u"): swept a workspace the runner's user could not clean"
+    wipe_work_root "$w"
+    rm -f "$w/.hook-waiting"   # the path unit fires again while it exists; the hook judges by what is left, not by this
+    log "$(unit_name "$u"): swept a workspace the runner's user could not clean"
   done
 }
 
+# A root path unit that runs `ramdisk-sweep` the moment a completed hook marks its workspace, so the sweep needs neither the
+# follower service nor slots. Rewritten whenever the runners change; removed with `ramdisk off`.
+SWEEP_UNIT=runnerpool-ramdisk-sweep
+write_sweep_units() {
+  local u
+  mkdir -p "$SYSTEMD_DIR"
+  { echo '[Unit]'; echo 'Description=runnerpool: wipe RAM workspaces a job left files in that its user cannot delete'
+    echo '[Path]'; for u in $(ci_units); do echo "PathExists=$(ramdisk_unit_path "$u")/.hook-waiting"; done
+    echo '[Install]'; echo 'WantedBy=multi-user.target'; } > "$SYSTEMD_DIR/$SWEEP_UNIT.path"
+  printf '[Unit]\nDescription=runnerpool: RAM workspace sweep\n[Service]\nType=oneshot\nExecStart=%s/linuxrunner ramdisk-sweep\n' "$HOME_DIR" > "$SYSTEMD_DIR/$SWEEP_UNIT.service"
+  systemctl daemon-reload || true
+  systemctl enable --now "$SWEEP_UNIT.path" >/dev/null 2>&1 || log "could not enable $SWEEP_UNIT.path: root-owned files wait for the next service start"
+}
+remove_sweep_units() {
+  systemctl disable --now "$SWEEP_UNIT.path" >/dev/null 2>&1 || true
+  rm -f "$SYSTEMD_DIR/$SWEEP_UNIT.path" "$SYSTEMD_DIR/$SWEEP_UNIT.service"
+  systemctl daemon-reload || true
+}
+
 # Stops every CI runner that has to change, without cutting a job short: an idle runner is stopped (after a second look, since
-# a job can be assigned just before its Worker shows), a busy one is waited for and stopped the moment its job ends. DRAINED
-# lists what was stopped; MAINT_FILE (PID and time) keeps slot-sync from starting them again. Gives up after RAMDISK_WAIT
-# seconds (default 900, inside the Admin workflow's 20-minute limit): a queue that never lets a runner go idle starves this,
-# and then nothing was changed.
+# a job can be assigned just before its Worker shows), a busy one is watched every 0.1 s and stopped the moment its job ends,
+# before it can pick up the next one. DRAINED lists what was stopped; MAINT_FILE (PID and time) keeps slot-sync from starting
+# them again. Gives up after RAMDISK_WAIT seconds (default 900, inside the Admin workflow's 20-minute limit), and then nothing
+# was changed. The one window left is a job assigned in the instant between that second look and the stop (as with `ci off`).
 ramdisk_drain() {  # UNITS...
   local deadline u left noted=0 pending=$*
   deadline=$(( $(date +%s) + ${RAMDISK_WAIT:-900} ))
@@ -560,7 +589,7 @@ ramdisk_drain() {  # UNITS...
       [ "$(state "$u")" = active ] || continue
       if is_busy "$u"; then left="$left $u"
       else
-        sleep "${RAMDISK_RECHECK:-1}"
+        sleep "${RAMDISK_RECHECK:-0.3}"
         if is_busy "$u"; then left="$left $u"; else systemctl stop "$u"; DRAINED="$DRAINED $u"; fi
       fi
     done
@@ -569,7 +598,7 @@ ramdisk_drain() {  # UNITS...
       die "a runner is still running a job after ${RAMDISK_WAIT:-900}s: nothing was changed (a busy queue can starve this; try again when CI is quieter)"
     fi
     [ "$noted" = 1 ] || { log "waiting for running jobs to finish:$left"; noted=1; }
-    sleep "${RAMDISK_POLL:-0.2}"
+    sleep "${RAMDISK_POLL:-0.1}"
     pending=$left
   done
 }
@@ -577,10 +606,14 @@ ramdisk_drain() {  # UNITS...
 # Runs on every exit of `ramdisk`, success or not (a failed mount, a cancelled workflow): lets slot-sync work again and starts
 # the runners this change stopped, so a failure never strands them. A failed change is safe to run again.
 ramdisk_finish() {
-  local rc=$? u
+  local rc=$? u free=''
   rm -f "$MAINT_FILE"
+  # With slots on, only as many as there are free slots: slot-sync resumes the rest when one frees, as it does any paused runner.
+  [ -z "$(slots_n)" ] || free=$(( $(slots_n) - $(held_slots | wc -l) ))
   for u in $DRAINED; do
-    [ -f "$CI_OFF" ] || [ "$(state "$u")" = active ] || systemctl start "$u" || true
+    if [ -f "$CI_OFF" ] || [ "$(state "$u")" = active ]; then continue; fi
+    if [ -n "$free" ]; then [ "$free" -gt 0 ] || continue; free=$((free - 1)); fi
+    systemctl start "$u" || true
   done
   [ "$rc" = 0 ] || log "ramdisk did not finish: the runners it stopped were started again; running it again completes it"
 }
@@ -613,7 +646,8 @@ cmd_ramdisk() {  # on [MB] | off
     if [ "$mb" = off ]; then ramdisk_remove_unit "$u"; else ramdisk_apply_unit "$u" "$mb"; fi
   done
   # The setting is recorded only once every runner has it, so a failed change leaves the old one in force.
-  if [ "$mb" = off ]; then rm -f "$RAMDISK_FILE"; else mkdir -p "$HOME_DIR"; echo "$mb" > "$RAMDISK_FILE"; write_hook_scripts; fi
+  if [ "$mb" = off ]; then rm -f "$RAMDISK_FILE"; remove_sweep_units
+  else mkdir -p "$HOME_DIR"; echo "$mb" > "$RAMDISK_FILE"; write_hook_scripts; write_sweep_units; fi
   APPLY_NO_RESTART=1   # a runner that was stopped (ci off, slots full) must stay stopped; ramdisk_finish restarts the drained ones
   for u in $(ci_units); do apply_limits "$u"; done
   [ "$count" -gt 0 ] && log "RAM workspace $mb: $count runner(s) changed" || log "RAM workspace already $mb on every runner"
@@ -764,6 +798,7 @@ linuxrunner: manage GitHub Actions runners on a systemd Linux box (adopts existi
   ramdisk on [MB] | off              each CI runner's work folder on a RAM disk (tmpfs, size is a cap; default half a runner's
                                      share of RAM), emptied after every job. Waits for running jobs, never cuts one short
   ramdisk-mount DIR MB UID GID       what each runner's service runs as root before it starts (mount and empty the RAM disk)
+  ramdisk-sweep                      root: wipe workspaces a completed job hook is waiting on (runnerpool-ramdisk-sweep.path)
   limit NAME cores=<N|default> ram=<MB|default>
                                      one runner's own limits (CI_MAX_CORES, CI_MAX_RAM_MB, systemd MemoryMax);
                                      they win over `cores`; default = back to the device-wide setting
@@ -794,6 +829,7 @@ case $cmd in
   limit) locked cmd_limit "$@" ;;
   ramdisk) locked cmd_ramdisk "$@" ;;
   ramdisk-mount) cmd_ramdisk_mount "$@" ;;
+  ramdisk-sweep) need_root; ramdisk_sweep ;;
   add-runner) [ $# -ge 4 ] || die "add-runner REPO|ORG NAME LABELS TOKEN [ci|root]"; locked cmd_add_runner "$@" ;;
   remove-runner) [ $# -ge 1 ] || die "remove-runner NAME [TOKEN|-]"; locked cmd_remove_runner "$@" ;;
   install-docker) cmd_install_docker ;;

@@ -351,17 +351,14 @@ def ram_work(tmp_path, name="ci-1/_work"):
     return work
 
 
-def test_on_wires_the_job_hooks_even_with_slots_off_and_the_started_hook_can_fail_a_job(tmp_path):
+def test_on_wires_the_job_hooks_even_with_slots_off(tmp_path):
     env, home, units = setup(tmp_path)
     run(env, "ramdisk", "on", "1024")
     e = (tmp_path / "ci-1/.env").read_text().split("\n")
     assert f"ACTIONS_RUNNER_HOOK_JOB_COMPLETED={home}/slot-done.sh" in e
     assert f"GIT_RUNNER_WORK={tmp_path}/ci-1/_work" in e
     assert "hook release" in (home / "slot-done.sh").read_text()
-    start = (home / "slot-start.sh").read_text()
-    assert (
-        "hook acquire" in start and "exit 1" in start
-    )  # exit code 75 (a dirty workspace) fails the job, nothing else does
+    assert "hook acquire" in (home / "slot-start.sh").read_text()
     assert not (tmp_path / "admin/.env").exists()
 
 
@@ -439,30 +436,29 @@ def test_the_hooks_only_ever_touch_a_real_ram_mount(tmp_path):
     assert (target / "f").exists()
 
 
-def test_started_hook_cleans_what_a_crashed_runner_left(tmp_path):
+def test_the_started_hook_never_touches_the_workspace(tmp_path):
+    # By the time it runs, the runner has downloaded the job's actions and made its workspace: wiping there broke every job
     env, home, units = setup(tmp_path)
     work = ram_work(tmp_path)
-    (work / "old-repo").mkdir()
-    (work / "old-repo/f").write_text("x")
-    assert hook(env, "acquire", work).returncode == 0
-    assert not (work / "old-repo").exists()
+    for d in ("_actions/actions/checkout/v5", "Priorities/Priorities", "_temp/_runner_file_commands"):
+        (work / d).mkdir(parents=True)
+    (work / "_actions/actions/checkout/v5/action.yml").write_text("name: checkout")
+    r = hook(env, "acquire", work)
+    assert r.returncode == 0, r.stderr
+    assert (work / "_actions/actions/checkout/v5/action.yml").exists() and (work / "Priorities/Priorities").is_dir()
 
 
-def test_files_the_user_cannot_delete_hold_the_job_until_a_root_sweep_clears_them(tmp_path):
+def test_files_the_user_cannot_delete_hold_the_finished_job_until_the_root_sweep_clears_them(tmp_path):
     env, home, units = setup(tmp_path)
     (home / "ramdisk").write_text("1024\n")
     work = ram_work(tmp_path)
     (work / "stuck").mkdir()
     (work / "stuck/f").write_text("x")
-    stuck = {"STUB_RM_FAIL": "1"}
-    # released: the hook cannot delete it, and says so only by leaving it behind (it never fails a finished job)
-    assert hook(env, "release", work, **stuck).returncode == 0 and (work / "stuck").exists()
-    # the next job's start waits for the root sweep rather than failing, then goes ahead
     p = subprocess.Popen(
-        ["bash", str(LINUXRUNNER), "hook", "acquire"],
+        ["bash", str(LINUXRUNNER), "hook", "release"],
         env={
             **env,
-            **stuck,
+            "STUB_RM_FAIL": "1",
             "GIT_RUNNER_NAME": "ci-1",
             "GIT_RUNNER_WORK": str(work),
             "RAMDISK_SWEEP_POLL": "0.2",
@@ -477,21 +473,80 @@ def test_files_the_user_cannot_delete_hold_the_job_until_a_root_sweep_clears_the
         if (work / ".hook-waiting").exists():
             break
         time.sleep(0.1)
-    assert (work / ".hook-waiting").exists() and p.poll() is None
-    assert run(env, "slot-sync").returncode == 0  # root (rm works for it): wipes while the hook waits
+    assert (work / ".hook-waiting").exists() and p.poll() is None  # the runner stays busy: no new job meanwhile
+    assert run(env, "ramdisk-sweep").returncode == 0  # what the path unit runs, as root (rm works for it)
     out, err = p.communicate(timeout=20)
     assert p.returncode == 0, err
+    assert "the root sweep cleaned" in out
     assert not (work / "stuck").exists() and not (work / ".hook-waiting").exists()
 
 
-def test_a_workspace_nobody_can_clean_fails_the_job_with_a_clear_reason(tmp_path):
+def test_without_a_root_sweep_the_finished_job_still_succeeds_and_says_why_files_remain(tmp_path):
     env, home, units = setup(tmp_path)
     work = ram_work(tmp_path)
     (work / "stuck").mkdir()
-    r = hook(env, "acquire", work, STUB_RM_FAIL="1", RAMDISK_SWEEP_POLL="0.1", RAMDISK_SWEEP_WAIT="1")
-    assert r.returncode == 75
-    assert "could not be deleted" in r.stdout + r.stderr and "follower" in r.stdout + r.stderr
+    r = hook(env, "release", work, STUB_RM_FAIL="1", RAMDISK_SWEEP_POLL="0.1", RAMDISK_SWEEP_WAIT="1")
+    assert r.returncode == 0  # a finished job is never failed by its cleanup
+    assert "could not be deleted" in r.stdout + r.stderr and "ramdisk-sweep.path" in r.stdout + r.stderr
     assert (work / "stuck").exists() and not (work / ".hook-waiting").exists()
+
+
+def test_the_hook_scripts_never_fail_a_job(tmp_path):
+    env, home, units = setup(tmp_path)
+    run(env, "ramdisk", "on", "1024")
+    for name in ("slot-start.sh", "slot-done.sh"):
+        text = (home / name).read_text()
+        assert "|| true" in text and text.rstrip().endswith("exit 0") and "exit 1" not in text
+
+
+def test_on_installs_a_root_sweep_path_unit_and_off_removes_it(tmp_path):
+    env, home, units = setup(tmp_path)
+    run(env, "ramdisk", "on", "1024")
+    path = (units / "runnerpool-ramdisk-sweep.path").read_text()
+    assert (
+        f"PathExists={tmp_path}/ci-1/_work/.hook-waiting" in path
+        and f"PathExists={tmp_path}/ci-2/_work/.hook-waiting" in path
+    )
+    assert "admin" not in path
+    assert f"ExecStart={home}/linuxrunner ramdisk-sweep" in (units / "runnerpool-ramdisk-sweep.service").read_text()
+    assert "enable --now runnerpool-ramdisk-sweep.path" in syslog(tmp_path)
+    run(env, "ramdisk", "off")
+    assert (
+        not (units / "runnerpool-ramdisk-sweep.path").exists()
+        and not (units / "runnerpool-ramdisk-sweep.service").exists()
+    )
+    assert "disable --now runnerpool-ramdisk-sweep.path" in syslog(tmp_path)
+
+
+def test_the_sweep_removes_its_marker_so_the_path_unit_does_not_fire_again(tmp_path):
+    env, home, units = setup(tmp_path)
+    (home / "ramdisk").write_text("1024\n")
+    work = ram_work(tmp_path)
+    (work / "leftover").mkdir()
+    (work / ".hook-waiting").write_text("")
+    assert run(env, "ramdisk-sweep").returncode == 0
+    assert not (work / "leftover").exists() and not (work / ".hook-waiting").exists()
+
+
+def test_after_a_change_drained_runners_only_restart_into_free_slots(tmp_path):
+    env, home, units = setup(tmp_path)
+    run(env, "slots", "1", "2")
+    held = home / "slots.d/slot-1"
+    held.mkdir(parents=True)
+    (held / "owner").write_text("runner=win-1\nside=win\ntime=1\n")  # the one slot is taken by a Windows job
+    (tmp_path / "systemctl.log").write_text("")
+    assert run(env, "ramdisk", "on", "1024").returncode == 0
+    log = syslog(tmp_path)
+    assert (
+        f"stop {UNIT1}" in log and f"start {UNIT1}" not in log and f"start {UNIT2}" not in log
+    )  # slot-sync resumes them later
+
+
+def test_root_commands_from_a_wsl_session_rerun_in_the_services_mount_namespace():
+    text = LINUXRUNNER.read_text()
+    guard = text.split("\n# ---")[0]
+    assert "nsenter -t 1 -m" in guard and "/proc/1/ns/mnt" in guard and '"$EUID" = 0' in guard
+    assert "LINUXRUNNER_IN_NS" in guard  # never loops
 
 
 def test_the_root_sweep_leaves_alone_a_workspace_nobody_is_waiting_on(tmp_path):
