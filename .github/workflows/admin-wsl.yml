@@ -50,7 +50,7 @@ on:
         description: limit action only, MB or default
         required: false
       slots:
-        description: "slots action: N, N:THREADS (CPU threads per job, default 8) or off, N CI jobs at once. ramdisk-on: GB per runner for the RAM workspace (a cap, default 4)"
+        description: "slots action: N, N:THREADS (CPU threads per job, default 8) or off, N CI jobs at once. ramdisk-on: GB per runner for the RAM workspace (a cap; empty = half a runner's share of RAM)"
         required: false
       request:
         description: Id the control PC uses to find this run
@@ -112,8 +112,9 @@ jobs:
               th=''; case "$SLOTS" in *:*) th=${SLOTS#*:} ;; esac
               "$lr" slots "${SLOTS%%:*}" ${th:+"$th"} ;;
             ramdisk-on)
-              case "${SLOTS:-4}" in *[!0-9]*|'') echo 'size is a whole number of GB'; exit 1 ;; esac
-              "$lr" ramdisk on "$(( ${SLOTS:-4} * 1024 ))" ;;
+              # no size: linuxrunner picks half of one runner's share of the distro's RAM
+              case "${SLOTS:-}" in *[!0-9]*) echo 'size is a whole number of GB'; exit 1 ;; esac
+              "$lr" ramdisk on ${SLOTS:+"$(( SLOTS * 1024 ))"} ;;
             ramdisk-off) "$lr" ramdisk off ;;
             install-postgres)
               # The Postgres 16 binaries an integration job starts its own cluster from;

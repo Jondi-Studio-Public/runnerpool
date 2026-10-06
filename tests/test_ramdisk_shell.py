@@ -330,3 +330,40 @@ def test_the_default_wait_fits_inside_the_admin_workflows_timeout():
     text = LINUXRUNNER.read_text()
     assert "RAMDISK_WAIT:-900" in text and "RAMDISK_WAIT:-1800" not in text
     assert "timeout-minutes: 20" in (ROOT / ".github/workflows/admin-wsl.yml").read_text()
+
+
+def sent_to_workflow(tmp_path, *args):
+    """Runs `runner ramdisk ...` against a fake gh and returns the `-f key=value` fields it dispatched."""
+    bindir = tmp_path / "gh-bin"
+    bindir.mkdir(exist_ok=True)
+    log = tmp_path / "gh.log"
+    log.write_text("")
+    (bindir / "gh").write_text(
+        '#!/bin/sh\necho "$*" >> "$GH_LOG"\ncase "$1 $2" in\n  "run list") echo 42 ;;\n  "run view") echo completed ;;\nesac\nexit 0\n'
+    )
+    (bindir / "gh").chmod(0o755)
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "GH_LOG": str(log), "GITRUNNER_ORG": "example-org"}
+    r = subprocess.run(
+        [str(ROOT / "runner"), "ramdisk", *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=30,
+    )
+    assert r.returncode == 0, r.stderr
+    dispatch = next(ln for ln in log.read_text().splitlines() if ln.startswith("workflow run"))
+    return dispatch
+
+
+def test_wsl_ramdisk_without_a_size_leaves_it_to_linuxrunner(tmp_path):
+    dispatch = sent_to_workflow(tmp_path, "wsl-1", "on")
+    assert "admin-wsl.yml" in dispatch and "action=ramdisk-on" in dispatch
+    assert (
+        "slots=" not in dispatch and "size=" not in dispatch
+    )  # no fixed per-runner size that could exhaust the distro's RAM
+
+
+def test_wsl_ramdisk_with_a_size_sends_it_and_a_mac_keeps_its_four_gb_default(tmp_path):
+    assert "slots=2" in sent_to_workflow(tmp_path, "wsl-1", "on", "2")
+    assert "size=4" in sent_to_workflow(tmp_path, "air-1", "on")

@@ -350,7 +350,7 @@ runner: manage the Mac and Windows CI runners from this PC
   runner drop HOST OWNER/REPO NAME    unregister a runner added with `add`
   runner update HOST                  install this repo's macrunner / winrunner / linuxrunner on HOST
   runner battery HOST pause|run       pause CI on battery (default) or run it anyway
-  runner ramdisk HOST on [GB]|off     CI workspace on a RAM disk (default 4 GB; 16 GB Macs, or a PC's WSL runners: wsl-1)
+  runner ramdisk HOST on [GB]|off     CI workspace on a RAM disk (default 4 GB on a Mac, half a runner's share of RAM on WSL: wsl-1; 16 GB Macs)
   runner linux-vm HOST on [--cpus N] [--memory GB] [--disk GB] [--no-admin]
                                       an ARM64 Linux VM on a Mac with one linux-ci runner (air-N-vm-1) that takes turns with the Mac's own; run `runner update HOST` first
   runner linux-vm HOST off|status     stop the VM (CI finishes its job first) / show it
@@ -402,7 +402,7 @@ case $cmd in
     is_win "$1" && die "ramdisk is for Macs and the PC's WSL runners (wsl-N); $1 is a native Windows runner"
     [[ "${3:-4}" =~ ^[0-9]+$ ]] || die "GB is a whole number"
     case $2 in
-      on) if is_wsl "$1"; then admin "$1" ramdisk-on "slots=${3:-4}"; else admin "$1" ramdisk-on "size=${3:-4}"; fi ;;   # the Linux workflow is at GitHub's 10-input limit: it reuses `slots`
+      on) if is_wsl "$1"; then admin "$1" ramdisk-on ${3:+"slots=$3"}; else admin "$1" ramdisk-on "size=${3:-4}"; fi ;;   # the Linux workflow is at GitHub's 10-input limit: it reuses `slots`
       off) admin "$1" ramdisk-off ;;
       *) die "ramdisk HOST on [GB]|off" ;;
     esac ;;
