@@ -809,3 +809,19 @@ def test_a_failed_off_puts_the_sweep_units_back(tmp_path):
     (tmp_path / "um").write_text("")
     assert run({**env, "STUB_UMOUNT_FAIL": str(tmp_path / "um")}, "ramdisk", "off").returncode != 0
     assert (home / "ramdisk").exists() and (units / "runnerpool-ramdisk-sweep.path").exists()
+
+
+def test_a_docker_labelled_runner_joins_the_docker_group_before_its_service_starts(tmp_path):
+    env, home, units = setup(tmp_path)
+    env = add_runner_stubs(tmp_path, env, home)
+    bindir = tmp_path / "bin"
+    (bindir / "getent").write_text('#!/bin/sh\n[ "$2" = docker ]\n')
+    (bindir / "usermod").write_text('#!/bin/sh\necho "usermod $*" >> "$STUB_MOUNTLOG"\n')
+    (bindir / "docker").write_text("#!/bin/sh\nexit 0\n")
+    for name in ("getent", "usermod", "docker"):
+        (bindir / name).chmod(0o755)
+    r = run(env, "add-runner", "o/r", "new-1", "linux-ci,docker", "TOKEN")
+    assert r.returncode == 0, r.stderr
+    log = (tmp_path / "mount.log").read_text().splitlines()
+    assert "usermod -aG docker runner" in log
+    assert log.index("usermod -aG docker runner") < log.index("svc start")
