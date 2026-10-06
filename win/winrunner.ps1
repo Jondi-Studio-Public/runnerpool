@@ -39,6 +39,7 @@ $HealEvery = 600       # seconds between checks that GitHub still has our runner
 $PushEvery = 30        # seconds between health pushes to the dashboard
 $PushTimeout = 5       # seconds a push may take: it runs inside the power loop, which must not stall
 $SlotPoll = 2          # seconds between slot checks (clear dead slots, pause or resume idle runners)
+$StartRetry = 600      # seconds before trying again to start a CI service that failed to start
 
 function Log([string]$m) { Write-Host ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m) }
 function Die([string]$m) { throw "error: $m" }
@@ -346,6 +347,10 @@ function Initialize-CiUser {  # -> the password
     $sec = ConvertTo-SecureString $pw -AsPlainText -Force
     if (Get-LocalUser -Name $CiUser -ErrorAction SilentlyContinue) {
         Set-LocalUser -Name $CiUser -Password $sec
+        # Failed service logons (a stale password) can trip Windows' account lockout, and a locked
+        # account rejects even the new password, so config.cmd reports invalid credentials.
+        $u = [ADSI]"WinNT://./$CiUser,user"
+        if ($u.IsAccountLocked) { Log "unlocking $CiUser"; $u.IsAccountLocked = $false; $u.SetInfo() }
     } else {
         Log "creating service user $CiUser"
         New-LocalUser -Name $CiUser -Password $sec -PasswordNeverExpires -UserMayNotChangePassword `
@@ -857,7 +862,9 @@ function Clear-StaleSlots([string[]]$busy) {
 }
 
 # Stops idle CI runners that may not run (paused, or every slot held); starts stopped ones that may.
-# A runner with a job is never stopped.
+# A runner with a job is never stopped. A service that fails to start is left for $StartRetry seconds:
+# retrying every poll is a failed logon each time, and enough of those lock $CiUser out.
+$script:StartFailedAt = @{}
 function Sync-RunState([string[]]$busy) {
     $reason = Get-CiPauseReason
     $hold = Test-SlotHold
@@ -865,9 +872,16 @@ function Sync-RunState([string[]]$busy) {
         if (-not (Test-Ci $n)) { continue }
         $s = Get-Service-For $n
         if (-not $s) { continue }
+        if ($s.Status -eq 'Running') { $script:StartFailedAt.Remove($n) }  # started by hand (winrunner restart): forget the failure
         $isBusy = $busy -contains $n
         if (-not $reason -and (-not $hold -or $isBusy)) {
-            if ($s.Status -ne 'Running') { Log "starting $n"; Start-Runner $n }
+            if ($s.Status -ne 'Running') {
+                $failed = $script:StartFailedAt[$n]
+                if ($failed -and ((Get-Date) - $failed).TotalSeconds -lt $StartRetry) { continue }
+                Log "starting $n"
+                try { Start-Runner $n; $script:StartFailedAt.Remove($n) }
+                catch { $script:StartFailedAt[$n] = Get-Date; Log "could not start $n (next try in $StartRetry s): $($_.Exception.Message)" }
+            }
         } elseif ($s.Status -eq 'Running' -and -not $isBusy) {
             Log "pausing $n ($(if ($reason) { $reason } else { 'every job slot is taken' }))"; Stop-Runner $n
         }

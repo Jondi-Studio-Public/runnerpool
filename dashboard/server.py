@@ -80,7 +80,7 @@ RUNNERS_EVERY = 10
 IDLE_AFTER = 300
 # Which job each busy runner is on: read only while some runner is busy, every ACTIVITY_EVERY s, one gh
 # call at a time. An entry older than ACTIVITY_MAX_AGE s is no longer shown.
-ACTIVITY_EVERY = 15
+ACTIVITY_EVERY = 30
 ACTIVITY_MAX_AGE = 300  # a walk over every repo can take minutes; the 90 s it had expired mid-walk
 ACTIVITY_RUNS = 30  # in-progress runs read per repo
 HERE = Path(__file__).resolve().parent
@@ -167,10 +167,21 @@ def gh_env(env=None):
     return dict(os.environ if env is None else env, GH_TOKEN=tok)
 
 
+# GitHub's hourly quota is shared by every user of one App installation (this dashboard, the watchdog,
+# the runner CLI). After a "rate limit" error the dashboard sends no gh calls for RATE_LIMIT_BACKOFF s,
+# so it neither hammers a spent quota nor delays its reset.
+RATE_LIMIT_BACKOFF = 300
+_gh_blocked_until = 0.0
+
+
 def run(cmd, timeout, env=None):
     """-> (exit code, stdout, stderr); 124 on timeout, 127 when the program is missing.
     A `gh` call with no env of its own gets the GitHub App's token when one is configured."""
-    if env is None and cmd and cmd[0] == "gh":
+    global _gh_blocked_until
+    is_gh = bool(cmd) and cmd[0] == "gh"
+    if is_gh and time.time() < _gh_blocked_until:
+        return 1, "", "gh: API rate limit exceeded (the dashboard is backing off)"
+    if env is None and is_gh:
         env = gh_env()
     try:
         p = subprocess.run(
@@ -183,6 +194,8 @@ def run(cmd, timeout, env=None):
             stdin=subprocess.DEVNULL,
             env=env,
         )
+        if is_gh and p.returncode != 0 and "rate limit" in (p.stderr + p.stdout).lower():
+            _gh_blocked_until = time.time() + RATE_LIMIT_BACKOFF
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 124, "", f"timed out after {timeout}s"
@@ -315,7 +328,7 @@ def parse_ts(v):
         return None
 
 
-RUNS_TTL = 60
+RUNS_TTL = 120
 RECENT = 30
 GOOD = {"success"}
 BAD = {"failure", "timed_out", "startup_failure"}
@@ -445,7 +458,7 @@ def summarize_jobs(jobs):
     return {"at": now(), "runners": runners, "compare": compare[:25], "jobs": rows[:JOB_HISTORY]}
 
 
-CI_TTL = 120
+CI_TTL = 300
 CI_PRS = 10  # open PRs per repo whose check is read (newest first)
 
 

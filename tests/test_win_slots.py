@@ -121,7 +121,7 @@ def test_cpu_masks_are_distinct_blocks_and_wrap():
     assert "255 65280 16711680 983055 " in r.stdout, r.stdout + r.stderr
 
 
-def controller(tmp_path, held, busy, running, hold_slots=2, reason="$null"):
+def controller(tmp_path, held, busy, running, hold_slots=2, reason="$null", extra="", tail=""):
     """Slots `held` ({num: (runner, side, age)}), runners `busy`, services `running`; prints what it did."""
     slots = tmp_path / "slots"
     slots.mkdir(exist_ok=True)
@@ -144,9 +144,12 @@ function Get-CiPauseReason {{ {reason} }}
 function Get-Service-For($n) {{ [pscustomobject]@{{ Status = $(if ($script:running -contains $n) {{ 'Running' }} else {{ 'Stopped' }}) }} }}
 function Start-Runner($n) {{ Write-Output "START $n" }}
 function Stop-Runner($n) {{ Write-Output "STOP $n" }}
+$StartRetry = 600; $script:StartFailedAt = @{{}}
+{extra}
 $busy = @({",".join(f"'{n}'" for n in busy)})
 Clear-StaleSlots $busy
 Sync-RunState $busy
+{tail}
 Write-Output ("HELD " + (@(Get-HeldSlots).Count))
 """
     )
@@ -184,6 +187,35 @@ def test_free_slot_resumes_a_stopped_runner(tmp_path):
 def test_battery_or_ci_off_wins_over_a_free_slot(tmp_path):
     out = controller(tmp_path, {}, busy=[], running=[], reason="'battery'")
     assert "START" not in out
+
+
+def test_a_service_that_fails_to_start_is_left_alone_until_the_retry_wait_passes(tmp_path):
+    out = controller(
+        tmp_path,
+        {},
+        busy=[],
+        running=[],
+        extra='function Start-Runner($n) { Write-Output "START $n"; throw "logon failure" }',
+        tail="Sync-RunState $busy; $script:StartFailedAt.Clear(); Sync-RunState $busy",
+    )
+    lines = out.splitlines()
+    # first pass tries both runners and survives the failures; the second skips them; after the wait it retries
+    assert lines.count("START win-1") == 2 and lines.count("START win-1-ci-2") == 2, out
+    assert sum("could not start win-1 " in line for line in lines) == 2, out
+
+
+def test_a_service_started_by_hand_forgets_its_failure_so_a_later_stop_is_recovered(tmp_path):
+    out = controller(
+        tmp_path,
+        {},
+        busy=[],
+        running=[],
+        extra='function Start-Runner($n) { Write-Output "START $n"; throw "logon failure" }',
+        # the operator starts both services (`winrunner restart`), a poll sees them running, then they stop again
+        tail="$script:running = @('win-1','win-1-ci-2'); Sync-RunState $busy; $script:running = @(); Sync-RunState $busy",
+    )
+    lines = out.splitlines()
+    assert lines.count("START win-1") == 2 and lines.count("START win-1-ci-2") == 2, out
 
 
 # --- something outside the runners holding a slot as a lease (slots-hold / slots-release) -----------------

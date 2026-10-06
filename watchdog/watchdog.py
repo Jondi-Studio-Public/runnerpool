@@ -80,7 +80,7 @@ class Config:
         g = e.get
         self.org = g("WATCHDOG_ORG", "example-org")
         self.repos = g("WATCHDOG_REPOS", "").split()  # empty = every unarchived repo in the org
-        self.poll_seconds = int(g("WATCHDOG_POLL_SECONDS", "60"))
+        self.poll_seconds = int(g("WATCHDOG_POLL_SECONDS", "120"))
         self.pool_offline_minutes = int(g("WATCHDOG_POOL_OFFLINE_MINUTES", "30"))
         self.queue_minutes = int(g("WATCHDOG_QUEUE_MINUTES", "15"))
         self.stale_days = float(g("WATCHDOG_STALE_DAYS", "3"))
