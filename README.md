@@ -222,7 +222,7 @@ suite between machines. Details: [docs/architecture.md](docs/architecture.md), [
 
 `./runner help` lists everything: `list`, `link`, `status`, `doctor`, `logs`, `restart`, `reregister`,
 `remove`, `add`/`drop` (a runner for another repo), `update` (push a new on-device tool), `battery pause|run`,
-`cores N|all`, `slots HOST N|off`, `limit HOST RUNNER cores=N|default ram=MB|default`, `ramdisk HOST on|off` (a Mac, or the PC's WSL runners),
+`cores N|all`, `slots HOST N|off`, `limit HOST RUNNER cores=N|default ram=MB|default`, `ramdisk HOST on [GB]|off` (a Mac, or the PC's WSL runners),
 `postgres`, `tailscale`, `rotate-token`, `set-app`, `ssh`.
 
 Rotating keys: for the App key, generate a new one, update your secret manager and `CI_APP_PRIVATE_KEY`, run

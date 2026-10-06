@@ -113,8 +113,8 @@ jobs:
               "$lr" slots "${SLOTS%%:*}" ${th:+"$th"} ;;
             ramdisk-on)
               # no size: linuxrunner picks half of one runner's share of the distro's RAM
-              case "${SLOTS:-}" in *[!0-9]*) echo 'size is a whole number of GB'; exit 1 ;; esac
-              "$lr" ramdisk on ${SLOTS:+"$(( SLOTS * 1024 ))"} ;;
+              case "${SLOTS:-}" in *[!0-9]*|?????*) echo 'size is a whole number of GB (up to 4 digits)'; exit 1 ;; esac
+              "$lr" ramdisk on ${SLOTS:+"$(( 10#$SLOTS * 1024 ))"} ;;
             ramdisk-off) "$lr" ramdisk off ;;
             install-postgres)
               # The Postgres 16 binaries an integration job starts its own cluster from;
