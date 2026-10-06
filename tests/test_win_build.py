@@ -134,3 +134,31 @@ def test_the_org_must_be_configured(tmp_path):
         text=True,
     )
     assert r.returncode != 0 and "GITRUNNER_ORG" in r.stderr
+
+
+def test_scripts_reach_the_distro_as_files_never_on_the_command_line():
+    # Windows caps a command line at 32767 characters; linuxrunner in base64 is far past that
+    # ("The filename or extension is too long"), so the installer copies it through /mnt/c instead.
+    ps = (ROOT / "win" / "winrunner.ps1").read_text()
+    assert "ToBase64String" not in ps.split("function Install-WslSet")[1].split("\nfunction ")[0]
+    assert "install -m 755 '$lrWsl' /tmp/linuxrunner" in ps
+    assert "install -m 755 '$pWsl' /tmp/linux-provision.sh" in ps
+    assert len(base64.b64encode((ROOT / "linux" / "linuxrunner").read_bytes())) > 32767  # why it matters
+
+
+def test_windows_paths_map_to_where_the_distro_sees_them():
+    import shutil
+
+    import pytest
+
+    if not shutil.which("pwsh"):
+        pytest.skip("pwsh not installed")
+    ps = (ROOT / "win" / "winrunner.ps1").read_text()
+    fn = re.search(r"function ConvertTo-WslPath.*?\n}\n", ps, re.S).group(0)
+    out = subprocess.run(
+        ["pwsh", "-NoProfile", "-Command", fn + "ConvertTo-WslPath 'C:\ProgramData\win-runners\linuxrunner'"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert out == "/mnt/c/ProgramData/win-runners/linuxrunner"
