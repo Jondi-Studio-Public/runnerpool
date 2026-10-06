@@ -3,8 +3,11 @@
 import base64
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -138,27 +141,25 @@ def test_the_org_must_be_configured(tmp_path):
 
 def test_scripts_reach_the_distro_as_files_never_on_the_command_line():
     # Windows caps a command line at 32767 characters; linuxrunner in base64 is far past that
-    # ("The filename or extension is too long"), so the installer copies it through /mnt/c instead.
+    # ("The filename or extension is too long"), so the installer copies it through the distro's view of the drive.
     ps = (ROOT / "win" / "winrunner.ps1").read_text()
-    assert "ToBase64String" not in ps.split("function Install-WslSet")[1].split("\nfunction ")[0]
-    assert "install -m 755 '$lrWsl' /tmp/linuxrunner" in ps
-    assert "install -m 755 '$pWsl' /tmp/linux-provision.sh" in ps
+    body = ps.split("function Install-WslSet")[1].split("\nfunction ")[0]
+    assert "ToBase64String" not in body and "base64 -d" not in body
+    assert "Copy-ToWsl $distro (Join-Path $HomeDir 'linuxrunner') '/tmp/linuxrunner'" in body
+    assert "Copy-ToWsl $distro (Join-Path $HomeDir 'linux-provision.sh') '/tmp/linux-provision.sh'" in body
+    assert "wslpath -u" in ps  # the distro maps the path itself: a custom automount root works too
     assert len(base64.b64encode((ROOT / "linux" / "linuxrunner").read_bytes())) > 32767  # why it matters
 
 
-def test_windows_paths_map_to_where_the_distro_sees_them():
-    import shutil
-
-    import pytest
-
+def test_copy_to_wsl_builds_a_quoted_wslpath_copy():
     if not shutil.which("pwsh"):
         pytest.skip("pwsh not installed")
     ps = (ROOT / "win" / "winrunner.ps1").read_text()
-    fn = re.search(r"function ConvertTo-WslPath.*?\n}\n", ps, re.S).group(0)
+    fn = re.search(r"function Copy-ToWsl.*?\n}\n", ps, re.S).group(0)
+    stub = 'function Invoke-WslIn($d, $c) { Write-Output "$d|$c" }\n'
+    src = r"C:\ProgramData\win-runners\linuxrunner"
+    call = f"Copy-ToWsl gh-runner '{src}' '/tmp/linuxrunner'"
     out = subprocess.run(
-        ["pwsh", "-NoProfile", "-Command", fn + "ConvertTo-WslPath 'C:\ProgramData\win-runners\linuxrunner'"],
-        capture_output=True,
-        text=True,
-        check=True,
+        ["pwsh", "-NoProfile", "-Command", stub + fn + call], capture_output=True, text=True, check=True
     ).stdout.strip()
-    assert out == "/mnt/c/ProgramData/win-runners/linuxrunner"
+    assert out == f"gh-runner|install -m 755 \"$(wslpath -u '{src}')\" '/tmp/linuxrunner'"

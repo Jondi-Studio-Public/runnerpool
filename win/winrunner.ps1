@@ -1353,9 +1353,11 @@ function Invoke-WslIn([string]$distro, [string]$cmd) {  # run a bash command in 
     if ($LASTEXITCODE) { throw "wsl command failed (exit $LASTEXITCODE): $cmd" }
 }
 
-# C:\ProgramData\x -> /mnt/c/ProgramData/x, the path the distro sees a Windows file at.
-function ConvertTo-WslPath([string]$path) {
-    '/mnt/' + $path.Substring(0, 1).ToLower() + '/' + ($path.Substring(3) -replace '\\', '/')
+# Copies a Windows file into DISTRO as an executable, through the distro's own view of the drive (wslpath, so a custom
+# automount root works too), never on the command line: Windows caps a command line at 32767 characters, and linuxrunner
+# in base64 is well past that ("The filename or extension is too long"). Throws if the copy fails.
+function Copy-ToWsl([string]$distro, [string]$file, [string]$dest) {
+    Invoke-WslIn $distro ("install -m 755 `"`$(wslpath -u '" + $file + "')`" '" + $dest + "'")
 }
 
 function Test-WslDistro([string]$distro) {
@@ -1395,18 +1397,17 @@ function Install-WslSet($e) {
         & wsl.exe --terminate $distro   # this one distro only, never --shutdown
         Start-Sleep -Seconds 3
     }
-    # The scripts reach the distro as files through /mnt/c, never on the command line: Windows caps a command line at 32767
-    # characters, and linuxrunner in base64 is well past that ("The filename or extension is too long").
-    $lrWsl = ConvertTo-WslPath (Join-Path $HomeDir 'linuxrunner')
     # A new distro is provisioned (git, python, uv) before any runner may take a job; an adopted one
     # already runs jobs, so it is only marked. If provisioning fails the runners stay off.
     $provisioned = $true
     if ($fresh) {
-        $pWsl = ConvertTo-WslPath (Join-Path $HomeDir 'linux-provision.sh')
-        try { Invoke-WslIn $distro "install -m 755 '$pWsl' /tmp/linux-provision.sh && bash /tmp/linux-provision.sh" }
+        try {
+            Copy-ToWsl $distro (Join-Path $HomeDir 'linux-provision.sh') '/tmp/linux-provision.sh'
+            Invoke-WslIn $distro 'bash /tmp/linux-provision.sh'
+        }
         catch { $provisioned = $false; Log "provisioning the Linux box failed ($($_.Exception.Message)): its runners stay off until it works" }
     } else { Invoke-WslIn $distro 'mkdir -p /opt/git-runner && touch /opt/git-runner/provisioned' }
-    Invoke-WslIn $distro "install -m 755 '$lrWsl' /tmp/linuxrunner"
+    Copy-ToWsl $distro (Join-Path $HomeDir 'linuxrunner') '/tmp/linuxrunner'
     # Runners labelled docker need Docker Engine (x86-64 only; the Mac VMs have none). On a new distro a failure keeps
     # the runners off like provisioning does; an adopted distro already runs jobs, so it only logs.
     if ($e.WSL_SET -match '(^|[:,;])docker([,;]|$)') {
