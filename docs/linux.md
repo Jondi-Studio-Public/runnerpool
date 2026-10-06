@@ -43,17 +43,20 @@ folder (`.runner`'s `workFolder`, normally `_work`), so checkouts and test temp 
   CI runners); `on` warns when the caps add up to more than the distro has. The distro's RAM ceiling is whatever WSL gives it
   (`.wslconfig`, which this tool never touches), so size to `free -m` inside the distro. With slots on, tmpfs pages count against
   the runner service's `MemoryMax`. The mount is `nosuid,nodev`, so jobs that `mknod` (debootstrap) fail there.
-- **Emptied after every job, checked before the next.** The job-completed hook deletes everything under the work folder,
-  toolchain and action caches included (`_tool`, `_actions`), and empties the runner's own `_temp` folders; the job-started hook
-  cleans anything a crash left. Files a Docker action created as root are removed by the root `slot-sync` loop (the follower
-  service runs it every 2 s, slots on or off) while the started hook waits; a job fails, with the reason in its log, only if that
-  does not happen within 90 s (a Linux box without the follower service). Toolchains are therefore downloaded again by each job.
-- **No fstab entry.** Each runner's unit runs `linuxrunner ramdisk-mount` as root (`ExecStartPre=+`) on every start, which mounts
+- **Emptied after every job.** The job-completed hook deletes everything under the work folder, toolchain and action caches
+  included (`_tool`, `_actions`), and empties the runner's own `_temp` folders. (Only that hook wipes: when the job-started hook
+  runs, the runner has already downloaded the job's actions into the folder.) Files a Docker action created as root are removed
+  by a root systemd path unit, `runnerpool-ramdisk-sweep.path`, which `ramdisk on` installs; the completed hook waits for it (up to
+  90 s) while the runner is still busy, so no job starts in between. A finished job is never failed by its cleanup: anything still
+  left is logged and goes at the next service start, as do a crashed job's files. Toolchains are downloaded again by each job.
+- **No fstab entry.** Commands run from a `wsl -u root` session re-run themselves in the services' mount namespace (WSL gives such
+  a session its own), so the runners see the mounts. Each runner's unit runs `linuxrunner ramdisk-mount` as root (`ExecStartPre=+`) on every start, which mounts
   the tmpfs and empties it, so a boot or a crash also starts clean. A work folder that is a symlink, sits under one or has `..` in its path is refused, so a job cannot
   redirect the mount. `add-runner` mounts a new runner before its service starts; `remove-runner` unmounts it. A CI runner
-  adopted some other way after `on` is picked up by the next `ramdisk on`, `slots` or `limit`.
-- It never interrupts a job: idle runners are stopped at once (after a second look), busy ones are waited for (up to 15 minutes,
-  inside the Admin workflow's 20-minute limit; a queue that never lets a runner go idle starves it, and then nothing is changed).
+  adopted some other way after `on` is picked up by the next `ramdisk on` (until then it has no RAM disk and no sweep).
+- It never interrupts a job: idle runners are stopped at once (after a second look), busy ones are watched every 0.1 s and stopped the moment
+  their job ends (up to 15 minutes, inside the Admin workflow's 20-minute limit, then nothing is changed). With slots on, the runners
+  it stopped restart only into free slots.
   Runners that were stopped (CI off) stay stopped. A failed or cancelled change restarts what it stopped and is safe to run again;
   the setting is recorded only once every runner has it. Commands that change runners hold a lock, so two never run at once.
 - Not covered: Docker images and build caches (they live in Docker's own storage, not the work folder) and native Windows runners
