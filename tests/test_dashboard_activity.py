@@ -114,3 +114,26 @@ def test_nothing_is_fetched_while_no_runner_is_busy():
     s.build_activity = lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetched"))
     st.get_activity()
     assert st.activity == {}
+
+
+def test_a_long_walk_publishes_progress_and_keeps_entries_fresh():
+    s = load()
+    seen = []
+    table = {
+        "repos/o/a/actions/runs?status=in_progress&per_page=%d" % s.ACTIVITY_RUNS: {"workflow_runs": []},
+        "repos/o/b/actions/runs?status=in_progress&per_page=%d" % s.ACTIVITY_RUNS: {"workflow_runs": []},
+    }
+    s.build_activity([("o/a", None), ("o/b", None)], fetch=fake(table), progress=lambda f, e: seen.append(1))
+    assert len(seen) == 2
+    assert s.ACTIVITY_MAX_AGE >= 300
+
+
+def test_a_failed_repo_fetch_is_published_at_once():
+    s = load()
+    seen = []
+    table = {
+        "repos/o/a/actions/runs?status=in_progress&per_page=%d" % s.ACTIVITY_RUNS: "HTTP 403",
+        "repos/o/b/actions/runs?status=in_progress&per_page=%d" % s.ACTIVITY_RUNS: "HTTP 403",
+    }
+    s.build_activity([("o/a", None), ("o/b", None)], fetch=fake(table), progress=lambda f, e: seen.append(dict(e)))
+    assert seen == [{"o/a": "HTTP 403"}, {"o/a": "HTTP 403", "o/b": "HTTP 403"}]

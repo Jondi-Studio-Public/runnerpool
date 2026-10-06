@@ -976,7 +976,10 @@ th[aria-sort=ascending] button.sort i, th[aria-sort=descending] button.sort i { 
   function activityLine(r) {
     if (r.status !== "online" || !r.busy) return null;
     var a = activityOf(r);
-    if (!a) return h("div", { class: "act unk", text: "↳ busy (job details unavailable)" });
+    if (!a) {
+      var errs = S.data && S.data.activity_errors || {}, ks = Object.keys(errs);
+      return h("div", { class: "act unk", text: "↳ busy (" + (ks.length ? "job details unavailable: " + ks[0] + ": " + errs[ks[0]] : "looking up the job…") + ")" });
+    }
     var label = a.repo + " · " + (a.workflow ? a.workflow + " / " : "") + (a.job || "running"), u = safeUrl(a.job_url) || safeUrl(a.run_url);
     var el = secsSince(a.started_at);
     return h("div", { class: "act", role: "status" }, "↳ ",
