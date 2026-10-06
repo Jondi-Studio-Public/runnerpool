@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -108,12 +109,50 @@ def test_on_twice_is_idempotent_and_resizes(tmp_path):
     assert "remount,size=3072m" in (tmp_path / "mount.log").read_text()
 
 
-def test_busy_runner_refuses_and_changes_nothing(tmp_path):
+def test_a_job_that_outlasts_the_wait_stops_the_change_and_nothing_is_cut_short(tmp_path):
     env, home, units, etc = setup(tmp_path)
     (tmp_path / "busy").write_text("")
-    r = run(env, "ramdisk", "on", "1024")
-    assert r.returncode != 0 and "running a job" in r.stderr
+    r = run({**env, "RAMDISK_WAIT": "1", "RAMDISK_POLL": "0.2"}, "ramdisk", "on", "1024")
+    assert r.returncode != 0 and "still running a job" in r.stderr
     assert tmpfs_lines(etc) == [] and not (home / "ramdisk").exists()
+    assert not (home / "maintenance").exists()
+    assert " stop " not in f" {(tmp_path / 'systemctl.log').read_text()} "  # a busy runner is never stopped
+
+
+def test_it_waits_for_a_running_job_to_finish_then_stops_and_changes_the_runners(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    busy = tmp_path / "busy"
+    busy.write_text("")
+    p = subprocess.Popen(
+        ["bash", str(LINUXRUNNER), "ramdisk", "on", "1024"],
+        env={**env, "RAMDISK_POLL": "0.2"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    time.sleep(1)
+    assert p.poll() is None and tmpfs_lines(etc) == []  # still waiting: the job is not interrupted
+    assert (home / "maintenance").exists()
+    busy.unlink()
+    out, err = p.communicate(timeout=20)
+    assert p.returncode == 0, err
+    assert "waiting for running jobs to finish" in out
+    log = (tmp_path / "systemctl.log").read_text()
+    assert "stop actions.runner.o-r.ci-1.service" in log and "stop actions.runner.o-r.ci-2.service" in log
+    assert len(tmpfs_lines(etc)) == 2 and not (home / "maintenance").exists()
+
+
+def test_slot_sync_leaves_the_runners_alone_during_a_change(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    run(env, "slots", "1", "2")
+    (home / "provisioned").write_text("")
+    slotdir = home / "slots.d"
+    slotdir.mkdir(exist_ok=True)
+    (home / "maintenance").write_text("")
+    (tmp_path / "systemctl.log").write_text("")
+    assert run(env, "slot-sync").returncode == 0
+    assert (tmp_path / "systemctl.log").read_text() == ""
 
 
 def test_bad_sizes_are_refused(tmp_path):

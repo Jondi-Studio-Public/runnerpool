@@ -19,6 +19,7 @@ SLOTS_FILE=$HOME_DIR/slots           # `slots=N` / `threads=T` lines: the PC's j
 SLOT_DIR_FILE=$HOME_DIR/slot-dir     # where the slot locks live (the follower points it at the Windows side)
 FOLLOW_LAST=$HOME_DIR/follow-last    # the Windows state the follower last applied
 FOLLOW_UNIT=win-runners-follow.service
+MAINT_FILE=$HOME_DIR/maintenance    # present while `ramdisk` changes the runners: slot-sync must not restart them
 RAMDISK_FILE=$HOME_DIR/ramdisk      # `ramdisk on` writes the size in MB here; add-runner reads it for new runners
 CI_USER=${CI_USER:-runner}           # who adopted and new CI runners run as
 UNIT_GLOB='actions.runner.*.service'
@@ -224,6 +225,7 @@ cmd_slot_sync() {
   local n d dir u name held age side
   n=$(slots_n); [ -n "$n" ] || return 0
   dir=$(slot_dir)
+  [ ! -f "$MAINT_FILE" ] || return 0   # a `ramdisk` change has the runners stopped on purpose
   for d in $(held_slots); do
     age=$(slot_age "$d"); side=$(owner_field "$d" side); name=$(owner_field "$d" runner)
     if [ -z "$side" ]; then [ "$age" -gt 60 ] && rm -rf "$d"; continue; fi  # written a moment ago, or abandoned
@@ -425,28 +427,61 @@ ramdisk_remove_unit() {  # UNIT
   if [ "$was" = active ] && [ ! -f "$CI_OFF" ]; then systemctl start "$u"; fi
   log "$(unit_name "$u"): workspace back on the disk"
 }
+# Stops every CI runner for a ramdisk change without cutting a job short: an idle runner is stopped on the spot, a busy one
+# is waited for (and stopped the moment its job ends), so a job is never interrupted. Writes the stopped units to $DRAINED
+# and holds MAINT_FILE so slot-sync does not start them again. Gives up after RAMDISK_WAIT seconds (default 1800), restarting
+# what it stopped.
+ramdisk_drain() {
+  local deadline u left pending noted=0
+  deadline=$(( $(date +%s) + ${RAMDISK_WAIT:-1800} ))
+  : > "$MAINT_FILE"
+  pending=$(ci_units)
+  while :; do
+    left=
+    for u in $pending; do
+      [ "$(state "$u")" = active ] || continue
+      if is_busy "$u"; then left="$left $u"; else systemctl stop "$u"; DRAINED="$DRAINED $u"; fi
+    done
+    [ -n "$left" ] || return 0
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      for u in $DRAINED; do [ -f "$CI_OFF" ] || systemctl start "$u" || true; done
+      die "a runner is still running a job after ${RAMDISK_WAIT:-1800}s: nothing was changed"
+    fi
+    [ "$noted" = 1 ] || { log "waiting for running jobs to finish:$left"; noted=1; }
+    sleep "${RAMDISK_POLL:-2}"
+    pending=$left
+  done
+}
+
 cmd_ramdisk() {  # on [MB] | off
   need_root
   local v=${1:-} mb=${2:-} mem_mb n u
+  DRAINED=
   mem_mb=$(free -m | awk '/Mem:/{print $2}')
-  for u in $(ci_units); do ! is_busy "$u" || die "$(unit_name "$u") is running a job: try again when it is idle"; done
   case $v in
     on)
       if [ -z "$mb" ]; then   # half of one runner's share of RAM: the rest is for the job's own processes
         n=$(slots_n); [ -n "$n" ] || n=$(ci_units | wc -l); [ "$n" -ge 1 ] || n=1
         mb=$((mem_mb / n / 2)); [ "$mb" -ge 512 ] || mb=512
       fi
-      [[ "$mb" =~ ^[0-9]+$ ]] && [ "$mb" -ge 256 ] && [ "$mb" -le "$mem_mb" ] || die "ramdisk on [MB]: 256 to $mem_mb"
-      mkdir -p "$HOME_DIR"; echo "$mb" > "$RAMDISK_FILE"
-      write_hook_scripts
-      for u in $(ci_units); do ramdisk_apply_unit "$u" "$mb"; apply_limits "$u"; done
-      log "RAM workspace on: $mb MB per runner, a cap (RAM is used only for what jobs write; it is freed when the distro stops)" ;;
-    off)
-      rm -f "$RAMDISK_FILE"
-      for u in $(ci_units); do ramdisk_remove_unit "$u"; apply_limits "$u"; done
-      log "RAM workspace off" ;;
+      [[ "$mb" =~ ^[0-9]+$ ]] && [ "$mb" -ge 256 ] && [ "$mb" -le "$mem_mb" ] || die "ramdisk on [MB]: 256 to $mem_mb" ;;
+    off) ;;
     *) die "ramdisk on [MB] | off" ;;
   esac
+  trap 'rm -f "$MAINT_FILE"' EXIT
+  ramdisk_drain
+  mkdir -p "$HOME_DIR"
+  if [ "$v" = on ]; then
+    echo "$mb" > "$RAMDISK_FILE"
+    write_hook_scripts
+    for u in $(ci_units); do ramdisk_apply_unit "$u" "$mb"; apply_limits "$u"; done
+    log "RAM workspace on: $mb MB per runner, a cap (RAM is used only for what jobs write; it is freed when the distro stops)"
+  else
+    rm -f "$RAMDISK_FILE"
+    for u in $(ci_units); do ramdisk_remove_unit "$u"; apply_limits "$u"; done
+    log "RAM workspace off"
+  fi
+  for u in $DRAINED; do [ -f "$CI_OFF" ] || [ "$(state "$u")" = active ] || systemctl start "$u"; done
 }
 
 # Docker's work runs in its own cgroups, outside the runner services' drop-ins, so a job's `docker build` would escape the
@@ -589,7 +624,7 @@ linuxrunner: manage GitHub Actions runners on a systemd Linux box (adopts existi
   ci on|off                          CI runners take jobs / finish their job and stay stopped
   cores N|all                        CI jobs may use N cores (CI_MAX_CORES)
   ramdisk on [MB] | off              each CI runner's _work folder on a RAM disk (tmpfs, size is a cap; default half a runner's
-                                     share of RAM). Gone when the distro stops; refuses while a job runs
+                                     share of RAM). Gone when the distro stops; waits for running jobs, never cuts one short
   limit NAME cores=<N|default> ram=<MB|default>
                                      one runner's own limits (CI_MAX_CORES, CI_MAX_RAM_MB, systemd MemoryMax);
                                      they win over `cores`; default = back to the device-wide setting
