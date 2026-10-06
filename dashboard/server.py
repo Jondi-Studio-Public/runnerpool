@@ -48,6 +48,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ci_store  # noqa: E402  (the shared run/job store the webhook receiver fills)
 import gh_app_token  # noqa: E402  (shared with the watchdog)
 
 # Everything org-specific comes from the environment; the defaults are obvious placeholders.
@@ -201,6 +202,77 @@ def run(cmd, timeout, env=None):
         return 124, "", f"timed out after {timeout}s"
     except FileNotFoundError:
         return 127, "", f"{cmd[0]} not found"
+
+
+# CI_STORE=1 reads workflow runs and jobs from the shared store (filled by webhooks and the watchdog's
+# reconcile) instead of polling GitHub. Unset or 0 = polling exactly as before. A store that is missing,
+# locked or not recently reconciled is skipped per call, so a request never fails because of it.
+CI_STORE_RETRY = 30  # s before a store that failed to open is tried again
+_store = {"path": None, "db": None, "failed_at": 0.0}
+_store_lock = threading.Lock()
+
+
+def store_mode():
+    return os.environ.get("CI_STORE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def store_max_age():
+    try:
+        return float(os.environ.get("CI_STORE_MAX_AGE", "") or 900)
+    except ValueError:
+        return 900.0
+
+
+def store_handle():
+    """The open Store, or None when it is off or cannot be opened (retried every CI_STORE_RETRY s)."""
+    if not store_mode():
+        return None
+    path = os.environ.get("CI_DB") or "/ci/ci.db"
+    with _store_lock:
+        if _store["db"] is not None and _store["path"] == path:
+            return _store["db"]
+        if _store["path"] == path and time.time() - _store["failed_at"] < CI_STORE_RETRY:
+            return None
+        _store["path"], _store["db"] = path, None
+        try:
+            _store["db"] = ci_store.Store(path)
+        except Exception as e:  # sqlite3.Error, OSError: fall back to polling
+            _store["failed_at"] = time.time()
+            gh_app_token.log(f"CI store {path} unavailable: {e}")
+        return _store["db"]
+
+
+def store_read(fn):
+    """fn(store) when the store is on and trusted, else None (the caller polls GitHub). fn may
+    return None itself for 'the store cannot answer this'."""
+    st = store_handle()
+    if st is None:
+        return None
+    try:
+        if not st.trusted(store_max_age()):
+            return None
+        return fn(st)
+    except Exception as e:
+        gh_app_token.log(f"CI store read failed: {e}")
+        return None
+
+
+def store_info():
+    """/api/info ci_store: whether the store is in use, and how fresh it is."""
+    info = {"mode": "on" if store_mode() else "off", "trusted": False, "webhook_ago_s": None,
+            "reconciled_ago_s": None, "ratelimit": None}  # fmt: skip
+    st = store_handle()
+    if st is None:
+        return info
+    try:
+        info["trusted"] = bool(st.trusted(store_max_age()))
+        for key, ago in (("webhook_ago_s", st.webhook_ago()), ("reconciled_ago_s", st.reconciled_ago())):
+            info[key] = None if ago is None else round(ago)
+        raw = st.get_meta("ratelimit")
+        info["ratelimit"] = json.loads(raw) if raw else None
+    except Exception:
+        pass
+    return info
 
 
 def ssh(host, args, timeout):
@@ -546,13 +618,18 @@ def repo_ci(repo, branch, token):
                 }
             )
         row["prs_open"] = len(pulls)
-    runs, err = gh_json(f"repos/{repo}/actions/runs?per_page=30", token)
-    if err:
-        row["error"] = row["error"] or f"workflow runs: {err}"
+    # the store knows a repo only once it has seen a run of it (a quiet or personal repo is polled)
+    live = store_read(lambda st: st.runs(repo, status=tuple(sorted(LIVE))) if st.runs(repo, limit=1) else None)
+    if live is not None:
+        statuses = [r.get("status") for r in live]
     else:
+        runs, err = gh_json(f"repos/{repo}/actions/runs?per_page=30", token)
+        if err:
+            row["error"] = row["error"] or f"workflow runs: {err}"
+            return row
         statuses = [r.get("status") for r in runs.get("workflow_runs", [])]
-        row["running"] = statuses.count("in_progress")
-        row["queued"] = sum(1 for s in statuses if s in LIVE and s != "in_progress")
+    row["running"] = statuses.count("in_progress")
+    row["queued"] = sum(1 for s in statuses if s in LIVE and s != "in_progress")
     return row
 
 
@@ -608,6 +685,34 @@ def build_activity(repos, want=None, fetch=None):
                 if not have or (entry["started_at"] or "") >= (have["started_at"] or ""):
                     found[name.lower()] = entry
     return found, errors
+
+
+def store_activity(st):
+    """build_activity from the store: its in-progress jobs, same entries as the API walk."""
+    found = {}
+    runs = {}
+    for j in st.jobs(status="in_progress"):
+        name = j.get("runner_name") or ""
+        if not name:
+            continue
+        repo = j["_repo"]
+        if repo not in runs:
+            runs[repo] = {r.get("id"): r for r in st.runs(repo, status="in_progress")}
+        r = runs[repo].get(j.get("run_id")) or {}
+        entry = {
+            "runner": name,
+            "repo": repo,
+            "workflow": r.get("name") or j.get("workflow_name") or "",
+            "job": j.get("name") or "",
+            "branch": r.get("head_branch") or j.get("head_branch") or "",
+            "run_url": r.get("html_url") or f"https://github.com/{repo}/actions/runs/{j.get('run_id')}",
+            "job_url": j.get("html_url"),
+            "started_at": j.get("started_at") or r.get("run_started_at"),
+        }
+        have = found.get(name.lower())
+        if not have or (entry["started_at"] or "") >= (have["started_at"] or ""):
+            found[name.lower()] = entry
+    return found
 
 
 def natural_key(name):
@@ -1009,8 +1114,10 @@ class State:
             except (ValueError, AttributeError):
                 return repo, "gh returned something that is not JSON", []
 
-        with ThreadPoolExecutor(max(1, len(REPOS))) as pool:
-            results = list(pool.map(one, REPOS))
+        results = store_read(lambda st: [(repo, None, st.runs(repo, limit=100)) for repo in REPOS])
+        if results is None:
+            with ThreadPoolExecutor(max(1, len(REPOS))) as pool:
+                results = list(pool.map(one, REPOS))
         answer = summarize_runs(results)
         with self.lock:
             self.runs, self.runs_at = answer, time.time()
@@ -1086,6 +1193,11 @@ class State:
         if not want:
             with self.lock:
                 self.activity, self.activity_errors = {}, {}
+            return
+        stored = store_read(store_activity)
+        if stored is not None:
+            with self.lock:
+                self.activity, self.activity_errors, self.activity_at = stored, {}, time.time()
             return
         with self.lock:
             names = [r["repo"] for r in (self.ci or {}).get("repos", [])]
@@ -1660,6 +1772,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(200, STATE.get_jobs())
         if url.path == "/api/ci":
             return self.send(200, STATE.get_ci())
+        if url.path == "/api/info":
+            return self.send(200, {"ci_store": store_info()})
         m = re.fullmatch(r"/api/mac/([^/]+)/info", url.path)
         if m:
             host = m.group(1)

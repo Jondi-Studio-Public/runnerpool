@@ -16,3 +16,5 @@ secrets:
     file: /root/macs-dashboard/secrets/ntfy_topic
   ntfy_token:
     file: /root/macs-dashboard/secrets/ntfy_token
+  webhook_secret:
+    file: /root/macs-dashboard/secrets/webhook_secret

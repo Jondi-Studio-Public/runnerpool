@@ -23,6 +23,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import statistics
 import sys
 import threading
@@ -30,10 +31,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "dashboard"))
+import ci_store  # noqa: E402  (the shared CI state store, also from dashboard/)
 import gh_app_token  # noqa: E402  (shared with the dashboard; the image copies both directories)
 
 API = "https://api.github.com"
@@ -47,6 +50,8 @@ LOST_PATTERNS = (
 )
 FAILED = {"failure", "cancelled", "timed_out"}
 KEEP_DAYS = 7
+ETAG_CACHE_MAX = 500
+RATELIMIT_LOW = 500  # log once each time the remaining quota drops below this
 
 
 def log(msg):
@@ -90,6 +95,12 @@ class Config:
         self.rerun_max_tries = int(g("WATCHDOG_RERUN_MAX_TRIES", "5"))
         self.api_fail_alert_cycles = int(g("WATCHDOG_API_FAIL_ALERT_CYCLES", "10"))
         self.data_dir = Path(g("WATCHDOG_DATA_DIR", "/data"))
+        # Store mode: read runs and jobs from the shared SQLite store (filled by webhooks plus a slow
+        # reconcile poll) instead of polling GitHub each cycle. Off by default: behaviour is unchanged.
+        self.ci_store = g("CI_STORE", "0").strip().lower() in ("1", "true", "yes", "on")
+        self.ci_db = g("CI_DB", "/ci/ci.db")
+        self.reconcile_seconds = int(g("WATCHDOG_RECONCILE_SECONDS", "300"))
+        self.store_max_age = int(g("WATCHDOG_STORE_MAX_AGE", "900"))
         self.ntfy_url = g("WATCHDOG_NTFY_URL", "https://ntfy.sh").rstrip("/")
         self.ntfy_topic = ""
         self.ntfy_token = ""
@@ -114,12 +125,42 @@ class GitHubError(Exception):
 
 class GitHub:
     """Minimal REST client. request() -> (status, json or None); only the path is ever logged.
-    token is a string or a zero-argument callable returning the current one."""
+    token is a string or a zero-argument callable returning the current one.
+
+    GETs are conditional: the last (etag, parsed body) per full URL is kept (bounded), sent as
+    If-None-Match, and a 304 (which costs no quota) comes back as 200 with the cached body. Callers
+    must not mutate a returned body. `ratelimit` holds the X-RateLimit-* values of the latest response."""
 
     def __init__(self, token, base=API, opener=None):
         self._token = token
         self.base = base
         self._open = opener or urllib.request.urlopen
+        self._etags = OrderedDict()
+        self.ratelimit = {}
+        self._low = set()
+
+    def _note_limits(self, headers):
+        if headers is None:
+            return
+        try:
+            remaining = int(headers.get("X-RateLimit-Remaining"))
+        except (TypeError, ValueError, AttributeError):
+            return
+        rl = {"remaining": remaining}
+        for key, name in (("limit", "X-RateLimit-Limit"), ("reset", "X-RateLimit-Reset")):
+            try:
+                rl[key] = int(headers.get(name))
+            except (TypeError, ValueError):
+                pass
+        rl["resource"] = headers.get("X-RateLimit-Resource") or "core"
+        self.ratelimit = rl
+        if remaining >= RATELIMIT_LOW:
+            self._low.discard(rl["resource"])
+        elif rl["resource"] not in self._low:
+            self._low.add(rl["resource"])
+            log(
+                f"GitHub rate limit low: {remaining}/{rl.get('limit', '?')} left ({rl['resource']}), reset {rl.get('reset', '?')}"
+            )
 
     def request(self, method, path, params=None):
         url = self.base + path
@@ -134,11 +175,27 @@ class GitHub:
         req.add_header("Accept", "application/vnd.github+json")
         req.add_header("X-GitHub-Api-Version", "2022-11-28")
         req.add_header("User-Agent", "git-runner-watchdog")
+        cached = self._etags.get(url) if method == "GET" else None
+        if cached:
+            req.add_header("If-None-Match", cached[0])
         try:
             with self._open(req, timeout=30) as r:
+                headers = getattr(r, "headers", None)
+                self._note_limits(headers)
                 body = r.read()
-                return r.status, (json.loads(body) if body else None)
+                data = json.loads(body) if body else None
+                etag = headers.get("ETag") if headers is not None and method == "GET" else None
+                if etag and r.status == 200:
+                    self._etags[url] = (etag, data)
+                    self._etags.move_to_end(url)
+                    while len(self._etags) > ETAG_CACHE_MAX:
+                        self._etags.popitem(last=False)
+                return r.status, data
         except urllib.error.HTTPError as e:
+            self._note_limits(getattr(e, "headers", None))
+            if e.code == 304 and cached:
+                self._etags.move_to_end(url)
+                return 200, cached[1]
             try:
                 data = json.loads(e.read() or b"null")
             except ValueError:
@@ -283,8 +340,10 @@ class State:
 
 
 class Watchdog:
-    def __init__(self, cfg, gh, notify, state, clock=time.time):
+    def __init__(self, cfg, gh, notify, state, clock=time.time, store=None):
         self.cfg, self.gh, self.notify, self.state, self.now = cfg, gh, notify, state, clock
+        self.store = store if cfg.ci_store else None
+        self._last_reconcile = None  # None: the first cycle reconciles at once
         try:
             from zoneinfo import ZoneInfo
 
@@ -325,26 +384,128 @@ class Watchdog:
         return repos
 
     def runs(self, repo, **params):
-        data = self.get(f"/repos/{repo}/actions/runs", dict(params, per_page=100))
+        data = self.get(f"/repos/{repo}/actions/runs", dict({"per_page": 100}, **params))
         return data.get("workflow_runs", [])
 
-    def jobs(self, repo, run_id):
+    def poll_jobs(self, repo, run_id):
         return self.get_all(f"/repos/{repo}/actions/runs/{run_id}/jobs", "jobs", {"filter": "latest"}, 3)
+
+    def jobs(self, repo, run_id, use_store=True):
+        """The latest attempt's jobs of a run: from the store when it is trusted and holds them."""
+        if use_store and self.store_ready():
+            try:
+                held = self.store.jobs(repo=repo, run_id=run_id)
+            except sqlite3.Error as e:
+                log(f"store read failed ({type(e).__name__}); polling")
+                held = []
+            if held:
+                latest = max(j.get("run_attempt") or 1 for j in held)
+                return [j for j in held if (j.get("run_attempt") or 1) == latest]
+        return self.poll_jobs(repo, run_id)
+
+    # --- the shared store (CI_STORE=1)
+
+    def store_ready(self):
+        """True when this cycle may read runs and jobs from the store: a recent reconcile finished."""
+        if self.store is None:
+            return False
+        try:
+            return self.store.trusted(self.cfg.store_max_age)
+        except sqlite3.Error as e:
+            log(f"store unavailable ({type(e).__name__}); polling")
+            return False
+
+    def _put_meta(self, key, value):
+        with self.store._lock:  # Store.set_meta does not lock itself; its other writers hold this lock
+            self.store.set_meta(key, value)
+
+    def maybe_reconcile(self, now):
+        if self._last_reconcile is not None and now - self._last_reconcile < self.cfg.reconcile_seconds:
+            return
+        try:
+            self.reconcile(now)
+            self._last_reconcile = now
+        except GitHubError as e:
+            log(f"reconcile failed, store not marked: {e}")  # retried next cycle; readers fall back to polling
+
+    def reconcile(self, now):
+        """Make the store correct even if webhooks were missed. Raises GitHubError (and then does not
+        mark the store reconciled) when GitHub cannot be read."""
+        store = self.store
+        horizon = now - self.cfg.rerun_max_age_minutes * 60 * 2
+        repos = self.repos()
+        live_ids = set()
+        for repo in repos:
+            live = self.runs(repo, status="queued") + self.runs(repo, status="in_progress")
+            latest = self.runs(repo, per_page=30)
+            live_ids.update(r["id"] for r in live)
+            runs = {r["id"]: r for r in latest}
+            for status in (
+                "failure",
+                "cancelled",
+            ):  # a failure older than the latest 30 runs still needs its jobs examined
+                runs.update({r["id"]: r for r in self.runs(repo, status=status)})
+            runs.update({r["id"]: r for r in live})
+            jobs = []
+            for run in runs.values():
+                is_live = run["id"] in live_ids
+                held = store.jobs(repo=repo, run_id=run["id"])
+                failed = (
+                    run.get("conclusion") in ("failure", "cancelled")
+                    and (parse_ts(run.get("updated_at")) or 0) >= horizon
+                )
+                stuck = not is_live and any(j.get("status") != "completed" for j in held)  # a job event was missed
+                # a stored subset of a failed run can hide a job whose event was missed, so failed runs are always read
+                if is_live or stuck or failed:
+                    jobs += self.poll_jobs(repo, run["id"])
+            store.upsert_many(repo, runs.values(), jobs)
+        # Runs the store holds as live that GitHub no longer lists as live finished while we missed the event.
+        for repo, run_id in store.live_run_ids():
+            if run_id in live_ids or repo not in repos:
+                continue
+            try:
+                run = self.get(f"/repos/{repo}/actions/runs/{run_id}")
+            except GitHubError as e:
+                if "HTTP 404" not in str(e):
+                    raise
+                log(f"run {repo}#{run_id} no longer exists; dropping it from the store")
+                with store._lock:  # no delete API in Store; the run is gone on GitHub
+                    store.db.execute("DELETE FROM jobs WHERE repo = ? AND run_id = ?", (repo, run_id))
+                    store.db.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+                continue
+            store.upsert_many(repo, [run], self.poll_jobs(repo, run_id))
+        store.mark_reconciled()
+        log(f"reconciled the store: {len(repos)} repo(s)")
+
+    def write_meta(self):
+        try:
+            self._put_meta("ratelimit", json.dumps(getattr(self.gh, "ratelimit", None) or {}))
+            self._put_meta("reconcile_seconds", self.cfg.reconcile_seconds)
+        except sqlite3.Error as e:
+            log(f"store meta write failed: {type(e).__name__}")
 
     # --- one cycle
 
     def cycle(self):
         now = self.now()
-        runners = self.get_all(f"/orgs/{self.cfg.org}/actions/runners", "runners")
-        self.track_runners(runners, now)
-        queued = self.queued_jobs()
-        self.check_pool(runners, queued, now)
-        self.check_queue(queued, now)
-        self.check_stale(runners, now)
-        self.check_failures(now)
-        self.maybe_digest(now)
-        self.state.prune(now)
-        self.state.save()
+        try:
+            if self.store is not None:
+                self.maybe_reconcile(now)
+            runners = self.get_all(f"/orgs/{self.cfg.org}/actions/runners", "runners")  # no webhook for runners
+            self.track_runners(runners, now)
+            queued = self.queued_jobs()
+            self.check_pool(runners, queued, now)
+            self.check_queue(queued, now)
+            self.check_stale(runners, now)
+            self.check_failures(now)
+            self.maybe_digest(now)
+            self.state.prune(now)
+            self.state.save()
+            if self.store is not None:
+                self.store.prune()
+        finally:
+            if self.store is not None:
+                self.write_meta()
 
     def run_forever(self, stop, heartbeat):
         fails = 0
@@ -390,6 +551,11 @@ class Watchdog:
 
     def queued_jobs(self):
         """Every queued job across the org: [{repo, job, labels, waited_s}]."""
+        if self.store_ready():
+            try:
+                return self.queued_jobs_from_store()
+            except sqlite3.Error as e:
+                log(f"store read failed ({type(e).__name__}); polling")
         seen, out = set(), []
         now = self.now()
         for repo in self.repos():
@@ -411,6 +577,30 @@ class Watchdog:
                                     "run_name": run.get("name", ""),
                                 }
                             )
+        return out
+
+    def queued_jobs_from_store(self):
+        now, out = self.now(), []
+        for repo in self.repos():
+            queued = self.store.jobs(repo=repo, status="queued")
+            if not queued:
+                continue
+            runs = {r["id"]: r for r in self.store.runs(repo, limit=200)}
+            for job in queued:
+                run = runs.get(job.get("run_id"))
+                if run and run.get("status") == "completed":
+                    continue  # a stale queued row of a finished run: the polling path never reports it
+                t = parse_ts(job.get("created_at")) or now
+                out.append(
+                    {
+                        "repo": repo,
+                        "job": job,
+                        "labels": labels_of(job),
+                        "waited": max(0, now - t),
+                        "name": job.get("name", ""),
+                        "run_name": (run or {}).get("name", ""),
+                    }
+                )
         return out
 
     def check_pool(self, runners, queued, now):
@@ -484,15 +674,25 @@ class Watchdog:
         s = self.state.d
         horizon = now - self.cfg.rerun_max_age_minutes * 60 * 2
         for repo in self.repos():
-            for conclusion in ("failure", "cancelled"):
-                for run in self.runs(repo, status=conclusion):
-                    t = parse_ts(run.get("updated_at")) or 0
-                    ekey = f"{repo}#{run['id']}#{run.get('run_attempt', 1)}"
-                    if t < horizon or ekey in s["examined"]:
-                        continue
-                    if self.examine_run(repo, run, now):
-                        s["examined"][ekey] = now
+            for run in self.failed_runs(repo):
+                t = parse_ts(run.get("updated_at")) or 0
+                ekey = f"{repo}#{run['id']}#{run.get('run_attempt', 1)}"
+                if t < horizon or ekey in s["examined"]:
+                    continue
+                if self.examine_run(repo, run, now):
+                    s["examined"][ekey] = now
             self.state.save()
+
+    def failed_runs(self, repo):
+        """Failed and cancelled runs of one repo, newest first: from the store when it is trusted."""
+        if self.store_ready():
+            try:
+                return [
+                    r for c in ("failure", "cancelled") for r in self.store.runs_by_conclusion(repo, (c,))
+                ]  # up to 100 of each, like polling
+            except sqlite3.Error as e:
+                log(f"store read failed ({type(e).__name__}); polling")
+        return [r for c in ("failure", "cancelled") for r in self.runs(repo, status=c)]
 
     def annotations(self, repo, job_id):
         try:
@@ -590,7 +790,7 @@ class Watchdog:
                 runs[run.get("conclusion") or run.get("status")] = (
                     runs.get(run.get("conclusion") or run.get("status"), 0) + 1
                 )
-                for job in self.jobs(repo, run["id"]):
+                for job in self.jobs(repo, run["id"], use_store=False):
                     a, b = parse_ts(job.get("created_at")), parse_ts(job.get("started_at"))
                     if a and b and b >= a:
                         waits.append(b - a)
@@ -637,11 +837,18 @@ def main(argv=None):
     if not cfg.ntfy_topic:
         log("no ntfy topic configured: alerts are only written to this log")
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    store = None
+    if cfg.ci_store:
+        try:
+            store = ci_store.Store(cfg.ci_db)
+        except (sqlite3.Error, OSError) as e:
+            log(f"CI_STORE is on but {cfg.ci_db} cannot be opened ({type(e).__name__}); polling GitHub instead")
     wd = Watchdog(
         cfg,
         GitHub(cfg.tokens.token),
         Ntfy(cfg.ntfy_url, cfg.ntfy_topic, cfg.ntfy_token),
         State(cfg.data_dir / "state.json"),
+        store=store,
     )
     if args.once:
         wd.cycle()
@@ -649,7 +856,7 @@ def main(argv=None):
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
-    log(f"watchdog started: org {cfg.org}, every {cfg.poll_seconds}s")
+    log(f"watchdog started: org {cfg.org}, every {cfg.poll_seconds}s" + (", store mode" if store else ""))
     wd.run_forever(stop, beat)
     return 0
 
