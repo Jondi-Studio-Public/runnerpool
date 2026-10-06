@@ -232,7 +232,14 @@ def test_a_runner_added_while_ram_mode_is_on_is_mounted_and_gets_the_wipe_hook(t
     bindir = tmp_path / "bin"
     stubs = {
         "curl": '#!/bin/sh\ncase "$*" in *-w*) echo https://github.com/actions/runner/releases/tag/v2.9.9 ;; esac\n',
-        "tar": '#!/bin/sh\ncat > /dev/null\nwhile [ $# -gt 0 ]; do [ "$1" = -C ] && d=$2; shift; done\nprintf "#!/bin/sh\nexit 0\n" > "$d/svc.sh"; cp "$d/svc.sh" "$d/config.sh"; chmod +x "$d/svc.sh" "$d/config.sh"\n',
+        # svc.sh logs "svc install" / "svc start" next to the mount log; `start` is what makes the unit active
+        "tar": """#!/bin/sh
+cat > /dev/null
+while [ $# -gt 0 ]; do [ "$1" = -C ] && d=$2; shift; done
+printf '#!/bin/sh\\nexit 0\\n' > "$d/config.sh"
+printf '#!/bin/sh\\necho "svc $1" >> "$STUB_MOUNTLOG"\\n[ "$1" != start ] || touch "$STUB_DIR/started.new-1"\\n' > "$d/svc.sh"
+chmod +x "$d/svc.sh" "$d/config.sh"
+""",
         "sudo": '#!/bin/sh\n[ "$1" = -u ] && shift 2\nexec "$@"\n',
         "useradd": "#!/bin/sh\nexit 0\n",
         "chown": "#!/bin/sh\nexit 0\n",
@@ -249,6 +256,10 @@ def test_a_runner_added_while_ram_mode_is_on_is_mounted_and_gets_the_wipe_hook(t
             'list-units) echo "actions.runner.o-r.new-1.service loaded active running x"; echo',
         )
         .replace('show) case "$5" in', 'show) case "$5" in *new-1*) echo "$STUB_HOME/runners/new-1" ;;')
+        .replace(
+            "is-active) echo active ;;",
+            'is-active) case "$2" in *new-1*) [ -e "$STUB_DIR/started.new-1" ] && echo active || echo inactive ;; *) echo active ;; esac ;;',
+        )
     )
     env["STUB_HOME"] = str(home)
     r = run(env, "add-runner", "o/r", "new-1", "linux-ci", "TOKEN")
@@ -258,6 +269,10 @@ def test_a_runner_added_while_ram_mode_is_on_is_mounted_and_gets_the_wipe_hook(t
     e = (home / "runners/new-1/.env").read_text().split("\n")
     assert f"GIT_RUNNER_WORK={work}" in e
     assert f"ACTIONS_RUNNER_HOOK_JOB_COMPLETED={home}/slot-done.sh" in e
+    # the workspace is mounted before the service starts, so the runner never holds a job while it is being changed
+    order = [ln for ln in (tmp_path / "mount.log").read_text().splitlines() if ln.startswith(("svc ", f"mount {work}"))]
+    assert order == ["svc install", f"mount {work}", "svc start"]
+    assert "stop actions.runner.o-r.new-1.service" not in (tmp_path / "systemctl.log").read_text()
 
 
 def test_a_failure_part_way_restarts_the_runners_it_stopped(tmp_path):

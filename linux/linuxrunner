@@ -376,9 +376,14 @@ cmd_add_runner() {  # REPO|ORG NAME LABELS TOKEN [ci|root]
   chown -R "$user" "$dir"
   sudo -u "$user" env RUNNER_ALLOW_RUNASROOT=1 "$dir/config.sh" --unattended --replace --url "$url" --token "$token" \
     --name "$name" --labels "$labels" --work _work >/dev/null
-  ( cd "$dir" && RUNNER_ALLOW_RUNASROOT=1 ./svc.sh install "$user" >/dev/null && ./svc.sh start >/dev/null )
+  ( cd "$dir" && RUNNER_ALLOW_RUNASROOT=1 ./svc.sh install "$user" >/dev/null )
+  if [ "$as" != root ] && [ -s "$RAMDISK_FILE" ]; then   # RAM workspace is on here: mount it and wire the wipe hook BEFORE the
+    u=$(unit_for "$name")                                # runner can take a job, so nothing is stopped or deleted under one
+    ramdisk_apply_unit "$u" "$(cat "$RAMDISK_FILE")"
+    APPLY_NO_RESTART=1 apply_limits "$u"
+  fi
+  ( cd "$dir" && ./svc.sh start >/dev/null )
   log "added $name ($url, labels $labels)"
-  [ "$as" = root ] || [ ! -s "$RAMDISK_FILE" ] || { u=$(unit_for "$name"); ramdisk_apply_unit "$u" "$(cat "$RAMDISK_FILE")"; apply_limits "$u"; }   # RAM workspace is on here: mount it and wire the wipe hook
   [[ ",$labels," != *,docker,* ]] || command -v docker >/dev/null || cmd_install_docker   # the label promises Docker
 }
 
