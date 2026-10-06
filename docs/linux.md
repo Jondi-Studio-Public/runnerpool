@@ -44,7 +44,7 @@ folder, so checkouts and test temp files live in RAM and never fill the disk. `r
 - **Emptied after every job.** `ramdisk on` wires the runners' job-completed hook, which deletes the checkout and the job's temp
   files. The `_tool` and `_actions` caches stay (the next job reuses them) until the distro stops, which empties everything.
 - Persistent: an `/etc/fstab` line per runner (WSL2 mounts it at boot) and a `RequiresMountsFor` drop-in so the runner starts after the
-  mount. `add-runner` mounts new runners too. It never interrupts a job: idle runners are stopped at once, busy ones are waited for (up to 30 minutes, then nothing is changed), and slot-sync leaves them alone meanwhile. It deletes what is on the disk under `_work` first.
+  mount. `add-runner` mounts new runners too. It never interrupts a job: idle runners are stopped at once, busy ones are waited for (up to 15 minutes, inside the Admin workflow's 20-minute limit, then nothing is changed), and slot-sync leaves them alone meanwhile. It deletes what is on the disk under `_work` first.
 - Not covered: Docker images and build caches (they live in Docker's own storage, not `_work`) and native Windows runners (`win-ci`).
 
 Not covered: `reregister`/`remove` (the adopted runners keep their registration), `rotate-token`

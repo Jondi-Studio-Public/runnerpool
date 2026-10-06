@@ -306,3 +306,27 @@ def test_runners_that_were_paused_stay_stopped_through_a_change(tmp_path):
         assert run(env, "ramdisk", *action).returncode == 0
         log = (tmp_path / "systemctl.log").read_text().splitlines()
         assert not [ln for ln in log if ln.startswith(("start ", "restart ", "stop "))]
+
+
+def test_a_cancelled_change_clears_the_marker_and_restarts_what_it_stopped(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    (tmp_path / "busy").write_text("")
+    p = subprocess.Popen(
+        ["bash", str(LINUXRUNNER), "ramdisk", "on", "1024"],
+        env={**env, "RAMDISK_POLL": "0.2"},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+    time.sleep(1)
+    assert (home / "maintenance").exists()
+    p.terminate()  # what a cancelled workflow sends
+    p.wait(timeout=10)
+    assert not (home / "maintenance").exists()
+    assert tmpfs_lines(etc) == []
+
+
+def test_the_default_wait_fits_inside_the_admin_workflows_timeout():
+    text = LINUXRUNNER.read_text()
+    assert "RAMDISK_WAIT:-900" in text and "RAMDISK_WAIT:-1800" not in text
+    assert "timeout-minutes: 20" in (ROOT / ".github/workflows/admin-wsl.yml").read_text()

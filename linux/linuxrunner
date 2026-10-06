@@ -436,11 +436,11 @@ ramdisk_remove_unit() {  # UNIT
 }
 # Stops every CI runner for a ramdisk change without cutting a job short: an idle runner is stopped on the spot, a busy one
 # is waited for (and stopped the moment its job ends), so a job is never interrupted. Writes the stopped units to $DRAINED
-# and holds MAINT_FILE so slot-sync does not start them again. Gives up after RAMDISK_WAIT seconds (default 1800), restarting
+# and holds MAINT_FILE so slot-sync does not start them again. Gives up after RAMDISK_WAIT seconds (default 900, inside the Admin workflow's 20-minute limit), restarting
 # what it stopped.
 ramdisk_drain() {
   local deadline u left pending noted=0
-  deadline=$(( $(date +%s) + ${RAMDISK_WAIT:-1800} ))
+  deadline=$(( $(date +%s) + ${RAMDISK_WAIT:-900} ))
   : > "$MAINT_FILE"
   pending=$(ci_units)
   while :; do
@@ -451,7 +451,7 @@ ramdisk_drain() {
     done
     [ -n "$left" ] || return 0
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      die "a runner is still running a job after ${RAMDISK_WAIT:-1800}s: nothing was changed"
+      die "a runner is still running a job after ${RAMDISK_WAIT:-900}s: nothing was changed"
     fi
     [ "$noted" = 1 ] || { log "waiting for running jobs to finish:$left"; noted=1; }
     sleep "${RAMDISK_POLL:-2}"
@@ -485,6 +485,7 @@ cmd_ramdisk() {  # on [MB] | off
     *) die "ramdisk on [MB] | off" ;;
   esac
   trap ramdisk_finish EXIT
+  trap 'exit 143' TERM INT HUP   # a cancelled workflow or a closed session still runs the EXIT cleanup
   ramdisk_drain
   APPLY_NO_RESTART=1   # a runner that was stopped (ci off, slots full) must stay stopped; ramdisk_finish restarts the drained ones
   mkdir -p "$HOME_DIR"
