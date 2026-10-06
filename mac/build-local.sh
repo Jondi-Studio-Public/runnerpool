@@ -20,6 +20,7 @@ TOOLS=$HOME/pkgtools
 ORG=${GITRUNNER_ORG:?set GITRUNNER_ORG to your GitHub org}
 CI_REPO=$ORG  # org-level CI runners
 CI_LABELS=mac-ci-heavy,mac-ci
+CI_HOST_LABELS=${CI_HOST_LABELS:-}  # extra labels per Mac, HOST=label[,label];...  e.g. host-a=gpu
 ADMIN_REPO=${ADMIN_REPO:-$ORG/runnerpool}
 IDENT=${GITRUNNER_BUNDLE_ID:-io.github.git-runner.mac-runners}   # reverse-DNS bundle id; set GITRUNNER_BUNDLE_ID for your own
 
@@ -106,7 +107,7 @@ main() {
   local env_file=$root/usr/local/mac-runners/bootstrap.env
   ( umask 077
     { printf 'GITRUNNER_ORG=%q\n' "$ORG"
-      printf 'CI_REPO=%q\nCI_LABELS=%q\n' "$CI_REPO" "$CI_LABELS"
+      printf 'CI_REPO=%q\nCI_LABELS=%q\nCI_HOST_LABELS=%q\n' "$CI_REPO" "$CI_LABELS" "$CI_HOST_LABELS"
       printf 'TS_AUTHKEY=%q\n' "$TS_AUTHKEY"
       if [ -n "$USE_APP" ]; then
         printf 'ADMIN_REPO=%q\nGITHUB_APP_ID=%q\nGITHUB_APP_KEY_B64=%q\n' "$ADMIN_REPO" "$CI_APP_ID" "$CI_APP_KEY_B64"

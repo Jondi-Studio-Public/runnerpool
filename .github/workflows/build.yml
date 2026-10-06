@@ -33,6 +33,7 @@ concurrency:
 env:
   CI_REPO: ${{ github.repository_owner }} # org-level: the Macs' CI runners serve every repo in the org
   CI_LABELS: mac-ci-heavy,mac-ci
+  CI_HOST_LABELS: ${{ vars.CI_HOST_LABELS }} # optional repo variable, HOST=label[,label];...  e.g. host-a=gpu
   GITRUNNER_BUNDLE_ID: ${{ vars.GITRUNNER_BUNDLE_ID }}   # optional repo variable; default io.github.git-runner.mac-runners
 
 jobs:
@@ -108,7 +109,7 @@ jobs:
               printf 'HOST=%q\n' "test-$GITHUB_RUN_ID"
               printf 'ADMIN_EPHEMERAL=1\nEXTRA_ADMIN_LABELS=%q\n' "test-$GITHUB_RUN_ID"
             else
-              printf 'CI_REPO=%q\nCI_LABELS=%q\n' "$CI_REPO" "$CI_LABELS"
+              printf 'CI_REPO=%q\nCI_LABELS=%q\nCI_HOST_LABELS=%q\n' "$CI_REPO" "$CI_LABELS" "$CI_HOST_LABELS"
               printf 'TS_AUTHKEY=%q\n' "$TS_AUTHKEY"
             fi
             if [ -n "$CI_APP_ID" ] && [ -n "$CI_APP_PRIVATE_KEY" ]; then
