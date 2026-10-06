@@ -466,7 +466,7 @@ cmd_add_runner() {  # REPO|ORG NAME LABELS TOKEN [ci|root]
   id "$user" >/dev/null 2>&1 || useradd -m -s /bin/bash "$user"
   # A docker-labelled runner's user must be in the docker group before its service starts. Docker installed before this user
   # existed (the installer's order) did not add it, and jobs failed with "permission denied ... docker.sock".
-  if [[ ",$labels," == *,docker,* ]] && getent group docker >/dev/null 2>&1; then usermod -aG docker "$user"; fi
+  if [ "$user" != root ] && [[ ",$labels," == *,docker,* ]] && getent group docker >/dev/null 2>&1; then usermod -aG docker "$user"; fi
   mkdir -p "$dir"
   v=$(latest_version)
   curl -fsSL "https://github.com/actions/runner/releases/download/v$v/actions-runner-linux-$(runner_arch)-$v.tar.gz" | tar xz -C "$dir"

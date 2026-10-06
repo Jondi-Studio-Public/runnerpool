@@ -825,3 +825,6 @@ def test_a_docker_labelled_runner_joins_the_docker_group_before_its_service_star
     log = (tmp_path / "mount.log").read_text().splitlines()
     assert "usermod -aG docker runner" in log
     assert log.index("usermod -aG docker runner") < log.index("svc start")
+    (tmp_path / "mount.log").write_text("")
+    assert run(env, "add-runner", "o/r", "new-1", "linux-ci", "TOKEN").returncode == 0
+    assert "usermod" not in (tmp_path / "mount.log").read_text()  # no docker label, no docker group
