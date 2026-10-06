@@ -350,7 +350,7 @@ runner: manage the Mac and Windows CI runners from this PC
   runner drop HOST OWNER/REPO NAME    unregister a runner added with `add`
   runner update HOST                  install this repo's macrunner / winrunner / linuxrunner on HOST
   runner battery HOST pause|run       pause CI on battery (default) or run it anyway
-  runner ramdisk HOST on [GB]|off     CI workspace on a RAM disk (default 4 GB; 16 GB Macs only)
+  runner ramdisk HOST on [GB]|off     CI workspace on a RAM disk (default 4 GB on a Mac, half a runner's share of RAM on WSL: wsl-1; 16 GB Macs)
   runner linux-vm HOST on [--cpus N] [--memory GB] [--disk GB] [--no-admin]
                                       an ARM64 Linux VM on a Mac with one linux-ci runner (air-N-vm-1) that takes turns with the Mac's own; run `runner update HOST` first
   runner linux-vm HOST off|status     stop the VM (CI finishes its job first) / show it
@@ -369,7 +369,7 @@ runner: manage the Mac and Windows CI runners from this PC
   runner tailscale HOST               re-join Tailscale with the current TS_AUTHKEY secret
   runner ssh HOST [COMMAND]           Tailscale SSH as root (when the admin runner is down)
 
-HOST is a Mac (air-1), a Windows PC (win-1) or a Linux box such as the PC's WSL runners (wsl-1); a Mac's Linux VM is air-1-vm (see linux-vm). ramdisk, postgres, linux-vm, tailscale and ssh are Mac-only; slots is for the PC (win-N, wsl-N). linux-vm is air-1-vm style: `runner linux-vm air-1 on`.
+HOST is a Mac (air-1), a Windows PC (win-1) or a Linux box such as the PC's WSL runners (wsl-1); a Mac's Linux VM is air-1-vm (see linux-vm). postgres, linux-vm, tailscale and ssh are Mac-only (ramdisk also works on wsl-N); slots is for the PC (win-N, wsl-N). linux-vm is air-1-vm style: `runner linux-vm air-1 on`.
 MACS_REF=<branch> runs a Mac action from that branch of this repo. `runner ssh HOST sudo macrunner help` lists what runs on the Mac.
 EOF
 }
@@ -399,8 +399,15 @@ case $cmd in
   update) [ $# -eq 1 ] || die "update HOST"; admin "$1" update-macrunner ;;
   battery) [ $# -eq 2 ] || die "battery HOST pause|run"; admin "$1" "battery-$2" ;;
   ramdisk) [ $# -ge 2 ] || die "ramdisk HOST on [GB]|off"
-    mac_only "$1" ramdisk
-    case $2 in on) admin "$1" ramdisk-on "size=${3:-4}" ;; off) admin "$1" ramdisk-off ;; *) die "ramdisk HOST on [GB]|off" ;; esac ;;
+    is_win "$1" && die "ramdisk is for Macs and the PC's WSL runners (wsl-N); $1 is a native Windows runner"
+    [[ "$1" == *-vm ]] && die "ramdisk is for Macs and the PC's WSL runners (wsl-N); $1 is a Mac's Linux VM"
+    case $2 in
+      on) [ $# -le 3 ] || die "ramdisk HOST on [GB]|off"
+          [[ "${3:-4}" =~ ^[0-9]{1,4}$ ]] || die "GB is a whole number (up to 4 digits)"
+          if is_wsl "$1"; then admin "$1" ramdisk-on ${3:+"slots=$3"}; else admin "$1" ramdisk-on "size=${3:-4}"; fi ;;   # the Linux workflow is at GitHub's 10-input limit: it reuses `slots`
+      off) [ $# -eq 2 ] || die "ramdisk HOST off takes no size"; admin "$1" ramdisk-off ;;
+      *) die "ramdisk HOST on [GB]|off" ;;
+    esac ;;
   linux-vm) [ $# -ge 2 ] || die "linux-vm HOST on [--cpus N] [--memory GB] [--disk GB] [--no-admin] | off | status"
     mac_only "$1" linux-vm; h=$1; sub=$2; shift 2
     case $sub in

@@ -32,8 +32,35 @@ an older one. On a PC set slots from Windows (`runner slots win-1 3`); `runner s
 `install-docker` installs Docker Engine from Docker's apt repo (x86-64 only, so the PC's WSL and never a Mac VM), enables `docker.service`
 and adds the CI runners' users to the `docker` group; see "Docker" in [windows.md](windows.md).
 
+## RAM workspace (`ramdisk`)
+
+`linuxrunner ramdisk on [MB]` (`runner ramdisk wsl-1 on [GB]` from the control PC) mounts a tmpfs on every CI runner's work
+folder (`.runner`'s `workFolder`, normally `_work`), so checkouts and test temp files live in RAM and never fill the disk.
+`ramdisk off` puts it back. Details:
+
+- The size is a **cap**, not a reservation: RAM is used only for what jobs write, and a full workspace fails the job (ENOSPC)
+  instead of letting it eat the distro's memory. The default is half of one runner's share of RAM (RAM / slots, or / the number of
+  CI runners); `on` warns when the caps add up to more than the distro has. The distro's RAM ceiling is whatever WSL gives it
+  (`.wslconfig`, which this tool never touches), so size to `free -m` inside the distro. With slots on, tmpfs pages count against
+  the runner service's `MemoryMax`. The mount is `nosuid,nodev`, so jobs that `mknod` (debootstrap) fail there.
+- **Emptied after every job, checked before the next.** The job-completed hook deletes everything under the work folder,
+  toolchain and action caches included (`_tool`, `_actions`), and empties the runner's own `_temp` folders; the job-started hook
+  cleans anything a crash left. Files a Docker action created as root are removed by the root `slot-sync` loop (the follower
+  service runs it every 2 s, slots on or off) while the started hook waits; a job fails, with the reason in its log, only if that
+  does not happen within 90 s (a Linux box without the follower service). Toolchains are therefore downloaded again by each job.
+- **No fstab entry.** Each runner's unit runs `linuxrunner ramdisk-mount` as root (`ExecStartPre=+`) on every start, which mounts
+  the tmpfs and empties it, so a boot or a crash also starts clean. A work folder that is a symlink, sits under one or has `..` in its path is refused, so a job cannot
+  redirect the mount. `add-runner` mounts a new runner before its service starts; `remove-runner` unmounts it. A CI runner
+  adopted some other way after `on` is picked up by the next `ramdisk on`, `slots` or `limit`.
+- It never interrupts a job: idle runners are stopped at once (after a second look), busy ones are waited for (up to 15 minutes,
+  inside the Admin workflow's 20-minute limit; a queue that never lets a runner go idle starves it, and then nothing is changed).
+  Runners that were stopped (CI off) stay stopped. A failed or cancelled change restarts what it stopped and is safe to run again;
+  the setting is recorded only once every runner has it. Commands that change runners hold a lock, so two never run at once.
+- Not covered: Docker images and build caches (they live in Docker's own storage, not the work folder) and native Windows runners
+  (`win-ci`).
+
 Not covered: `reregister`/`remove` (the adopted runners keep their registration), `rotate-token`
-(no token or App key is stored), `battery`, `ramdisk`, `postgres`, `tailscale`, `ssh`. The dashboard still only lists the PC's
+(no token or App key is stored), `battery`, `postgres`, `tailscale`, `ssh`. The dashboard still only lists the PC's
 runners; per-host controls for `wsl-N` are a follow-up.
 
 WSL rules: never `wsl --shutdown` (it stops every runner) and never change `.wslconfig`.

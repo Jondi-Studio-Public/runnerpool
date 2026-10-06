@@ -27,6 +27,8 @@ on:
           - cores
           - limit
           - slots
+          - ramdisk-on
+          - ramdisk-off
           - install-postgres
         default: status
       token:
@@ -48,7 +50,7 @@ on:
         description: limit action only, MB or default
         required: false
       slots:
-        description: "slots action only: N, N:THREADS (CPU threads per job, default 8) or off. N CI jobs may run at once"
+        description: "slots action: N, N:THREADS (CPU threads per job, default 8) or off, N CI jobs at once. ramdisk-on: GB per runner for the RAM workspace (a cap; empty = half a runner's share of RAM)"
         required: false
       request:
         description: Id the control PC uses to find this run
@@ -109,6 +111,11 @@ jobs:
               [ -n "${SLOTS:-}" ] || { echo 'slots needs a number or off'; exit 1; }
               th=''; case "$SLOTS" in *:*) th=${SLOTS#*:} ;; esac
               "$lr" slots "${SLOTS%%:*}" ${th:+"$th"} ;;
+            ramdisk-on)
+              # no size: linuxrunner picks half of one runner's share of the distro's RAM
+              case "${SLOTS:-}" in *[!0-9]*|?????*) echo 'size is a whole number of GB (up to 4 digits)'; exit 1 ;; esac
+              "$lr" ramdisk on ${SLOTS:+"$(( 10#$SLOTS * 1024 ))"} ;;
+            ramdisk-off) "$lr" ramdisk off ;;
             install-postgres)
               # The Postgres 16 binaries an integration job starts its own cluster from;
               # the same step linux/linux-provision.sh runs on a fresh distro.
