@@ -19,6 +19,7 @@ SLOTS_FILE=$HOME_DIR/slots           # `slots=N` / `threads=T` lines: the PC's j
 SLOT_DIR_FILE=$HOME_DIR/slot-dir     # where the slot locks live (the follower points it at the Windows side)
 FOLLOW_LAST=$HOME_DIR/follow-last    # the Windows state the follower last applied
 FOLLOW_UNIT=win-runners-follow.service
+RAMDISK_FILE=$HOME_DIR/ramdisk      # `ramdisk on` writes the size in MB here; add-runner reads it for new runners
 CI_USER=${CI_USER:-runner}           # who adopted and new CI runners run as
 UNIT_GLOB='actions.runner.*.service'
 
@@ -48,6 +49,7 @@ cmd_status() {
   echo "host: $(host)  ($(. /etc/os-release && echo "$PRETTY_NAME"), $(nproc) cores, $(free -m | awk '/Mem:/{print $2}') MB RAM)"
   [ -f "$CI_OFF" ] && echo "CI: off (linuxrunner ci on to resume)" || echo "CI: on"
   [ -f "$CORES_FILE" ] && echo "max cores: $(cat "$CORES_FILE")" || echo "max cores: all"
+  [ -s "$RAMDISK_FILE" ] && echo "RAM workspace: on ($(cat "$RAMDISK_FILE") MB per runner)" || echo "RAM workspace: off"
   if [ -n "$(slots_n)" ]; then
     echo "slots: $(held_slots | wc -l) of $(slots_n) in use on the PC ($(slots_threads) threads each)"
     for u in $(held_slots); do echo "  $(basename "$u"): $(owner_field "$u" runner) ($(owner_field "$u" side))"; done
@@ -169,11 +171,24 @@ cpu_block() {  # NUM THREADS TOTAL -> a CPU list such as 8-15, or nothing when t
   if [ "$end" -lt "$total" ]; then echo "$start-$end"; else echo "$start-$((total - 1)),0-$((end - total))"; fi
 }
 
+# Empties the RAM workspace when a job ends (set by `ramdisk on`; GIT_RUNNER_WORK is the runner's _work folder): the
+# checkout and everything the job wrote next to it, and the job's own temp files. `_tool` and `_actions` stay (toolchain
+# and action caches the next job reuses; they go when the distro stops), as do the runner's own underscore files.
+wipe_work() {  # WORKDIR
+  local w=${1:-}
+  case $w in */_work) ;; *) return 0 ;; esac
+  [ -d "$w" ] || return 0
+  find "$w" -mindepth 1 -maxdepth 1 ! -name '_*' -exec rm -rf {} + 2>/dev/null || true
+  [ ! -d "$w/_temp" ] || find "$w/_temp" -mindepth 1 -maxdepth 1 ! -name '_*' -exec rm -rf {} + 2>/dev/null || true
+  return 0
+}
+
 # The hook the runner runs when a job starts (acquire) or ends (release); never fails the job. It runs
 # as the runner's own user, so it only needs to read the files above.
 cmd_hook() {  # acquire|release
   local action=${1:-} name=${GIT_RUNNER_NAME:-${RUNNER_NAME:-}} dir n t i d cpus last=0
   [ -n "$name" ] || { log "slot hook: no runner name, skipped"; return 0; }
+  [ "$action" != release ] || wipe_work "${GIT_RUNNER_WORK:-}"
   dir=$(slot_dir); n=$(slots_n); t=$(slots_threads)
   [ -n "$n" ] || return 0
   for d in "$dir"/slot-*; do  # a runner runs one job at a time, so any slot it still holds is left over
@@ -229,9 +244,19 @@ cmd_slot_sync() {
   : "$dir"
 }
 
+write_hook_scripts() {
+  local hook
+  mkdir -p "$HOME_DIR"
+  for hook in start:acquire done:release; do
+    printf '#!/bin/sh\n# Job hook (linuxrunner hook %s): waits for a PC job slot / gives it back, and empties the RAM workspace. Never fails the job.\n%s/linuxrunner hook %s || true\nexit 0\n' \
+      "${hook#*:}" "$HOME_DIR" "${hook#*:}" > "$HOME_DIR/slot-${hook%%:*}.sh"
+    chmod 755 "$HOME_DIR/slot-${hook%%:*}.sh"
+  done
+}
+
 cmd_slots() {  # N [THREADS] | off
   need_root
-  local v=${1:-} t=${2:-} total u hook
+  local v=${1:-} t=${2:-} total u
   total=$(nproc)
   if [ "$v" = off ]; then
     rm -f "$SLOTS_FILE"
@@ -241,11 +266,7 @@ cmd_slots() {  # N [THREADS] | off
     [[ "$t" =~ ^[0-9]+$ ]] && [ "$t" -ge 1 ] && [ "$t" -le "$total" ] || die "threads is 1 to $total"
     mkdir -p "$HOME_DIR"
     printf 'slots=%s\nthreads=%s\n' "$v" "$t" > "$SLOTS_FILE"; chmod 644 "$SLOTS_FILE"
-    for hook in start:acquire done:release; do
-      printf '#!/bin/sh\n# Job slot hook (linuxrunner hook %s): waits for a PC job slot / gives it back. Never fails the job.\n%s/linuxrunner hook %s || true\nexit 0\n' \
-        "${hook#*:}" "$HOME_DIR" "${hook#*:}" > "$HOME_DIR/slot-${hook%%:*}.sh"
-      chmod 755 "$HOME_DIR/slot-${hook%%:*}.sh"
-    done
+    write_hook_scripts
     mkdir -p "$(slot_dir)"; chmod 777 "$(slot_dir)" 2>/dev/null || true
   fi
   for u in $(ci_units); do apply_limits "$u"; done
@@ -268,13 +289,14 @@ apply_limits() {  # UNIT
     quota=$((threads * 100))
   fi
   ram=$(runner_limit "$name" ram)
-  touch "$d/.env"; sed -i '/^CI_MAX_CORES=/d;/^CI_MAX_RAM_MB=/d;/^GIT_RUNNER_NAME=/d' "$d/.env"
+  touch "$d/.env"; sed -i '/^CI_MAX_CORES=/d;/^CI_MAX_RAM_MB=/d;/^GIT_RUNNER_NAME=/d;/^GIT_RUNNER_WORK=/d' "$d/.env"
   # Only the slot hooks this tool wrote: another tool's hooks (the Mac's Linux VM sets its own) stay.
   sed -i "\\|^ACTIONS_RUNNER_HOOK_JOB_STARTED=$HOME_DIR/slot-start.sh\$|d;\\|^ACTIONS_RUNNER_HOOK_JOB_COMPLETED=$HOME_DIR/slot-done.sh\$|d" "$d/.env"
   [ -z "$cores" ] || echo "CI_MAX_CORES=$cores" >> "$d/.env"
   [ -z "$ram" ] || echo "CI_MAX_RAM_MB=$ram" >> "$d/.env"
-  if [ -n "$slots" ]; then
+  if [ -n "$slots" ] || [ -s "$RAMDISK_FILE" ]; then   # the hooks also wipe the RAM workspace after each job
     { echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=$HOME_DIR/slot-start.sh"; echo "ACTIONS_RUNNER_HOOK_JOB_COMPLETED=$HOME_DIR/slot-done.sh"; echo "GIT_RUNNER_NAME=$name"; } >> "$d/.env"
+    [ ! -s "$RAMDISK_FILE" ] || echo "GIT_RUNNER_WORK=$d/_work" >> "$d/.env"
   fi
   dropin=$SYSTEMD_DIR/$u.d/limits.conf
   if [ -n "$ram" ] || [ -n "$quota" ]; then
@@ -352,7 +374,79 @@ cmd_add_runner() {  # REPO|ORG NAME LABELS TOKEN [ci|root]
     --name "$name" --labels "$labels" --work _work >/dev/null
   ( cd "$dir" && RUNNER_ALLOW_RUNASROOT=1 ./svc.sh install "$user" >/dev/null && ./svc.sh start >/dev/null )
   log "added $name ($url, labels $labels)"
+  [ "$as" = root ] || [ ! -s "$RAMDISK_FILE" ] || ramdisk_apply_unit "$(unit_for "$name")" "$(cat "$RAMDISK_FILE")"   # RAM workspace is on here
   [[ ",$labels," != *,docker,* ]] || command -v docker >/dev/null || cmd_install_docker   # the label promises Docker
+}
+
+# --- RAM workspace --------------------------------------------------------------------------
+# `ramdisk on [MB]` mounts a tmpfs on every CI runner's _work folder (checkouts, _temp, _tool, _actions), so a job
+# leaves nothing on the disk and the workspace is gone when the distro stops. Persisted in fstab (WSL2 mounts it
+# at boot) plus a RequiresMountsFor drop-in so the runner service starts after the mount. The size is a CAP, not a
+# reservation: tmpfs only uses RAM for what is written, and a full workspace fails the job (ENOSPC) instead of
+# letting it eat the distro's memory. With slots on, tmpfs pages count against the runner service's MemoryMax.
+ramdisk_unit_path() { echo "$(unit_dir "$1")/_work"; }
+fstab_drop() {  # PATH: remove this tool's line for PATH from fstab
+  local f=$ETC_DIR/fstab
+  [ -f "$f" ] || return 0
+  grep -vF -- "tmpfs $1 tmpfs " "$f" > "$f.new" || true
+  cat "$f.new" > "$f"; rm -f "$f.new"
+}
+ramdisk_apply_unit() {  # UNIT SIZE_MB
+  local u=$1 mb=$2 d w uid gid dropin was
+  d=$(unit_dir "$u"); w=$(ramdisk_unit_path "$u")
+  was=$(state "$u")
+  [ "$was" != active ] || systemctl stop "$u"
+  mkdir -p "$w"
+  uid=$(stat -c %u "$d"); gid=$(stat -c %g "$d")
+  # Mounting over a full folder only hides it: delete what is on the disk so the space really comes back.
+  mountpoint -q "$w" || find "$w" -mindepth 1 -delete
+  fstab_drop "$w"
+  mkdir -p "$ETC_DIR"
+  printf 'tmpfs %s tmpfs size=%sm,mode=0755,uid=%s,gid=%s,nosuid,nodev 0 0
+' "$w" "$mb" "$uid" "$gid" >> "$ETC_DIR/fstab"
+  dropin=$SYSTEMD_DIR/$u.d/ramdisk.conf
+  mkdir -p "$(dirname "$dropin")"
+  printf '[Unit]
+RequiresMountsFor=%s
+' "$w" > "$dropin"
+  systemctl daemon-reload || log "daemon-reload failed: the mount ordering for $(unit_name "$u") applies after the next reload"
+  if mountpoint -q "$w"; then mount -o "remount,size=${mb}m" "$w"; else mount "$w"; fi
+  if [ "$was" = active ] && [ ! -f "$CI_OFF" ]; then systemctl start "$u"; fi
+  log "$(unit_name "$u"): workspace $w on a ${mb} MB RAM disk"
+}
+ramdisk_remove_unit() {  # UNIT
+  local u=$1 w was
+  w=$(ramdisk_unit_path "$u"); was=$(state "$u")
+  [ "$was" != active ] || systemctl stop "$u"
+  if mountpoint -q "$w"; then umount "$w"; fi
+  fstab_drop "$w"
+  rm -f "$SYSTEMD_DIR/$u.d/ramdisk.conf"; rmdir "$SYSTEMD_DIR/$u.d" 2>/dev/null || true
+  systemctl daemon-reload || true
+  if [ "$was" = active ] && [ ! -f "$CI_OFF" ]; then systemctl start "$u"; fi
+  log "$(unit_name "$u"): workspace back on the disk"
+}
+cmd_ramdisk() {  # on [MB] | off
+  need_root
+  local v=${1:-} mb=${2:-} mem_mb n u
+  mem_mb=$(free -m | awk '/Mem:/{print $2}')
+  for u in $(ci_units); do ! is_busy "$u" || die "$(unit_name "$u") is running a job: try again when it is idle"; done
+  case $v in
+    on)
+      if [ -z "$mb" ]; then   # half of one runner's share of RAM: the rest is for the job's own processes
+        n=$(slots_n); [ -n "$n" ] || n=$(ci_units | wc -l); [ "$n" -ge 1 ] || n=1
+        mb=$((mem_mb / n / 2)); [ "$mb" -ge 512 ] || mb=512
+      fi
+      [[ "$mb" =~ ^[0-9]+$ ]] && [ "$mb" -ge 256 ] && [ "$mb" -le "$mem_mb" ] || die "ramdisk on [MB]: 256 to $mem_mb"
+      mkdir -p "$HOME_DIR"; echo "$mb" > "$RAMDISK_FILE"
+      write_hook_scripts
+      for u in $(ci_units); do ramdisk_apply_unit "$u" "$mb"; apply_limits "$u"; done
+      log "RAM workspace on: $mb MB per runner, a cap (RAM is used only for what jobs write; it is freed when the distro stops)" ;;
+    off)
+      rm -f "$RAMDISK_FILE"
+      for u in $(ci_units); do ramdisk_remove_unit "$u"; apply_limits "$u"; done
+      log "RAM workspace off" ;;
+    *) die "ramdisk on [MB] | off" ;;
+  esac
 }
 
 # Docker's work runs in its own cgroups, outside the runner services' drop-ins, so a job's `docker build` would escape the
@@ -494,6 +588,8 @@ linuxrunner: manage GitHub Actions runners on a systemd Linux box (adopts existi
   restart [NAME]                     restart idle CI runners (busy ones are skipped)
   ci on|off                          CI runners take jobs / finish their job and stay stopped
   cores N|all                        CI jobs may use N cores (CI_MAX_CORES)
+  ramdisk on [MB] | off              each CI runner's _work folder on a RAM disk (tmpfs, size is a cap; default half a runner's
+                                     share of RAM). Gone when the distro stops; refuses while a job runs
   limit NAME cores=<N|default> ram=<MB|default>
                                      one runner's own limits (CI_MAX_CORES, CI_MAX_RAM_MB, systemd MemoryMax);
                                      they win over `cores`; default = back to the device-wide setting
@@ -522,6 +618,7 @@ case $cmd in
   ci) cmd_ci "$@" ;;
   cores) cmd_cores "$@" ;;
   limit) cmd_limit "$@" ;;
+  ramdisk) cmd_ramdisk "$@" ;;
   add-runner) [ $# -ge 4 ] || die "add-runner REPO|ORG NAME LABELS TOKEN [ci|root]"; cmd_add_runner "$@" ;;
   remove-runner) [ $# -ge 1 ] || die "remove-runner NAME [TOKEN|-]"; cmd_remove_runner "$@" ;;
   install-docker) cmd_install_docker ;;

@@ -1,0 +1,185 @@
+"""linuxrunner's `ramdisk` command (a tmpfs on each CI runner's _work), against stubbed systemd and mount tools."""
+
+import os
+import subprocess
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+LINUXRUNNER = ROOT / "linux" / "linuxrunner"
+STUBS = {
+    "id": '#!/bin/sh\n[ "$1" = -u ] && echo 0 || /usr/bin/id "$@"\n',
+    "free": "#!/bin/sh\nprintf '              total\\nMem:          16000\\n'\n",
+    "pgrep": '#!/bin/sh\n[ -e "$STUB_BUSY" ]\n',
+    "systemctl": """#!/bin/sh
+echo "$@" >> "$STUB_LOG"
+case "$1" in
+  list-units) echo "actions.runner.o-r.ci-1.service loaded active running x"; echo "actions.runner.o-r.ci-2.service loaded active running x"; echo "actions.runner.o-r.wsl-1-admin.service loaded active running x" ;;
+  show) case "$5" in *ci-1*) echo "$STUB_DIR/ci-1" ;; *ci-2*) echo "$STUB_DIR/ci-2" ;; *) echo "$STUB_DIR/admin" ;; esac ;;
+  is-active) echo active ;;
+esac
+exit 0
+""",
+    # mount, umount and mountpoint keep their state in a file, so nothing is ever really mounted
+    "mount": '#!/bin/sh\necho "mount $*" >> "$STUB_MOUNTLOG"\nfor a; do p=$a; done\ngrep -qxF "$p" "$STUB_MOUNTS" 2>/dev/null || echo "$p" >> "$STUB_MOUNTS"\n',
+    "umount": '#!/bin/sh\necho "umount $*" >> "$STUB_MOUNTLOG"\ngrep -vxF "$1" "$STUB_MOUNTS" > "$STUB_MOUNTS.new"; mv "$STUB_MOUNTS.new" "$STUB_MOUNTS"\n',
+    "mountpoint": '#!/bin/sh\ngrep -qxF "$2" "$STUB_MOUNTS" 2>/dev/null\n',
+}
+
+
+def setup(tmp_path):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name, body in STUBS.items():
+        (bindir / name).write_text(body)
+        (bindir / name).chmod(0o755)
+    home, units, etc = tmp_path / "home", tmp_path / "systemd", tmp_path / "etc"
+    for d in ("ci-1", "ci-2", "admin"):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / ".runner").write_text('{"gitHubUrl": "https://github.com/o/r"}')
+    home.mkdir()
+    etc.mkdir()
+    (etc / "fstab").write_text("LABEL=cloudimg-rootfs / ext4 defaults 0 1\n")
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "GIT_RUNNER_HOME": str(home),
+        "SYSTEMD_DIR": str(units),
+        "ETC_DIR": str(etc),
+        "STUB_DIR": str(tmp_path),
+        "STUB_LOG": str(tmp_path / "systemctl.log"),
+        "STUB_BUSY": str(tmp_path / "busy"),
+        "STUB_MOUNTS": str(tmp_path / "mounts"),
+        "STUB_MOUNTLOG": str(tmp_path / "mount.log"),
+    }
+    return env, home, units, etc
+
+
+def run(env, *args):
+    return subprocess.run(
+        ["bash", str(LINUXRUNNER), *args], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20
+    )
+
+
+def tmpfs_lines(etc):
+    return [ln for ln in (etc / "fstab").read_text().splitlines() if ln.startswith("tmpfs ")]
+
+
+def test_on_writes_fstab_dropin_and_mounts_every_ci_runner_but_not_the_admin(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    r = run(env, "ramdisk", "on", "2048")
+    assert r.returncode == 0, r.stderr
+    assert (home / "ramdisk").read_text().strip() == "2048"
+    lines = tmpfs_lines(etc)
+    assert len(lines) == 2
+    assert lines[0].startswith(f"tmpfs {tmp_path}/ci-1/_work tmpfs size=2048m,mode=0755,uid=")
+    assert "nosuid,nodev" in lines[0] and "noexec" not in lines[0]  # jobs run binaries from the workspace
+    assert "LABEL=cloudimg-rootfs / ext4 defaults 0 1" in (etc / "fstab").read_text()  # other lines are kept
+    unit = "actions.runner.o-r.ci-1.service"
+    assert (units / f"{unit}.d/ramdisk.conf").read_text() == f"[Unit]\nRequiresMountsFor={tmp_path}/ci-1/_work\n"
+    assert not (units / "actions.runner.o-r.wsl-1-admin.service.d").exists()
+    assert not (tmp_path / "admin/_work").exists()
+    assert set((tmp_path / "mounts").read_text().split()) == {f"{tmp_path}/ci-1/_work", f"{tmp_path}/ci-2/_work"}
+
+
+def test_on_deletes_what_was_on_the_disk_before_mounting(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    old = tmp_path / "ci-1/_work/repo/repo"
+    old.mkdir(parents=True)
+    (old / "big.bin").write_text("x")
+    assert run(env, "ramdisk", "on", "1024").returncode == 0
+    assert list((tmp_path / "ci-1/_work").iterdir()) == []
+
+
+def test_default_size_is_half_a_runners_share_of_ram(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    assert run(env, "ramdisk", "on").returncode == 0
+    assert "size=4000m" in tmpfs_lines(etc)[0]  # 16000 MB / 2 runners / 2
+    run(env, "slots", "4", "2")
+    run(env, "ramdisk", "on")
+    assert "size=2000m" in tmpfs_lines(etc)[0]  # slots on: 16000 / 4 slots / 2
+
+
+def test_on_twice_is_idempotent_and_resizes(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    run(env, "ramdisk", "on", "1024")
+    assert run(env, "ramdisk", "on", "3072").returncode == 0
+    lines = tmpfs_lines(etc)
+    assert len(lines) == 2 and all("size=3072m" in ln for ln in lines)
+    assert "remount,size=3072m" in (tmp_path / "mount.log").read_text()
+
+
+def test_busy_runner_refuses_and_changes_nothing(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    (tmp_path / "busy").write_text("")
+    r = run(env, "ramdisk", "on", "1024")
+    assert r.returncode != 0 and "running a job" in r.stderr
+    assert tmpfs_lines(etc) == [] and not (home / "ramdisk").exists()
+
+
+def test_bad_sizes_are_refused(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    for bad in ("10", "99999", "lots"):
+        assert run(env, "ramdisk", "on", bad).returncode != 0
+    assert run(env, "ramdisk", "sideways").returncode != 0
+    assert tmpfs_lines(etc) == []
+
+
+def test_off_unmounts_and_removes_everything(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    run(env, "ramdisk", "on", "1024")
+    r = run(env, "ramdisk", "off")
+    assert r.returncode == 0, r.stderr
+    assert tmpfs_lines(etc) == [] and not (home / "ramdisk").exists()
+    assert (etc / "fstab").read_text() == "LABEL=cloudimg-rootfs / ext4 defaults 0 1\n"
+    assert not list(units.glob("*/ramdisk.conf"))
+    assert (tmp_path / "mounts").read_text() == ""
+
+
+def test_status_says_whether_the_ram_workspace_is_on(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    assert "RAM workspace: off" in run(env, "status").stdout
+    run(env, "ramdisk", "on", "1024")
+    assert "RAM workspace: on (1024 MB per runner)" in run(env, "status").stdout
+
+
+def test_on_wires_the_job_hooks_even_with_slots_off(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    run(env, "ramdisk", "on", "1024")
+    e = (tmp_path / "ci-1/.env").read_text().split("\n")
+    assert f"ACTIONS_RUNNER_HOOK_JOB_COMPLETED={home}/slot-done.sh" in e
+    assert f"GIT_RUNNER_WORK={tmp_path}/ci-1/_work" in e
+    assert "hook release" in (home / "slot-done.sh").read_text()
+    assert not (tmp_path / "admin/.env").exists()
+    run(env, "ramdisk", "off")
+    assert not any(
+        ln.startswith(("GIT_RUNNER_WORK=", "ACTIONS_RUNNER_HOOK"))
+        for ln in (tmp_path / "ci-1/.env").read_text().split("\n")
+    )
+
+
+def test_release_hook_empties_the_workspace_but_keeps_tool_caches(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    work = tmp_path / "ci-1/_work"
+    for d in ("repo/repo", "scratch", "_tool/node", "_actions/checkout", "_temp/pytest-1"):
+        (work / d).mkdir(parents=True)
+        (work / d / "f").write_text("x")
+    (work / "_temp/_runner_file_commands").mkdir()
+    hook_env = {**env, "GIT_RUNNER_NAME": "ci-1", "GIT_RUNNER_WORK": str(work)}
+    r = subprocess.run(
+        ["bash", str(LINUXRUNNER), "hook", "release"], env=hook_env, capture_output=True, text=True, timeout=20
+    )
+    assert r.returncode == 0, r.stderr
+    assert sorted(p.name for p in work.iterdir()) == ["_actions", "_temp", "_tool"]
+    assert [p.name for p in (work / "_temp").iterdir()] == ["_runner_file_commands"]
+
+
+def test_release_hook_ignores_a_work_path_that_is_not_a_work_folder(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    keep = tmp_path / "precious"
+    keep.mkdir()
+    (keep / "f").write_text("x")
+    hook_env = {**env, "GIT_RUNNER_NAME": "ci-1", "GIT_RUNNER_WORK": str(keep)}
+    subprocess.run(
+        ["bash", str(LINUXRUNNER), "hook", "release"], env=hook_env, capture_output=True, text=True, timeout=20
+    )
+    assert (keep / "f").exists()

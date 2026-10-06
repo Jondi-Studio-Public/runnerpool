@@ -32,8 +32,23 @@ an older one. On a PC set slots from Windows (`runner slots win-1 3`); `runner s
 `install-docker` installs Docker Engine from Docker's apt repo (x86-64 only, so the PC's WSL and never a Mac VM), enables `docker.service`
 and adds the CI runners' users to the `docker` group; see "Docker" in [windows.md](windows.md).
 
+## RAM workspace (`ramdisk`)
+
+`linuxrunner ramdisk on [MB]` (`runner ramdisk wsl-1 on [GB]` from the control PC) mounts a tmpfs on every CI runner's `_work`
+folder, so checkouts and test temp files live in RAM and never fill the disk. `ramdisk off` puts it back. Details:
+
+- The size is a **cap**, not a reservation: RAM is used only for what jobs write, and a full workspace fails the job (ENOSPC)
+  instead of letting it eat the distro's memory. The default is half of one runner's share of RAM (RAM / slots, or / the number of
+  CI runners). The distro's RAM ceiling is whatever WSL gives it (`.wslconfig`, which this tool never touches), so size to `free -m`
+  inside the distro. With slots on, tmpfs pages count against the runner service's `MemoryMax`.
+- **Emptied after every job.** `ramdisk on` wires the runners' job-completed hook, which deletes the checkout and the job's temp
+  files. The `_tool` and `_actions` caches stay (the next job reuses them) until the distro stops, which empties everything.
+- Persistent: an `/etc/fstab` line per runner (WSL2 mounts it at boot) and a `RequiresMountsFor` drop-in so the runner starts after the
+  mount. `add-runner` mounts new runners too. It refuses while a job is running, and it deletes what is on the disk under `_work` first.
+- Not covered: Docker images and build caches (they live in Docker's own storage, not `_work`) and native Windows runners (`win-ci`).
+
 Not covered: `reregister`/`remove` (the adopted runners keep their registration), `rotate-token`
-(no token or App key is stored), `battery`, `ramdisk`, `postgres`, `tailscale`, `ssh`. The dashboard still only lists the PC's
+(no token or App key is stored), `battery`, `postgres`, `tailscale`, `ssh`. The dashboard still only lists the PC's
 runners; per-host controls for `wsl-N` are a follow-up.
 
 WSL rules: never `wsl --shutdown` (it stops every runner) and never change `.wslconfig`.

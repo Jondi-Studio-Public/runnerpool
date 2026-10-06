@@ -63,7 +63,7 @@ Then, from the control PC:
 .\runner.cmd update win-1      # push a new winrunner.ps1
 ```
 
-`ramdisk`, `postgres`, `tailscale` and `ssh` are Mac-only (see below).
+`postgres`, `tailscale` and `ssh` are Mac-only (see below). `ramdisk` works for the WSL runners (see [linux.md](linux.md)), not the native Windows ones.
 
 ## Linux runners on the same PC (WSL)
 
