@@ -236,6 +236,21 @@ def test_reconcile_reads_a_failed_run_whose_stored_jobs_are_only_a_subset(env):
     assert sorted(j["id"] for j in store.jobs(run_id=4)) == [41, 42]
 
 
+def test_failed_runs_from_the_store_are_limited_per_conclusion_not_together(env):
+    wd, gh, sink, clock, store = env
+
+    def run(i, conclusion):
+        return {
+            "id": i, "name": "CI", "status": "completed", "conclusion": conclusion, "run_attempt": 1,
+            "created_at": iso(clock.t - 600), "updated_at": iso(clock.t - 60 + i % 50),
+        }  # fmt: skip
+
+    runs = [run(i, "failure") for i in range(1, 106)] + [run(i, "cancelled") for i in range(200, 205)]
+    store.upsert_many(REPO, runs, [])
+    store.mark_reconciled()
+    assert len(wd.failed_runs(REPO)) == 100 + 5
+
+
 def test_reconcile_stores_live_and_latest_runs_with_jobs(env):
     wd, gh, sink, clock, store = env
     gh.runs[(REPO, "queued")] = [

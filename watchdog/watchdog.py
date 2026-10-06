@@ -682,7 +682,9 @@ class Watchdog:
         """Failed and cancelled runs of one repo, newest first: from the store when it is trusted."""
         if self.store_ready():
             try:
-                return self.store.runs_by_conclusion(repo, ("failure", "cancelled"))
+                return [
+                    r for c in ("failure", "cancelled") for r in self.store.runs_by_conclusion(repo, (c,))
+                ]  # up to 100 of each, like polling
             except sqlite3.Error as e:
                 log(f"store read failed ({type(e).__name__}); polling")
         return [r for c in ("failure", "cancelled") for r in self.runs(repo, status=c)]
