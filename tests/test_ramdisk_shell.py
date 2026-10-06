@@ -203,7 +203,13 @@ def test_release_hook_empties_the_workspace_but_keeps_tool_caches(tmp_path):
         (work / d).mkdir(parents=True)
         (work / d / "f").write_text("x")
     (work / "_temp/_runner_file_commands").mkdir()
-    for d in ("_scratch", "_PipelineMapping", "_temp/_leftover"):
+    for d in (
+        "_scratch",
+        "_PipelineMapping",
+        "_temp/_leftover",
+        "_temp/_github_home/.config",
+        "_temp/_github_workflow",
+    ):
         (work / d).mkdir(parents=True, exist_ok=True)
     hook_env = {**env, "GIT_RUNNER_NAME": "ci-1", "GIT_RUNNER_WORK": str(work)}
     r = subprocess.run(
@@ -211,7 +217,8 @@ def test_release_hook_empties_the_workspace_but_keeps_tool_caches(tmp_path):
     )
     assert r.returncode == 0, r.stderr
     assert sorted(p.name for p in work.iterdir()) == ["_PipelineMapping", "_actions", "_temp", "_tool"]
-    assert [p.name for p in (work / "_temp").iterdir()] == ["_runner_file_commands"]
+    # the Docker-action home (/github/home) is job data: a credential left there must not reach the next job
+    assert sorted(p.name for p in (work / "_temp").iterdir()) == ["_github_workflow", "_runner_file_commands"]
 
 
 def test_release_hook_ignores_a_work_path_that_is_not_a_work_folder(tmp_path):

@@ -181,7 +181,7 @@ wipe_work() {  # WORKDIR
   case $w in */_work) ;; *) return 0 ;; esac
   [ -d "$w" ] || return 0
   find "$w" -mindepth 1 -maxdepth 1 ! -name _tool ! -name _actions ! -name _temp ! -name _PipelineMapping -exec rm -rf {} + 2>/dev/null || true
-  [ ! -d "$w/_temp" ] || find "$w/_temp" -mindepth 1 -maxdepth 1 ! -name _runner_file_commands ! -name _github_workflow ! -name _github_home -exec rm -rf {} + 2>/dev/null || true
+  [ ! -d "$w/_temp" ] || find "$w/_temp" -mindepth 1 -maxdepth 1 ! -name _runner_file_commands ! -name _github_workflow -exec rm -rf {} + 2>/dev/null || true
   return 0
 }
 
