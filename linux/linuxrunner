@@ -374,7 +374,7 @@ cmd_add_runner() {  # REPO|ORG NAME LABELS TOKEN [ci|root]
     --name "$name" --labels "$labels" --work _work >/dev/null
   ( cd "$dir" && RUNNER_ALLOW_RUNASROOT=1 ./svc.sh install "$user" >/dev/null && ./svc.sh start >/dev/null )
   log "added $name ($url, labels $labels)"
-  [ "$as" = root ] || [ ! -s "$RAMDISK_FILE" ] || ramdisk_apply_unit "$(unit_for "$name")" "$(cat "$RAMDISK_FILE")"   # RAM workspace is on here
+  [ "$as" = root ] || [ ! -s "$RAMDISK_FILE" ] || { u=$(unit_for "$name"); ramdisk_apply_unit "$u" "$(cat "$RAMDISK_FILE")"; apply_limits "$u"; }   # RAM workspace is on here: mount it and wire the wipe hook
   [[ ",$labels," != *,docker,* ]] || command -v docker >/dev/null || cmd_install_docker   # the label promises Docker
 }
 

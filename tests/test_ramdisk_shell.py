@@ -183,3 +183,37 @@ def test_release_hook_ignores_a_work_path_that_is_not_a_work_folder(tmp_path):
         ["bash", str(LINUXRUNNER), "hook", "release"], env=hook_env, capture_output=True, text=True, timeout=20
     )
     assert (keep / "f").exists()
+
+
+def test_a_runner_added_while_ram_mode_is_on_is_mounted_and_gets_the_wipe_hook(tmp_path):
+    env, home, units, etc = setup(tmp_path)
+    run(env, "ramdisk", "on", "1024")
+    bindir = tmp_path / "bin"
+    stubs = {
+        "curl": '#!/bin/sh\ncase "$*" in *-w*) echo https://github.com/actions/runner/releases/tag/v2.9.9 ;; esac\n',
+        "tar": '#!/bin/sh\ncat > /dev/null\nwhile [ $# -gt 0 ]; do [ "$1" = -C ] && d=$2; shift; done\nprintf "#!/bin/sh\nexit 0\n" > "$d/svc.sh"; cp "$d/svc.sh" "$d/config.sh"; chmod +x "$d/svc.sh" "$d/config.sh"\n',
+        "sudo": '#!/bin/sh\n[ "$1" = -u ] && shift 2\nexec "$@"\n',
+        "useradd": "#!/bin/sh\nexit 0\n",
+        "chown": "#!/bin/sh\nexit 0\n",
+    }
+    for name, body in stubs.items():
+        (bindir / name).write_text(body)
+        (bindir / name).chmod(0o755)
+    # the new runner's unit shows up in systemd, with its folder under the tool's runners dir
+    (bindir / "systemctl").write_text(
+        (bindir / "systemctl")
+        .read_text()
+        .replace(
+            "list-units) echo",
+            'list-units) echo "actions.runner.o-r.new-1.service loaded active running x"; echo',
+        )
+        .replace('show) case "$5" in', 'show) case "$5" in *new-1*) echo "$STUB_HOME/runners/new-1" ;;')
+    )
+    env["STUB_HOME"] = str(home)
+    r = run(env, "add-runner", "o/r", "new-1", "linux-ci", "TOKEN")
+    assert r.returncode == 0, r.stderr
+    work = f"{home}/runners/new-1/_work"
+    assert f"tmpfs {work} tmpfs size=1024m" in (etc / "fstab").read_text()
+    e = (home / "runners/new-1/.env").read_text().split("\n")
+    assert f"GIT_RUNNER_WORK={work}" in e
+    assert f"ACTIONS_RUNNER_HOOK_JOB_COMPLETED={home}/slot-done.sh" in e
