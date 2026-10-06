@@ -53,7 +53,7 @@ folder (`.runner`'s `workFolder`, normally `_work`), so checkouts and test temp 
   a session its own), so the runners see the mounts. Each runner's unit runs `linuxrunner ramdisk-mount` as root (`ExecStartPre=+`) on every start, which mounts
   the tmpfs and empties it, so a boot or a crash also starts clean. A work folder that is a symlink, sits under one or has `..` in its path is refused, so a job cannot
   redirect the mount. `add-runner` mounts a new runner before its service starts; `remove-runner` unmounts it. A CI runner
-  adopted some other way after `on` is picked up by the next `ramdisk on`, `slots` or `limit`.
+  adopted some other way after `on` is picked up by the next `ramdisk on` (until then it has no RAM disk and no sweep).
 - It never interrupts a job: idle runners are stopped at once (after a second look), busy ones are watched every 0.1 s and stopped the moment
   their job ends (up to 15 minutes, inside the Admin workflow's 20-minute limit, then nothing is changed). With slots on, the runners
   it stopped restart only into free slots.

@@ -8,10 +8,16 @@ set -euo pipefail
 
 # WSL runs a `wsl -u root` session in a mount namespace of its own, while systemd and the runner services live in PID 1's: a
 # tmpfs mounted from such a session is invisible to the runners. So a root command from there re-runs itself in PID 1's.
-if [ "$EUID" = 0 ] && [ -z "${LINUXRUNNER_IN_NS:-}" ] && [ -r /proc/1/ns/mnt ] && command -v nsenter >/dev/null 2>&1 &&
-  [ "$(readlink /proc/1/ns/mnt)" != "$(readlink /proc/self/ns/mnt)" ]; then
-  exec env LINUXRUNNER_IN_NS=1 nsenter -t 1 -m -- bash "$0" "$@"
+# nsenter -m resets the working directory, so the script goes by its absolute path. (LINUXRUNNER_NS1 lets the tests stand in
+# for PID 1's namespace.)
+NS1=${LINUXRUNNER_NS1:-/proc/1/ns/mnt}
+if { [ "$EUID" = 0 ] || [ -n "${LINUXRUNNER_NS1:-}" ]; } && [ -z "${LINUXRUNNER_IN_NS:-}" ] && [ -r "$NS1" ] &&
+  command -v nsenter >/dev/null 2>&1 && [ "$(readlink "$NS1")" != "$(readlink /proc/self/ns/mnt)" ]; then
+  self=$(readlink -f -- "$0" 2>/dev/null || true)
+  if [ -f "$self" ]; then exec env LINUXRUNNER_IN_NS=1 nsenter -t 1 -m -- bash "$self" "$@"; fi
+  echo "linuxrunner: warning: cannot find this script by an absolute path, so it runs in this session's mount namespace" >&2
 fi
+unset LINUXRUNNER_IN_NS
 
 HOME_DIR=/opt/git-runner
 [ -z "${GIT_RUNNER_HOME:-}" ] || HOME_DIR=$GIT_RUNNER_HOME   # tests point it elsewhere
@@ -232,27 +238,36 @@ wipe_work() {  # WORKDIR
 }
 
 # As root (the sweep path unit, or slot-sync), only while a job's completed hook is waiting on a workspace its user could not clean.
+# WORKDIR comes from the unit's root-owned drop-in, never from .runner (which a job can edit), and is checked again here: a
+# real directory by its own canonical path, that is a tmpfs mount point of its own and not a system one.
 wipe_work_root() {  # WORKDIR
-  local w=${1:-}
-  work_is_ram "$w" || return 0
+  local w=${1:-} owner
+  [[ "$w" =~ $RAM_PATH_RE ]] && [[ "$w" != *..* ]] || return 0
+  case $w in /|/tmp|/dev/shm|/run|/dev|/proc|/sys) return 0 ;; esac
+  work_is_ram "$w" && [ "$(realpath -e "$w" 2>/dev/null)" = "$w" ] || return 0
+  [ "$(findmnt -no FSTYPE --mountpoint "$w" 2>/dev/null)" = tmpfs ] || return 0
+  owner=$(stat -c %u:%g "$w")
   sh -c "$WIPE_SH" _ "$w" wipe 2>/dev/null || true
-  chown --reference="$w" "$w/_temp" "$w/_temp/_runner_file_commands" "$w/_temp/_github_workflow" 2>/dev/null || true
+  chown -h "$owner" "$w/_temp" "$w/_temp/_runner_file_commands" "$w/_temp/_github_workflow" 2>/dev/null || true
   return 0
 }
 
-# The job-completed hook's part. Never fails the job (it has finished): files that are still there after the root sweep's wait
-# are logged, and go when the service next starts.
+# The job-completed hook's part. Never fails the job (it has finished). Files its user cannot delete are left to the root sweep:
+# the hook waits (the runner still busy, so no job starts meanwhile) until the sweep has run, which removes the marker, or
+# RAMDISK_SWEEP_WAIT seconds; whatever is still there is logged and goes at the next service start.
 wipe_after_job() {  # WORKDIR
   local w=${1:-} deadline
-  work_is_ram "$w" || return 0
+  if ! work_is_ram "$w"; then log "RAM workspace $w is not mounted: nothing to empty"; return 0; fi
   wipe_work "$w"
   [ -n "$(work_junk "$w")" ] || return 0
   : > "$w/.hook-waiting" 2>/dev/null || true
   log "RAM workspace $w holds files this user cannot delete (root-owned, from a Docker action?): waiting for the root sweep"
   deadline=$(( $(date +%s) + ${RAMDISK_SWEEP_WAIT:-90} ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    sleep "${RAMDISK_SWEEP_POLL:-1}"
-    [ -n "$(work_junk "$w")" ] || { rm -f "$w/.hook-waiting"; log "the root sweep cleaned $w"; return 0; }
+    sleep "${RAMDISK_SWEEP_POLL:-0.5}"
+    [ -e "$w/.hook-waiting" ] && continue
+    if [ -z "$(work_junk "$w")" ]; then log "the root sweep cleaned $w"; else log "warning: the root sweep ran but files in $w remain; they go when the runner service next starts"; fi
+    return 0
   done
   rm -f "$w/.hook-waiting"
   log "warning: files in $w could not be deleted and no root sweep came in ${RAMDISK_SWEEP_WAIT:-90}s (is runnerpool-ramdisk-sweep.path enabled?); they go when the runner service next starts"
@@ -263,14 +278,18 @@ wipe_after_job() {  # WORKDIR
 # as the runner's own user, so it only needs to read the files above.
 cmd_hook() {  # acquire|release
   local action=${1:-} name=${GIT_RUNNER_NAME:-${RUNNER_NAME:-}} dir n t i d cpus last=0
-  [ "$action" != release ] || [ -z "${GIT_RUNNER_WORK:-}" ] || wipe_after_job "$GIT_RUNNER_WORK"   # RAM mode
-  [ -n "$name" ] || { log "slot hook: no runner name, skipped"; return 0; }
   dir=$(slot_dir); n=$(slots_n); t=$(slots_threads)
+  if [ -n "$name" ] && [ -n "$n" ]; then
+    for d in "$dir"/slot-*; do  # a runner runs one job at a time, so any slot it still holds is left over
+      [ -d "$d" ] && [ "$(owner_field "$d" runner)" = "$name" ] && rm -rf "$d"
+    done
+  fi
+  if [ "$action" = release ]; then   # the slot is back first, so waiting on the root sweep never holds one
+    [ -z "${GIT_RUNNER_WORK:-}" ] || wipe_after_job "$GIT_RUNNER_WORK"   # RAM mode
+    return 0
+  fi
+  [ -n "$name" ] || { log "slot hook: no runner name, skipped"; return 0; }
   [ -n "$n" ] || return 0
-  for d in "$dir"/slot-*; do  # a runner runs one job at a time, so any slot it still holds is left over
-    [ -d "$d" ] && [ "$(owner_field "$d" runner)" = "$name" ] && rm -rf "$d"
-  done
-  [ "$action" = acquire ] || return 0
   mkdir -p "$dir" 2>/dev/null || true
   while :; do
     # N is read on every pass, so `runner slots` changes take effect at once: a raise lets a waiting job in, a
@@ -528,7 +547,8 @@ ramdisk_apply_unit() {  # UNIT SIZE_MB: the unit is stopped (or about to start):
   cmd_ramdisk_mount "$w" "$mb" "$uid" "$gid"
   dropin=$(ramdisk_dropin "$u")
   mkdir -p "$(dirname "$dropin")"
-  printf '# size=%s\n[Service]\nExecStartPre=+%s/linuxrunner ramdisk-mount %s %s %s %s\n' "$mb" "$HOME_DIR" "$w" "$mb" "$uid" "$gid" > "$dropin"
+  printf '# size=%s\n[Service]\nExecStartPre=+%s/linuxrunner ramdisk-mount %s %s %s %s\nExecStartPost=+-/bin/systemctl --no-block try-restart %s.path\n' \
+    "$mb" "$HOME_DIR" "$w" "$mb" "$uid" "$gid" "$SWEEP_UNIT" > "$dropin"
   systemctl daemon-reload || log "daemon-reload failed: the mount ordering for $(unit_name "$u") applies after the next reload"
   log "$(unit_name "$u"): workspace $w on a ${mb} MB RAM disk"
 }
@@ -541,41 +561,55 @@ ramdisk_remove_unit() {  # UNIT: the unit is stopped
   log "$(unit_name "$u"): workspace back on the disk"
 }
 
-# Root, from slot-sync: a job's start hook is waiting on a workspace its user could not clean.
+# The RAM work folder of unit U as `ramdisk on` recorded it in the unit's root-owned drop-in (nothing when RAM mode is off for it).
+ramdisk_unit_ram_path() {  # UNIT
+  sed -n 's/^ExecStartPre=+[^ ]* ramdisk-mount \([^ ]*\) .*/\1/p' "$(ramdisk_dropin "$1")" 2>/dev/null | head -1 || true
+}
+
+# Root (the sweep path unit, or slot-sync): wipe the workspaces whose completed job hook is waiting on files its user cannot
+# delete. The marker is always removed, wiped or not (during a ramdisk change, or with RAM mode off), so the path unit never
+# fires in a loop; the hook judges by what is left.
 ramdisk_sweep() {
   local u w
-  [ -s "$RAMDISK_FILE" ] || return 0
-  ! maint_live || return 0
+  maint_live || true   # clears a marker its process left behind (killed), so slot-sync does not stay paused
   for u in $(ci_units); do
-    w=$(ramdisk_unit_path "$u")
-    [ -e "$w/.hook-waiting" ] || continue
-    wipe_work_root "$w"
-    rm -f "$w/.hook-waiting"   # the path unit fires again while it exists; the hook judges by what is left, not by this
-    log "$(unit_name "$u"): swept a workspace the runner's user could not clean"
+    w=$(ramdisk_unit_ram_path "$u")
+    [ -n "$w" ] && [ -e "$w/.hook-waiting" ] || continue
+    if [ -s "$RAMDISK_FILE" ] && ! maint_live; then
+      wipe_work_root "$w"
+      log "$(unit_name "$u"): swept a workspace the runner's user could not clean"
+    fi
+    rm -rf -- "$w/.hook-waiting" 2>/dev/null || true
   done
+  return 0
 }
 
 # A root path unit that runs `ramdisk-sweep` the moment a completed hook marks its workspace, so the sweep needs neither the
-# follower service nor slots. Rewritten whenever the runners change; removed with `ramdisk off`.
+# follower service nor slots. Each runner's start re-arms it (ExecStartPost in the drop-in): its watch on a work folder goes
+# stale when the tmpfs is mounted over it. Rewritten whenever runners are added or removed; removed with `ramdisk off`.
 SWEEP_UNIT=runnerpool-ramdisk-sweep
 write_sweep_units() {
-  local u
+  local u w paths=''
+  for u in $(ci_units); do w=$(ramdisk_unit_ram_path "$u"); [ -z "$w" ] || paths="$paths$w/.hook-waiting "; done
+  if [ -z "$paths" ]; then remove_sweep_units; return 0; fi
   mkdir -p "$SYSTEMD_DIR"
   { echo '[Unit]'; echo 'Description=runnerpool: wipe RAM workspaces a job left files in that its user cannot delete'
-    echo '[Path]'; for u in $(ci_units); do echo "PathExists=$(ramdisk_unit_path "$u")/.hook-waiting"; done
+    echo '[Path]'; for w in $paths; do echo "PathExists=$w"; done; echo 'TriggerLimitIntervalSec=0'
     echo '[Install]'; echo 'WantedBy=multi-user.target'; } > "$SYSTEMD_DIR/$SWEEP_UNIT.path"
-  printf '[Unit]\nDescription=runnerpool: RAM workspace sweep\n[Service]\nType=oneshot\nExecStart=%s/linuxrunner ramdisk-sweep\n' "$HOME_DIR" > "$SYSTEMD_DIR/$SWEEP_UNIT.service"
+  printf '[Unit]\nDescription=runnerpool: RAM workspace sweep\nStartLimitIntervalSec=0\n[Service]\nType=oneshot\nExecStart=%s/linuxrunner ramdisk-sweep\n' "$HOME_DIR" > "$SYSTEMD_DIR/$SWEEP_UNIT.service"
   systemctl daemon-reload || true
-  systemctl enable --now "$SWEEP_UNIT.path" >/dev/null 2>&1 || log "could not enable $SWEEP_UNIT.path: root-owned files wait for the next service start"
+  systemctl enable "$SWEEP_UNIT.path" >/dev/null 2>&1 || true
+  systemctl restart "$SWEEP_UNIT.path" >/dev/null 2>&1 || log "could not start $SWEEP_UNIT.path: root-owned files wait for the next service start"
 }
 remove_sweep_units() {
   systemctl disable --now "$SWEEP_UNIT.path" >/dev/null 2>&1 || true
+  systemctl stop "$SWEEP_UNIT.service" >/dev/null 2>&1 || true
   rm -f "$SYSTEMD_DIR/$SWEEP_UNIT.path" "$SYSTEMD_DIR/$SWEEP_UNIT.service"
   systemctl daemon-reload || true
 }
 
 # Stops every CI runner that has to change, without cutting a job short: an idle runner is stopped (after a second look, since
-# a job can be assigned just before its Worker shows), a busy one is watched every 0.1 s and stopped the moment its job ends,
+# a job can be assigned up to a second before its Worker shows), a busy one is watched every 0.1 s and stopped the moment its job ends,
 # before it can pick up the next one. DRAINED lists what was stopped; MAINT_FILE (PID and time) keeps slot-sync from starting
 # them again. Gives up after RAMDISK_WAIT seconds (default 900, inside the Admin workflow's 20-minute limit), and then nothing
 # was changed. The one window left is a job assigned in the instant between that second look and the stop (as with `ci off`).
@@ -589,7 +623,7 @@ ramdisk_drain() {  # UNITS...
       [ "$(state "$u")" = active ] || continue
       if is_busy "$u"; then left="$left $u"
       else
-        sleep "${RAMDISK_RECHECK:-0.3}"
+        sleep "${RAMDISK_RECHECK:-1}"
         if is_busy "$u"; then left="$left $u"; else systemctl stop "$u"; DRAINED="$DRAINED $u"; fi
       fi
     done
@@ -642,16 +676,17 @@ cmd_ramdisk() {  # on [MB] | off
   trap 'exit 143' TERM INT HUP   # a cancelled workflow or a closed session still runs the EXIT cleanup
   # shellcheck disable=SC2086
   [ -z "$todo" ] || ramdisk_drain $todo
+  [ "$mb" != off ] || remove_sweep_units   # first, so a sweep never holds a workspace that is being unmounted
   for u in $todo; do
     if [ "$mb" = off ]; then ramdisk_remove_unit "$u"; else ramdisk_apply_unit "$u" "$mb"; fi
   done
   # The setting is recorded only once every runner has it, so a failed change leaves the old one in force.
-  if [ "$mb" = off ]; then rm -f "$RAMDISK_FILE"; remove_sweep_units
+  if [ "$mb" = off ]; then rm -f "$RAMDISK_FILE"
   else mkdir -p "$HOME_DIR"; echo "$mb" > "$RAMDISK_FILE"; write_hook_scripts; write_sweep_units; fi
   APPLY_NO_RESTART=1   # a runner that was stopped (ci off, slots full) must stay stopped; ramdisk_finish restarts the drained ones
   for u in $(ci_units); do apply_limits "$u"; done
   [ "$count" -gt 0 ] && log "RAM workspace $mb: $count runner(s) changed" || log "RAM workspace already $mb on every runner"
-  [ "$mb" = off ] || log "a CI runner added or adopted outside add-runner after this is picked up by the next 'ramdisk on', slots or limit"
+  [ "$mb" = off ] || log "a CI runner adopted outside add-runner after this is picked up by the next ramdisk on"
 }
 
 # Docker's work runs in its own cgroups, outside the runner services' drop-ins, so a job's `docker build` would escape the
@@ -717,6 +752,7 @@ cmd_remove_runner() {  # NAME [TOKEN|-]
   systemctl disable --now "$u"
   if mountpoint -q "$(ramdisk_unit_path "$u")" 2>/dev/null; then umount "$(ramdisk_unit_path "$u")" || log "could not unmount the RAM workspace of $name"; fi
   rm -rf "${SYSTEMD_DIR:?}/$u.d"
+  [ ! -s "$RAMDISK_FILE" ] || write_sweep_units
   [ "$token" = - ] || sudo -u "$(stat -c %U "$d")" "$d/config.sh" remove --token "$token" >/dev/null
   rm -f "/etc/systemd/system/$u"; systemctl daemon-reload
   log "removed $name (its folder $d is left in place)"

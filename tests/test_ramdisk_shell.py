@@ -35,6 +35,11 @@ exit 0
     # mount, umount and mountpoint keep their state in a file, so nothing is ever really mounted
     "mount": '#!/bin/sh\n[ -e "$STUB_MOUNT_FAIL" ] && exit 1\necho "mount $*" >> "$STUB_MOUNTLOG"\nfor a; do p=$a; done\ngrep -qxF "$p" "$STUB_MOUNTS" 2>/dev/null || echo "$p" >> "$STUB_MOUNTS"\n',
     "umount": '#!/bin/sh\n[ -e "$STUB_UMOUNT_FAIL" ] && exit 1\necho "umount $*" >> "$STUB_MOUNTLOG"\ngrep -vxF "$1" "$STUB_MOUNTS" > "$STUB_MOUNTS.new"; mv "$STUB_MOUNTS.new" "$STUB_MOUNTS"\n',
+    "findmnt": """#!/bin/sh
+for a; do p=$a; done
+grep -qxF "$p" "$STUB_MOUNTS" || exit 1
+[ -f "$STUB_DIR/fstype" ] && cat "$STUB_DIR/fstype" || echo tmpfs
+""",
     "mountpoint": '#!/bin/sh\ngrep -qxF "$2" "$STUB_MOUNTS" 2>/dev/null\n',
     # rm refuses anything named "stuck" while STUB_RM_FAIL is set: a stand-in for root-owned files the runner's user cannot delete
     "rm": '#!/bin/sh\nif [ -n "${STUB_RM_FAIL:-}" ]; then for a; do case "$a" in *stuck*) exit 1 ;; esac; done; fi\nexec /bin/rm "$@"\n',
@@ -92,7 +97,7 @@ def mounts(tmp_path):
 
 
 def changes(tmp_path):
-    return [ln for ln in syslog(tmp_path) if ln.startswith(("stop ", "start ", "restart "))]
+    return [ln for ln in syslog(tmp_path) if ln.startswith(("stop ", "start ", "restart ")) and "actions.runner." in ln]
 
 
 def dropin(units, unit=UNIT1):
@@ -450,8 +455,8 @@ def test_the_started_hook_never_touches_the_workspace(tmp_path):
 
 def test_files_the_user_cannot_delete_hold_the_finished_job_until_the_root_sweep_clears_them(tmp_path):
     env, home, units = setup(tmp_path)
-    (home / "ramdisk").write_text("1024\n")
-    work = ram_work(tmp_path)
+    run(env, "ramdisk", "on", "1024")
+    work = tmp_path / "ci-1/_work"
     (work / "stuck").mkdir()
     (work / "stuck/f").write_text("x")
     p = subprocess.Popen(
@@ -509,7 +514,9 @@ def test_on_installs_a_root_sweep_path_unit_and_off_removes_it(tmp_path):
     )
     assert "admin" not in path
     assert f"ExecStart={home}/linuxrunner ramdisk-sweep" in (units / "runnerpool-ramdisk-sweep.service").read_text()
-    assert "enable --now runnerpool-ramdisk-sweep.path" in syslog(tmp_path)
+    assert "enable runnerpool-ramdisk-sweep.path" in syslog(
+        tmp_path
+    ) and "restart runnerpool-ramdisk-sweep.path" in syslog(tmp_path)
     run(env, "ramdisk", "off")
     assert (
         not (units / "runnerpool-ramdisk-sweep.path").exists()
@@ -520,8 +527,8 @@ def test_on_installs_a_root_sweep_path_unit_and_off_removes_it(tmp_path):
 
 def test_the_sweep_removes_its_marker_so_the_path_unit_does_not_fire_again(tmp_path):
     env, home, units = setup(tmp_path)
-    (home / "ramdisk").write_text("1024\n")
-    work = ram_work(tmp_path)
+    run(env, "ramdisk", "on", "1024")
+    work = tmp_path / "ci-1/_work"
     (work / "leftover").mkdir()
     (work / ".hook-waiting").write_text("")
     assert run(env, "ramdisk-sweep").returncode == 0
@@ -720,3 +727,74 @@ def test_a_work_folder_under_a_symlinked_parent_is_refused(tmp_path):
     r = run(env, "ramdisk-mount", f"{tmp_path}/via/_work", "1024", "0", "0")
     assert r.returncode != 0 and "symlink" in r.stderr and mounts(tmp_path) == set()
     assert run(env, "ramdisk-mount", f"{tmp_path}/ci-1/../ci-1", "1024", "0", "0").returncode != 0
+
+
+def test_root_commands_rerun_in_pid_1s_namespace_by_absolute_path_even_when_called_relatively(tmp_path):
+    env, home, units = setup(tmp_path)
+    (tmp_path / "ns1").write_text("")  # readlink gives nothing for it: not this namespace  # stands in for PID 1's namespace, which differs from this one
+    (tmp_path / "bin/nsenter").write_text(
+        '#!/bin/sh\necho "nsenter $*" >> "$STUB_DIR/nsenter.log"\nwhile [ "$1" != -- ]; do shift; done; shift\nexec "$@"\n'
+    )
+    (tmp_path / "bin/nsenter").chmod(0o755)
+    r = subprocess.run(
+        ["bash", "linuxrunner", "help"],
+        cwd=LINUXRUNNER.parent,
+        env={**env, "LINUXRUNNER_NS1": str(tmp_path / "ns1")},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert r.returncode == 0, r.stderr
+    log = (tmp_path / "nsenter.log").read_text()
+    assert f"-t 1 -m -- bash {LINUXRUNNER}" in log  # absolute: nsenter -m resets the working directory
+    assert log.count("nsenter") == 1  # re-runs once, never loops
+
+
+def test_the_sweep_takes_the_work_folder_from_the_root_owned_drop_in_not_from_runner(tmp_path):
+    env, home, units = setup(tmp_path)
+    run(env, "ramdisk", "on", "1024")
+    other = ram_work(tmp_path, "elsewhere")  # a mount a job would like root to wipe
+    (other / "precious").write_text("x")
+    (other / ".hook-waiting").write_text("")
+    (tmp_path / "ci-1/.runner").write_text(f'{{"gitHubUrl": "https://github.com/o/r", "workFolder": "{other}"}}')
+    assert run(env, "ramdisk-sweep").returncode == 0
+    assert (other / "precious").exists()
+
+
+def test_the_sweep_always_clears_its_marker_even_when_it_must_not_wipe(tmp_path):
+    env, home, units = setup(tmp_path)
+    run(env, "ramdisk", "on", "1024")
+    work = tmp_path / "ci-1/_work"
+    (work / "job-files").mkdir()
+    (work / ".hook-waiting").mkdir()  # a job made it a directory to keep the path unit firing
+    (home / "maintenance").write_text(f"{os.getpid()} {int(time.time())}\n")  # a ramdisk change is running
+    assert run(env, "ramdisk-sweep").returncode == 0
+    assert (
+        not (work / ".hook-waiting").exists() and (work / "job-files").exists()
+    )  # marker gone, nothing wiped meanwhile
+
+
+def test_the_sweep_never_wipes_a_folder_that_is_not_its_own_tmpfs(tmp_path):
+    env, home, units = setup(tmp_path)
+    run(env, "ramdisk", "on", "1024")
+    work = tmp_path / "ci-1/_work"
+    (work / "f").write_text("x")
+    (work / ".hook-waiting").write_text("")
+    (tmp_path / "fstype").write_text("ext4")  # findmnt reports something other than a tmpfs
+    assert run(env, "ramdisk-sweep").returncode == 0
+    assert (work / "f").exists() and not (work / ".hook-waiting").exists()
+
+
+def test_each_runner_start_rearms_the_sweep_watch_and_removing_a_runner_rewrites_it(tmp_path):
+    env, home, units = setup(tmp_path)
+    run(env, "ramdisk", "on", "1024")
+    assert (
+        "ExecStartPost=+-/bin/systemctl --no-block try-restart runnerpool-ramdisk-sweep.path"
+        in dropin(units).read_text()
+    )
+    path = units / "runnerpool-ramdisk-sweep.path"
+    assert "TriggerLimitIntervalSec=0" in path.read_text()
+    assert "StartLimitIntervalSec=0" in (units / "runnerpool-ramdisk-sweep.service").read_text()
+    assert run(env, "remove-runner", "ci-1").returncode == 0
+    text = path.read_text()
+    assert f"{tmp_path}/ci-1/_work" not in text and f"PathExists={tmp_path}/ci-2/_work/.hook-waiting" in text
