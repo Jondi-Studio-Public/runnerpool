@@ -52,7 +52,7 @@ The GitHub token is a fine-grained PAT owned by example-org with:
 
 - Repository access: **All repositories**, so a new org repo shows up in the CI panel by itself.
 - Repository permissions: Actions read and write (runs panel, Admin-workflow fallback; write is
-  only used on git-runner), Administration read (repo runner lists), **Checks read** and
+  only used on runnerpool), Administration read (repo runner lists), **Checks read** and
   **Pull requests read** (CI panel), Metadata read.
 - Organization permission: Self-hosted runners read (org runner list; `MACS_ORG`, default
   example-org).

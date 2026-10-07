@@ -8,7 +8,7 @@ and so it is if minting fails while a PAT exists. Only paths and status codes ar
   GH_APP_ID / GH_APP_ID_FILE               the App id (the `app_id` field of Dev/CI GitHub App)
   GH_APP_PRIVATE_KEY / GH_APP_KEY_FILE     the .pem (the `private_key` field)
   GH_APP_INSTALLATION_ID                   optional; else looked up with GET /orgs/{owner}/installation
-  GH_APP_OWNER                             the org that installed the App (default example-org)
+  GH_APP_OWNER                             the org that installed the App (default: GITRUNNER_ORG, else MACS_ORG, else WATCHDOG_ORG; none of them set is an error)
 
 Needs PyJWT with the crypto extra (dashboard/requirements.txt).
 """
@@ -47,6 +47,9 @@ def read_secret(env_name, file_env_name, env=None):
     return ""
 
 
+OWNER_VARS = ("GH_APP_OWNER", "GITRUNNER_ORG", "MACS_ORG", "WATCHDOG_ORG")  # first one set names the org
+
+
 class AppTokenError(Exception):
     pass
 
@@ -54,9 +57,7 @@ class AppTokenError(Exception):
 class AppTokenSource:
     """Mints and caches installation tokens. token() is safe to call from several threads."""
 
-    def __init__(
-        self, app_id, private_key, owner="example-org", installation_id="", base=API, opener=None, clock=time.time
-    ):
+    def __init__(self, app_id, private_key, owner="", installation_id="", base=API, opener=None, clock=time.time):
         self.app_id = str(app_id)
         self._key = private_key
         self.owner = owner
@@ -123,10 +124,15 @@ class AppTokenSource:
         key = read_secret("GH_APP_PRIVATE_KEY", "GH_APP_KEY_FILE", e)
         if not (app_id and key):
             return None
+        owner = next((e[k] for k in OWNER_VARS if e.get(k)), "")
+        if not owner:
+            raise AppTokenError(
+                "the GitHub App is configured but no org is: set GH_APP_OWNER (compose passes it from GITRUNNER_ORG)"
+            )
         return cls(
             app_id,
             key if key.endswith("\n") else key + "\n",
-            owner=e.get("GH_APP_OWNER", "example-org"),
+            owner=owner,
             installation_id=e.get("GH_APP_INSTALLATION_ID", ""),
             **kw,
         )

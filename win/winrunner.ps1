@@ -22,7 +22,8 @@ $AppKeyFile = Join-Path $HomeDir 'github-app.pem'     # its private key (PKCS#1 
 $AppInstallFile = Join-Path $HomeDir 'github-app-installation'   # cached installation id on $AppOrg
 $AppTokenFile = Join-Path $HomeDir 'github-app-token'            # cached installation token, SYSTEM and Administrators only
 $AppExpiryFile = Join-Path $HomeDir 'github-app-token.expires'   # "EPOCH ISO8601" of that token's expires_at
-$AppOrg = if ($env:GITRUNNER_APP_ORG) { $env:GITRUNNER_APP_ORG } elseif ($env:GITRUNNER_ORG) { $env:GITRUNNER_ORG } else { 'example-org' }   # the org the App is installed on
+$OrgFile = Join-Path $HomeDir 'org'                   # the GitHub org, written by the installer's bootstrap (its GITRUNNER_ORG setting)
+$AppOrg = if ($env:GITRUNNER_APP_ORG) { $env:GITRUNNER_APP_ORG } elseif ($env:GITRUNNER_ORG) { $env:GITRUNNER_ORG } elseif (Test-Path $OrgFile) { (Get-Content $OrgFile -Raw).Trim() } else { '' }   # the org the App is installed on; no default: Assert-AppOrg fails when it is empty
 $AppRefreshMargin = 600   # seconds: mint a new installation token this long before the old one expires
 $BatteryFlag = Join-Path $HomeDir 'pause-on-battery'  # present = CI pauses on battery (default)
 $CiOff = Join-Path $HomeDir 'ci-off'                  # present = CI runners take no jobs (`ci off`)
@@ -179,11 +180,16 @@ function Invoke-GhApp([string]$method, [string]$path) {  # called as the App (a 
     Invoke-RestMethod -Method $method -Uri "https://api.github.com/$path" -Headers $h -TimeoutSec 30
 }
 
+function Assert-AppOrg {  # the App's org has no default: say so instead of looking one up that is not yours
+    if (-not $AppOrg) { throw 'GITRUNNER_ORG is not set: the GitHub App needs to know which org it is installed on. Rebuild the installer with GITRUNNER_ORG=<your org> (runner build-win does), or set GITRUNNER_ORG for this command.' }
+}
+
 function Get-AppInstallationId {  # the App's installation on $AppOrg, cached
     if (Test-Path $AppInstallFile) {
         $v = (Get-Content $AppInstallFile -Raw).Trim()
         if ($v) { return $v }
     }
+    Assert-AppOrg
     $r = Invoke-GhApp 'GET' "orgs/$AppOrg/installation"
     if (-not $r.id) { throw "the GitHub App has no installation on $AppOrg" }
     Write-Private $AppInstallFile ([string]$r.id)
@@ -1297,7 +1303,10 @@ function Invoke-Bootstrap([string]$envFile) {
     $e = Get-Content $envFile -Raw | ConvertFrom-Json
     Remove-Item -Force $envFile
     foreach ($d in $HomeDir, $Runners, $Logs, $Conf) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    if ($e.GITRUNNER_ORG) { $script:AppOrg = ([string]$e.GITRUNNER_ORG).Trim() }
+    if ($script:AppOrg) { Write-Private $OrgFile $script:AppOrg }
     if ($e.GITHUB_APP_ID -and $e.GITHUB_APP_KEY_B64) {
+        try { Assert-AppOrg } catch { Die $_.Exception.Message }
         try { Save-App ([string]$e.GITHUB_APP_ID) ([string]$e.GITHUB_APP_KEY_B64) } catch { Die 'the installer''s GitHub App key is not a PEM private key' }
         Remove-Item -Force $AuthFile -ErrorAction SilentlyContinue   # an older PAT is no longer needed
         try { Initialize-AppToken } catch { Die "the installer's GitHub App cannot mint a token (not installed on $AppOrg, or its key was revoked?)" }
@@ -1440,7 +1449,7 @@ function Install-WslSet($e) {
     if (-not $provisioned) { Invoke-WslIn $distro "$lrBin ci off" }
     Install-WslFollower $distro
     Install-WslBoot $distro
-    Log "WSL runners done: $wname (macs doctor $wname)"
+    Log "WSL runners done: $wname (runner doctor $wname)"
 }
 
 # A service in the distro that follows linux-state (see Sync-WslCi) every 2 seconds and keeps the job

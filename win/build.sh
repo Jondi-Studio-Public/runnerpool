@@ -64,6 +64,7 @@ trap 'rm -f "$tmp"' EXIT
 chmod 600 "$tmp"
 while IFS= read -r line || [ -n "$line" ]; do
   line=${line%$'\r'}
+  line=${line//@@GITRUNNER_ORG@@/$(ps_quote "$ORG")}
   line=${line//@@CI_REPO@@/$(ps_quote "$CI_REPO")}
   line=${line//@@CI_LABELS@@/$(ps_quote "$CI_LABELS")}
   line=${line//@@ADMIN_REPO@@/$(ps_quote "$ADMIN_REPO")}

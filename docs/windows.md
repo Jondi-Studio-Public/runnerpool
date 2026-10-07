@@ -125,8 +125,8 @@ gh api -X GET orgs/example-org/actions/runners --jq '.runners[] | select(.name |
 `runner restart wsl-1` once the jobs are done.)
 
 A boot task keeps the distro running without anyone logged in. The Linux runners follow the Windows side:
-on battery, or after `macs ci win-1 off`, a small service in the distro (`linuxrunner follow`, checking every 2 seconds) turns
-Linux CI off too, and `macs cores win-1 N` and the job slots below carry over. `macs ci wsl-1 ...` still works on its own.
+on battery, or after `runner ci win-1 off`, a small service in the distro (`linuxrunner follow`, checking every 2 seconds) turns
+Linux CI off too, and `runner cores win-1 N` and the job slots below carry over. `runner ci wsl-1 ...` still works on its own.
 
 ## Job slots: the PC's CPU cap
 
