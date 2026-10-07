@@ -331,7 +331,8 @@ def macs(args, timeout):
     if not bash:
         return 127, "", "Git for Windows' bash not found (winget install Git.Git): it runs macs"
     script = os.environ.get("MACS_SCRIPT") or str(HERE.parent / "runner")
-    return run([bash, script, *args], timeout)
+    # The dashboard already tried SSH itself: tell the script to go straight to the workflow.
+    return run([bash, script, *args], timeout, env={**os.environ, "RUNNER_VIA": "github"})
 
 
 _MAIN_SHA = {"at": 0.0, "sha": ""}

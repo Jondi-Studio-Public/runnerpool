@@ -10,7 +10,8 @@ How the parts fit, and what was learned running them. Setup steps are in the [RE
    boxes, and the Linux VM inside each Mac). Paths on a Mac use the `mac-runners` name
    (`/usr/local/mac-runners`, `/var/log/mac-runners`, launchd labels `io.github.git-runner.mac-runners.*`).
 2. **`runner`** (`runner` for bash, `runner.cmd` for PowerShell and cmd): the control-machine command. It reaches
-   a device over Tailscale SSH, or falls back to the **Admin workflow** (`admin*.yml`) running on that
+   a Mac over Tailscale SSH (for actions that need no secret; `RUNNER_VIA=auto|ssh|github`, stderr names the
+   path that ran), or falls back to the **Admin workflow** (`admin*.yml`) running on that
    device's root admin runner. `./runner help` lists everything.
 3. **Shared CI** (`.github/workflows/ci-plan.yml`, `.github/actions/steal/`, `ci/ci_shard.py`,
    [ci-plan.md](ci-plan.md)): splits a repo's test suite between its always-on machines and whichever

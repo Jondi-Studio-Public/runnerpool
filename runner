@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # runner: manage the Mac CI runners from the PC (Git Bash, or runner.cmd from PowerShell or cmd;
 # `gh` must be signed in).
-# Every action runs on the Mac through this repo's Admin workflow; tokens are minted here,
-# used within seconds, and never stored. `runner help` lists the commands.
+# Mac actions that need no GitHub secret go over Tailscale SSH first, falling back to this repo's Admin
+# workflow when the Mac is unreachable (RUNNER_VIA=auto|ssh|github); every other action, and every PC or
+# Linux box, runs through the Admin workflow. Tokens are minted here, used within seconds, and never stored.
+# `runner help` lists the commands.
 set -euo pipefail
 
 # GITRUNNER_ORG: the GitHub org that owns the runners (required); GITRUNNER_REPO: the repo this tool lives in.
@@ -22,6 +24,61 @@ check_host() { [[ "${1:-}" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "host must loo
 is_win() { [[ "${1:-}" == win-* ]]; }
 is_wsl() { [[ "${1:-}" == wsl-* || "${1:-}" == *-vm ]]; }   # air-1-vm is the Linux VM on Mac air-1
 mac_only() { if is_win "$1" || is_wsl "$1"; then die "$2 is for Macs only ($1 is not a Mac)"; fi; }
+
+MACRUNNER=/usr/local/mac-runners/macrunner   # where the Macs keep it (the dashboard uses the same path)
+
+# ssh_args HOST ACTION [key=value ...] -> the macrunner arguments for an action a Mac can do over SSH, one per line
+# (nothing and status 1 for actions that need the workflow's secrets: update, tailscale, add, drop, ...).
+ssh_args() {
+  local host=$1 action=$2 kv name='' size='' cores='' lim=()
+  shift 2
+  for kv in "$@"; do
+    case $kv in
+      name=*) name=${kv#name=} ;;
+      size=*) size=${kv#size=} ;;
+      cores=*) if [ "$action" = limit ]; then lim+=("$kv"); else cores=${kv#cores=}; fi ;;
+      ram=*) lim+=("$kv") ;;
+    esac
+  done
+  case $action in
+    status|info|doctor) printf '%s\n' "$action" ;;
+    logs) printf '%s\n' logs "$name" 80 ;;
+    restart-ci) printf '%s\n' restart "$host" ;;
+    battery-pause) printf '%s\n' battery pause ;;
+    battery-run) printf '%s\n' battery run ;;
+    ci-on) printf '%s\n' ci on ;;
+    ci-off) printf '%s\n' ci off ;;
+    ramdisk-on) printf '%s\n' ramdisk on "$size" ;;
+    ramdisk-off) printf '%s\n' ramdisk off ;;
+    cores) printf '%s\n' cores "$cores" ;;
+    limit) printf '%s\n' limit "$name" "${lim[@]}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# via_ssh HOST ACTION [key=value ...]: run the action on the Mac over Tailscale SSH. Status 0 = it ran and its
+# output is shown; 255 = could not connect (VIA_REASON says why); anything else = the action's own failure, which stands.
+via_ssh() {
+  local host=$1 args=() a err rc=0
+  shift
+  while IFS= read -r a; do args+=("$a"); done < <(ssh_args "$host" "$@")
+  # ssh joins its arguments into one command line for the Mac's shell: only plain words may go through it.
+  for a in "${args[@]}"; do
+    [[ "$a" =~ ^[A-Za-z0-9][A-Za-z0-9._=:/-]*$ ]] || { VIA_REASON="argument not safe to send over ssh"; return 255; }
+  done
+  err=$(mktemp)
+  ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o StrictHostKeyChecking=accept-new \
+    "root@$host" "$MACRUNNER" "${args[@]}" </dev/null 2>"$err" || rc=$?
+  if [ "$rc" = 255 ]; then
+    VIA_REASON=$(grep -v '^Warning:' "$err" | tail -1)
+    VIA_REASON=${VIA_REASON:-"connection failed"}
+  else
+    echo "runner: via tailscale ssh" >&2
+    cat "$err" >&2
+  fi
+  rm -f "$err"
+  return "$rc"
+}
 
 # find_run WORKFLOW REQUEST -> run id (the run-name carries the request id)
 find_run() {
@@ -47,6 +104,22 @@ admin() {
   local host=$1 action=$2 req id status workflow=admin.yml
   shift 2
   check_host "$host"
+  local via=${RUNNER_VIA:-auto}
+  case $via in auto|ssh|github) ;; *) die "RUNNER_VIA must be auto, ssh or github (got: $via)" ;; esac
+  if ! is_win "$host" && ! is_wsl "$host"; then
+    if [ "$via" = github ]; then
+      echo "runner: via github actions (RUNNER_VIA=github)" >&2
+    elif ssh_args "$host" "$action" "$@" >/dev/null; then
+      local rc=0
+      VIA_REASON=''
+      via_ssh "$host" "$action" "$@" || rc=$?
+      [ "$rc" = 255 ] || return "$rc"   # the answer stands, success or not: never re-run it through GitHub
+      [ "$via" != ssh ] || die "ssh to $host failed: $VIA_REASON (RUNNER_VIA=ssh, no fallback)"
+      echo "runner: via github actions (ssh to $host failed: $VIA_REASON)" >&2
+    elif [ "$via" = ssh ]; then
+      die "$action needs the GitHub Admin workflow (RUNNER_VIA=ssh cannot run it)"
+    fi
+  fi
   if is_win "$host"; then
     workflow=admin-win.yml
     [ "$action" = update-macrunner ] && action=update-winrunner
@@ -370,6 +443,8 @@ runner: manage the Mac and Windows CI runners from this PC
   runner ssh HOST [COMMAND]           Tailscale SSH as root (when the admin runner is down)
 
 HOST is a Mac (air-1), a Windows PC (win-1) or a Linux box such as the PC's WSL runners (wsl-1); a Mac's Linux VM is air-1-vm (see linux-vm). postgres, linux-vm, tailscale and ssh are Mac-only (ramdisk also works on wsl-N); slots is for the PC (win-N, wsl-N). linux-vm is air-1-vm style: `runner linux-vm air-1 on`.
+Mac actions that need no GitHub secret (status, info, doctor, logs, restart, battery, ci, ramdisk, cores, limit) go over Tailscale SSH first
+and fall back to the Admin workflow when the Mac is unreachable; stderr says which ran. RUNNER_VIA=ssh|github forces one path (default auto).
 MACS_REF=<branch> runs a Mac action from that branch of this repo. `runner ssh HOST sudo macrunner help` lists what runs on the Mac.
 EOF
 }

@@ -207,7 +207,8 @@ label set that matches your own fleet; these are the defaults the installers cre
 ```
 
 Each device runs an unprivileged CI runner and a root admin runner. `runner` reaches a device over Tailscale
-SSH and falls back to dispatching the Admin workflow onto that device's admin runner. Devices mint short-lived
+SSH (Macs; actions that need no secret) and falls back to dispatching the Admin workflow onto that device's
+admin runner; it prints which path ran on stderr, and `RUNNER_VIA=auto|ssh|github` forces one. Devices mint short-lived
 App tokens and keep their own runners registered. The shared `ci-plan.yml` and `steal` action share a test
 suite between machines. Details: [docs/architecture.md](docs/architecture.md), [docs/ci-plan.md](docs/ci-plan.md).
 
