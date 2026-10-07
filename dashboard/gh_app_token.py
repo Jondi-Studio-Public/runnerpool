@@ -151,7 +151,16 @@ class TokenProvider:
         e = os.environ if env is None else env
         if pat is None:
             pat = read_secret("GH_TOKEN", "WATCHDOG_GH_TOKEN_FILE", e)
-        return cls(pat, AppTokenSource.from_env(e, **kw))
+        try:
+            source = AppTokenSource.from_env(e, **kw)
+        except AppTokenError as err:  # a missing org must not crash the dashboard or watchdog at import
+            print(
+                f"GitHub App ignored, using the PAT only: {err} (set GH_APP_OWNER or GITRUNNER_ORG)",
+                file=sys.stderr,
+                flush=True,
+            )
+            source = None
+        return cls(pat, source)
 
     def configured(self):
         return bool(self.pat or self.source)

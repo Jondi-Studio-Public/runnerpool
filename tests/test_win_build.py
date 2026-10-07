@@ -174,7 +174,9 @@ def test_winrunner_has_no_default_org_and_bootstrap_saves_and_checks_it():
     src = (ROOT / "win" / "winrunner.ps1").read_text()
     assert "example-org" not in src
     assert "GITRUNNER_ORG is not set" in src
-    boot = src[src.index("$e.GITRUNNER_ORG") :]
+    start = src.index("function Invoke-Bootstrap")
+    boot = src[start : src.index("\nfunction ", start + 1)]  # the body of Invoke-Bootstrap only
+    assert "Write-Private $OrgFile" in boot
     assert boot.index("Write-Private $OrgFile") < boot.index("Initialize-AppToken")
     assert boot.index("Assert-AppOrg") < boot.index("Save-App")
     assert "@@GITRUNNER_ORG@@" in (ROOT / "win" / "install.template.ps1").read_text()
@@ -185,4 +187,7 @@ def test_no_leftover_old_names_in_the_windows_installer_and_docs():
     win_doc = (ROOT / "docs" / "windows.md").read_text()
     assert not re.search(r"`macs (ci|cores)", win_doc)
     assert "git-runner" not in (ROOT / "docs" / "ci-plan.md").read_text()
-    assert "Jondi" not in (ROOT / ".github" / "ISSUE_TEMPLATE" / "config.yml").read_text()
+    assert (
+        "github.com/OWNER/REPO/security/advisories/new"
+        in (ROOT / ".github" / "ISSUE_TEMPLATE" / "config.yml").read_text()
+    )

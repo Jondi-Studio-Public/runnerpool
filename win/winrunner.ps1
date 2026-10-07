@@ -23,7 +23,7 @@ $AppInstallFile = Join-Path $HomeDir 'github-app-installation'   # cached instal
 $AppTokenFile = Join-Path $HomeDir 'github-app-token'            # cached installation token, SYSTEM and Administrators only
 $AppExpiryFile = Join-Path $HomeDir 'github-app-token.expires'   # "EPOCH ISO8601" of that token's expires_at
 $OrgFile = Join-Path $HomeDir 'org'                   # the GitHub org, written by the installer's bootstrap (its GITRUNNER_ORG setting)
-$AppOrg = if ($env:GITRUNNER_APP_ORG) { $env:GITRUNNER_APP_ORG } elseif ($env:GITRUNNER_ORG) { $env:GITRUNNER_ORG } elseif (Test-Path $OrgFile) { (Get-Content $OrgFile -Raw).Trim() } else { '' }   # the org the App is installed on; no default: Assert-AppOrg fails when it is empty
+$AppOrg = if ($env:GITRUNNER_APP_ORG) { $env:GITRUNNER_APP_ORG } elseif ($env:GITRUNNER_ORG) { $env:GITRUNNER_ORG } elseif (Test-Path $OrgFile) { ([string](Get-Content $OrgFile -Raw)).Trim() } else { '' }   # the org the App is installed on; no default: Assert-AppOrg fails when it is empty
 $AppRefreshMargin = 600   # seconds: mint a new installation token this long before the old one expires
 $BatteryFlag = Join-Path $HomeDir 'pause-on-battery'  # present = CI pauses on battery (default)
 $CiOff = Join-Path $HomeDir 'ci-off'                  # present = CI runners take no jobs (`ci off`)
@@ -180,6 +180,8 @@ function Invoke-GhApp([string]$method, [string]$path) {  # called as the App (a 
     Invoke-RestMethod -Method $method -Uri "https://api.github.com/$path" -Headers $h -TimeoutSec 30
 }
 
+function Get-AppOrgLabel { if ($AppOrg) { $AppOrg } else { 'org not set (GITRUNNER_ORG)' } }
+
 function Assert-AppOrg {  # the App's org has no default: say so instead of looking one up that is not yours
     if (-not $AppOrg) { throw 'GITRUNNER_ORG is not set: the GitHub App needs to know which org it is installed on. Rebuild the installer with GITRUNNER_ORG=<your org> (runner build-win does), or set GITRUNNER_ORG for this command.' }
 }
@@ -285,7 +287,7 @@ function Get-CredentialLine([string]$repo) {  # what `status` prints after "toke
             try {
                 Initialize-AppToken
                 "GitHub App $id, token valid until $(((Get-Content $AppExpiryFile -Raw).Trim() -split ' ')[1])"
-            } catch { "GitHub App $id, but no token can be minted (check the key, and that the App is installed on $AppOrg)" }
+            } catch { "GitHub App $id, but no token can be minted (check the key, and that the App is installed on $(Get-AppOrgLabel))" }
         }
         'pat' { if ($repo) { "GitHub token stored, expires $(Get-TokenExpiry $repo)" } else { 'GitHub token stored' } }
         default { 'none (runners cannot re-register themselves)' }
@@ -1269,7 +1271,7 @@ function Invoke-Doctor {
     if (Test-AppConfigured) {
         $minted = $false
         try { Initialize-AppToken; $minted = $true } catch { Write-Verbose $_.Exception.Message }
-        Check "GitHub App token can be minted (installation on $AppOrg)" $minted 'bad key, App not installed on the org, or no network'
+        Check "GitHub App token can be minted (installation on $(Get-AppOrgLabel))" $minted 'bad key, App not installed on the org, or no network'
     }
     $api = $false
     if (Test-HasCredential) { try { Invoke-Gh 'GET' 'rate_limit' | Out-Null; $api = $true } catch { Write-Verbose $_.Exception.Message } }

@@ -156,8 +156,12 @@ def app_env(tmp_path, **extra):
 def test_owner_has_no_default_and_a_configured_app_without_an_org_is_an_error(tmp_path):
     with pytest.raises(G.AppTokenError, match="GH_APP_OWNER"):
         G.AppTokenSource.from_env(app_env(tmp_path))
-    with pytest.raises(G.AppTokenError, match="GH_APP_OWNER"):
-        G.TokenProvider.from_env(app_env(tmp_path), pat="p")
+
+
+def test_provider_without_an_org_logs_and_falls_back_to_the_pat(tmp_path, capsys):
+    p = G.TokenProvider.from_env(app_env(tmp_path), pat="p")
+    assert p.source is None and p.token() == "p"
+    assert "GITRUNNER_ORG" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("var", ["GITRUNNER_ORG", "MACS_ORG", "WATCHDOG_ORG"])

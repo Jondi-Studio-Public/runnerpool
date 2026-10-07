@@ -46,6 +46,7 @@ FUNCS = [
     "Get-AppJwt",
     "Invoke-GhApp",
     "Assert-AppOrg",
+    "Get-AppOrgLabel",
     "Get-AppInstallationId",
     "Update-AppToken",
     "Initialize-AppToken",
