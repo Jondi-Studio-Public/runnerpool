@@ -95,6 +95,7 @@ PC_PUSH_RE = re.compile(r"^(?:win|wsl)-\d+$")  # hosts that push their own info:
 PUSH_TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{20,200}$")
 PUSH_TOKENS_FILE = os.environ.get("MACS_PUSH_TOKENS_FILE", "")  # lines `host=token`; empty/absent = push is off
 PUSH_STALE = 90  # a PC that has not reported for this many seconds is shown as not reporting
+PUSH_DIRECT_FRESH = 45  # a push this old still counts as the device reporting itself (it pushes every 30 s)
 PUSH_MIN_GAP = 5  # seconds between accepted pushes from one PC
 PUSH_MAX_BODY = 65536
 PUSH_FAIL_LIMIT = 20  # failed pushes per minute (all hosts) before pushes are refused for a minute
@@ -785,7 +786,7 @@ def device_groups(repos, macs):
 def device_reporters(host, runner_name):
     """The hosts whose own report may speak for RUNNER_NAME on device HOST: the device itself, and for a
     PC's WSL runners (win-N-wsl-M, wsl-N-admin) its wsl-N."""
-    n = host.split("-", 1)[1] if host.startswith("win-") else None
+    n = host.partition("-")[2] if host.startswith("win-") else None
     if n and (WSL_RUNNER_RE.match(runner_name) or runner_name.startswith(f"wsl-{n}-")):
         return ["wsl-" + n]
     return [host]
@@ -1057,7 +1058,7 @@ class State:
             hosts = list(self.pushed)
         for host in hosts:
             have = self.fresh_push(host)
-            if have:
+            if have and time.time() - have["at"] <= PUSH_DIRECT_FRESH:
                 out[host] = have["info"]
         return out
 
@@ -1075,7 +1076,7 @@ class State:
                     return False
                 continue
             needed = [d["host"]]
-            n = d["host"].split("-", 1)[1]
+            n = d["host"].partition("-")[2]
             if any(
                 WSL_RUNNER_RE.match(r["name"].lower()) or r["name"].lower().startswith(f"wsl-{n}-")
                 for r in d["runners"]
@@ -1290,7 +1291,12 @@ class State:
         """Lowercased names of the online runners the last runner list says are busy."""
         with self.lock:
             repos = (self.runners or {}).get("repos", [])
-        return {r["name"].lower() for repo in repos for r in repo["runners"] if r["busy"] and r["status"] == "online"}
+        names = {r["name"].lower() for repo in repos for r in repo["runners"] if r["busy"] and r["status"] == "online"}
+        for info in self.direct_reports().values():  # a device's own report is fresher than a 60 s old list
+            for x in (info or {}).get("runners") or []:
+                if isinstance(x, dict) and x.get("busy") is True and isinstance(x.get("name"), str):
+                    names.add(x["name"].lower())
+        return names
 
     def get_activity(self):
         """Refresh runner_activity, but only while a runner is busy; the repos are those of the CI panel."""
@@ -1401,7 +1407,7 @@ class State:
             return True
         if not is_pc_host(host):
             return False
-        n = host.split("-", 1)[1]
+        n = host.partition("-")[2]
         listed = any(d["host"] == f"win-{n}" for d in self.get_runners().get("devices", []))
         if host.startswith("wsl-"):
             return action == "limit" and listed

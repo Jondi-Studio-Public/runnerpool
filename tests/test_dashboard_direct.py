@@ -172,3 +172,17 @@ def test_overlay_ignores_malformed_runner_reports():
     bad = {"runners": [{"name": "win-1", "busy": "yes"}, {"busy": True}, "x", {"name": 3, "busy": True}]}
     out = s.overlay_busy(device_list(), {"win-1": bad, "wsl-1": None})
     assert [r["busy"] for r in out[1]["runners"]] == [False, False]
+
+
+def test_busy_runners_include_a_devices_own_busy_report(state):
+    s, st = state
+    st.push_info("wsl-1", linux_info(busy=True))
+    assert "win-1-wsl-1" in st.busy_runners()
+
+
+def test_a_push_older_than_the_direct_window_is_not_direct(state):
+    s, st = state
+    st.push_info("wsl-1", linux_info())
+    assert "wsl-1" in st.direct_reports()
+    st.clock[0] += s.PUSH_DIRECT_FRESH + 1
+    assert "wsl-1" not in st.direct_reports()

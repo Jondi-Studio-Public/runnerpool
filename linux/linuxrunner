@@ -146,7 +146,7 @@ push_once() {  # -> prints the HTTP status; non-zero when nothing could be sent
     cfg=$(mktemp)   # mktemp makes it 0600
     trap 'rm -f "$cfg"' EXIT
     printf 'header = "Authorization: Bearer %s"\n' "$(tr -d '\r\n ' < "$PUSH_TOKEN")" > "$cfg"
-    code=$(cmd_info | curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -K "$cfg" \
+    code=$(cmd_info 2>/dev/null | curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -K "$cfg" \
       -H 'Content-Type: application/json' --data-binary @- "$url") || exit 1
     echo "$code"
     [ "$code" = 200 ]
@@ -173,7 +173,7 @@ cmd_push_setup() {  # URL TOKENFILE: store the dashboard address and this box's 
   local url=${1%/} tokfile=$2 hostname
   url=${url%/api/push-info}
   case $url in https://*|http://*) ;; *) die "URL must start with https:// (or http:// on a trusted network)" ;; esac
-  [[ "$url" =~ ^https?://[A-Za-z0-9._:/@-]+$ ]] || die "URL has characters it should not (letters, digits and . _ : / - only)"
+  [[ "$url" =~ ^https?://[A-Za-z0-9._:/-]+$ ]] || die "URL has characters it should not (letters, digits and . _ : / - only)"
   [ -f "$tokfile" ] || die "token file $tokfile is missing"
   [[ "$(tr -d '\r\n ' < "$tokfile")" =~ ^[A-Za-z0-9._~+/=-]{20,200}$ ]] || die "token file $tokfile does not hold a 20-200 character token"
   hostname=$(host)
