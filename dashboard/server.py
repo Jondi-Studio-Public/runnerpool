@@ -153,15 +153,16 @@ def now():
 _TOKENS = gh_app_token.TokenProvider.from_env()
 
 
-def gh_env(env=None):
+def gh_env(env=None, min_ttl=0):
     """The environment for a `gh` call: with the GitHub App configured, GH_TOKEN is its current
-    installation token (minted and refreshed by gh_app_token). Otherwise env is returned as given
-    (None = inherit), so the PAT from the entrypoint is used exactly as before. A caller that
-    passes its own token (the personal-repo path) builds env itself and bypasses this."""
+    installation token (minted and refreshed by gh_app_token), valid for at least min_ttl s more.
+    Otherwise env is returned as given (None = inherit), so the PAT from the entrypoint is used exactly
+    as before. A caller that passes its own token (the personal-repo path) builds env itself and
+    bypasses this."""
     if not _TOKENS.source:
         return env
     try:
-        tok = _TOKENS.token()
+        tok = _TOKENS.token(min_ttl)
     except gh_app_token.AppTokenError as e:
         gh_app_token.log(f"GitHub App token unavailable: {e}")
         return env
@@ -337,7 +338,9 @@ def macs(args, timeout):
     if "GITRUNNER_ORG" not in env:
         env["GITRUNNER_ORG"] = ORG
         env.setdefault("GITRUNNER_REPO", ADMIN_REPO)
-    return run([bash, script, *args], timeout, env)
+    # Its gh calls get the App's token as the dashboard's own do (run() only adds it for a bare `gh`),
+    # one that outlives the whole call (plus a minute's slack): with the App set up the PAT may be gone.
+    return run([bash, script, *args], timeout, gh_env(env, min_ttl=timeout + 60))
 
 
 _MAIN_SHA = {"at": 0.0, "sha": ""}
