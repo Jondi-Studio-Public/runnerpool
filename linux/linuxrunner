@@ -36,6 +36,10 @@ FOLLOW_UNIT=win-runners-follow.service
 LOCK_FILE=$HOME_DIR/lock             # held (flock) by every command that changes the runners, so two never run at once
 MAINT_FILE=$HOME_DIR/maintenance    # `PID TIME` while `ramdisk` changes the runners: slot-sync must not restart them
 RAMDISK_FILE=$HOME_DIR/ramdisk      # `ramdisk on` writes the size in MB here; add-runner reads it for new runners
+PUSH_CONF=$HOME_DIR/dashboard-push.json   # {url, host}; absent = no health push (`push-setup`)
+PUSH_TOKEN=$HOME_DIR/dashboard-push-token # the dashboard's token for this box, root only
+PUSH_UNIT=linuxrunner-push.service
+PUSH_EVERY=${PUSH_EVERY:-30}              # seconds between health pushes to the dashboard
 CI_USER=${CI_USER:-runner}           # who adopted and new CI runners run as
 UNIT_GLOB='actions.runner.*.service'
 
@@ -110,7 +114,7 @@ cmd_info() {
   local u d first=1
   local ram_mb
   ram_mb=$(free -m | awk '/Mem:/{print $2}')
-  printf '{"host":%s,"kind":"linux","cores":%s,"ram_mb":%s,"memory_gb":%s,"ci_on":%s,"max_cores":%s,"slots":%s,"slot_threads":%s,"slots_held":%s,"runners":[' \
+  printf '{"host":%s,"kind":"linux","platform":"linux","cores":%s,"ram_mb":%s,"memory_gb":%s,"ci_on":%s,"max_cores":%s,"slots":%s,"slot_threads":%s,"slots_held":%s,"runners":[' \
     "$(jstr "$(host)")" "$(nproc)" "$ram_mb" "$(( (ram_mb + 512) / 1024 ))" \
     "$([ -f "$CI_OFF" ] && echo false || echo true)" "$([ -f "$CORES_FILE" ] && cat "$CORES_FILE" || echo null)" \
     "$(slots_n | grep . || echo null)" "$(slots_threads | grep . || echo null)" "$(held_slots | wc -l)"
@@ -124,6 +128,70 @@ cmd_info() {
       "$(is_busy "$u" && echo true || echo false)" "$(jstr "$(runner_field "$d" gitHubUrl)")" "${lc:-null}" "${lr:-null}"
   done
   echo ']}'
+}
+
+# --- health push to the dashboard ---------------------------------------------------------
+# The box reports its own `info` JSON to POST <url>/api/push-info with a bearer token, so the dashboard
+# reads it straight from the box (over the tailnet, a LAN or any HTTPS address) instead of asking GitHub.
+# Off unless `push-setup` wrote $PUSH_CONF. The token is only ever read from $PUSH_TOKEN and handed to curl
+# through a private config file: never logged, never on a command line.
+
+push_once() {  # -> prints the HTTP status; non-zero when nothing could be sent
+  [ -f "$PUSH_CONF" ] && [ -f "$PUSH_TOKEN" ] || { echo "push is not set up here: run linuxrunner push-setup URL TOKENFILE" >&2; return 2; }
+  local url cfg code
+  url=$(sed -nE 's|.*"url"[[:space:]]*:[[:space:]]*"([^"]*)".*|\1|p' "$PUSH_CONF" | head -1)
+  [ -n "$url" ] || { echo "push config has no url" >&2; return 2; }
+  cfg=$(mktemp)   # mktemp makes it 0600
+
+  printf 'header = "Authorization: Bearer %s"\n' "$(tr -d '\r\n ' < "$PUSH_TOKEN")" > "$cfg"
+  code=$(cmd_info | curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -K "$cfg" \
+    -H 'Content-Type: application/json' --data-binary @- "$url") || { rm -f "$cfg"; return 1; }
+  rm -f "$cfg"
+  echo "$code"
+  [ "$code" = 200 ]
+}
+
+cmd_push() { push_once >/dev/null || return 1; }
+
+cmd_push_loop() {
+  local failing=0 code
+  while :; do
+    if code=$(push_once 2>&1); then
+      [ "$failing" = 0 ] || log "dashboard push works again"
+      failing=0
+    elif [ "$failing" = 0 ]; then
+      log "dashboard push failed (${code:-no answer}); retrying every ${PUSH_EVERY}s"; failing=1
+    fi
+    sleep "$PUSH_EVERY"
+  done
+}
+
+cmd_push_setup() {  # URL TOKENFILE: store the dashboard address and this box's token, start the push service
+  need_root
+  local url=${1%/} tokfile=$2 hostname
+  url=${url%/api/push-info}
+  case $url in https://*|http://*) ;; *) die "URL must start with https:// (or http:// on a trusted network)" ;; esac
+  [ -s "$tokfile" ] || die "token file $tokfile is missing or empty"
+  hostname=$(host)
+  [[ "$hostname" =~ ^wsl-[0-9]+$ ]] || die "the dashboard accepts pushes from wsl-N hosts only; name this box first: linuxrunner bootstrap wsl-1"
+  mkdir -p "$HOME_DIR"
+  (umask 077; tr -d '\r\n ' < "$tokfile" > "$PUSH_TOKEN.new") && mv "$PUSH_TOKEN.new" "$PUSH_TOKEN"
+  printf '{"url":"%s/api/push-info","host":"%s"}\n' "$url" "$hostname" > "$PUSH_CONF"
+  printf '[Unit]\nDescription=Report this box to the runner dashboard\nAfter=network-online.target\n[Service]\nExecStart=%s/linuxrunner push-loop\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' "$HOME_DIR" > "$SYSTEMD_DIR/$PUSH_UNIT"
+  systemctl daemon-reload; systemctl enable "$PUSH_UNIT" >/dev/null 2>&1 || true; systemctl restart "$PUSH_UNIT"
+  log "health push set up: $url/api/push-info as $hostname every ${PUSH_EVERY}s. Delete $tokfile now."
+}
+
+cmd_push_test() {
+  local code
+  code=$(push_once 2>&1) && { echo "push accepted (HTTP $code)"; return 0; }
+  case $code in
+    401) echo "the dashboard does not know this token: check this box's line in its push tokens, then restart the dashboard" ;;
+    429) echo "too many pushes or bad tokens; wait a minute" ;;
+    503) echo "the dashboard has no push tokens yet (empty push_tokens secret)" ;;
+    *) echo "push failed: ${code:-no answer}" ;;
+  esac
+  return 1
 }
 
 cmd_logs() {  # [name] [lines]
@@ -856,6 +924,9 @@ linuxrunner: manage GitHub Actions runners on a systemd Linux box (adopts existi
   install-docker                     Docker Engine from Docker's apt repo (x86-64 only), dockerd enabled, runners' users in
                                      the docker group; add-runner does it when the labels include docker
   install-admin REPO TOKEN [NAME]    the root runner `runner` reaches this box through
+  push-setup URL TOKENFILE           report this box's info to the dashboard every 30 s (wsl-N hosts); URL like
+                                     https://runners.example.com or a tailnet address; TOKENFILE holds this box's token
+  push-test                          send the info once and say what the dashboard answered
   self-update FILE
 USAGE
 }
@@ -879,6 +950,10 @@ case $cmd in
   install-admin) [ $# -ge 2 ] || die "install-admin REPO TOKEN [NAME]"; cmd_install_admin "$@" ;;
   slots) [ $# -ge 1 ] || die "slots N [THREADS] | off"; locked cmd_slots "$@" ;;
   slot-sync) cmd_slot_sync ;;
+  push) cmd_push ;;
+  push-loop) cmd_push_loop ;;
+  push-setup) [ $# -eq 2 ] || die "push-setup URL TOKENFILE"; cmd_push_setup "$@" ;;
+  push-test) cmd_push_test ;;
   hook) [ $# -eq 1 ] || die "hook acquire|release"; cmd_hook "$1" ;;
   follow) [ $# -eq 1 ] || die "follow STATEFILE"; cmd_follow "$1" ;;
   follow-once) [ $# -eq 1 ] || die "follow-once STATEFILE"; cmd_follow_once "$1" ;;

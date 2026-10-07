@@ -3,13 +3,14 @@
 
 Started by `./runner dashboard [--port N] [--no-open]`. It reads:
   * GitHub's runner lists (gh api), for every runner's online/busy state, PC ones included;
-  * each PC's specs and settings, pushed by the PC itself (see push_info);
+  * each PC's specs and settings, pushed by the PC itself (see push_info), and the same from a Linux box
+    (`wsl-N`, `linuxrunner push-setup`);
   * each Mac's specs and settings (`macrunner info`) over Tailscale SSH, or on request
     through the Admin workflow (`runner info HOST`) when SSH can't reach it.
 Setting changes go over SSH too, and through the Admin workflow (`runner ...`) when SSH can't
 connect. A Windows PC (`win-N`) is not polled: it pushes its own health JSON (`winrunner info`) to
 POST /api/push-info every 30 s with its own bearer token (MACS_PUSH_TOKENS_FILE), and the page shows the
-latest push. Its changes go through the Admin workflow. Every action names a Mac found through its
+latest push. While every device reports itself, the GitHub runner list is read every RUNNERS_EVERY_DIRECT s. Its changes go through the Admin workflow. Every action names a Mac found through its
 `<host>-admin` runner or a listed PC, and nothing else.
 
 Only this PC can reach it (127.0.0.1), and every API call must carry the random token printed
@@ -78,6 +79,9 @@ os.makedirs(SSH_SOCKETS, mode=0o700, exist_ok=True)
 INFO_EVERY = 10
 INFO_BACKOFF = 45
 RUNNERS_EVERY = 10
+# While every device is reporting its own runner state (Mac info over SSH, PC and WSL pushes), the runner list
+# is read from GitHub this often instead, and the device-reported `busy` is shown in place of GitHub's.
+RUNNERS_EVERY_DIRECT = 60
 IDLE_AFTER = 300
 # Which job each busy runner is on: read only while some runner is busy, every ACTIVITY_EVERY s, one gh
 # call at a time. An entry older than ACTIVITY_MAX_AGE s is no longer shown.
@@ -86,7 +90,7 @@ ACTIVITY_MAX_AGE = 300  # a walk over every repo can take minutes; the 90 s it h
 ACTIVITY_RUNS = 30  # in-progress runs read per repo
 HERE = Path(__file__).resolve().parent
 HOST_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
-PC_PUSH_RE = re.compile(r"^win-\d+$")  # PCs that push their own info (wsl-N is managed through GitHub only)
+PC_PUSH_RE = re.compile(r"^(?:win|wsl)-\d+$")  # hosts that push their own info: win-N (Windows) and wsl-N (Linux)
 PUSH_TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{20,200}$")
 PUSH_TOKENS_FILE = os.environ.get("MACS_PUSH_TOKENS_FILE", "")  # lines `host=token`; empty/absent = push is off
 PUSH_STALE = 90  # a PC that has not reported for this many seconds is shown as not reporting
@@ -777,6 +781,19 @@ def device_groups(repos, macs):
     return ordered, other
 
 
+def overlay_busy(devices, direct):
+    """Copy of devices where each runner's `busy` is what its device last reported itself (`direct`:
+    {host: info}, with info["runners"] = [{name, busy}]), which is fresher than GitHub's runner list."""
+    busy = {}
+    for info in direct.values():
+        for r in (info or {}).get("runners") or []:
+            if isinstance(r, dict) and isinstance(r.get("name"), str) and isinstance(r.get("busy"), bool):
+                busy[r["name"].lower()] = r["busy"]
+    return [
+        {**d, "runners": [{**r, "busy": busy.get(r["name"].lower(), r["busy"])} for r in d["runners"]]} for d in devices
+    ]
+
+
 def default_limits(cores, ram_mb, n_ci):
     """The default per-runner share: floor(0.8 * cores / n) cores (at least 1) and 0.8 * RAM / n MB.
     -> {"cores": int|None, "ram_mb": int|None}; None where the device's size is unknown."""
@@ -1001,6 +1018,48 @@ class State:
         with self.lock:
             self.push_fails.append(time.time())
 
+    def fresh_push(self, host):
+        """HOST's last push when it is fresh (within PUSH_STALE), else None."""
+        with self.lock:
+            have = self.pushed.get(host)
+        return have if have and time.time() - have["at"] <= PUSH_STALE else None
+
+    def direct_reports(self):
+        """{host: info} of the devices that currently report their own state: Macs whose last SSH info
+        is good and recent, and the hosts whose last push is fresh."""
+        out = {}
+        with self.lock:
+            for host, res in self.infos.items():
+                if res.get("ok") and time.time() - self.info_at.get(host, 0) <= 3 * INFO_EVERY:
+                    out[host] = res["info"]
+        with self.lock:
+            hosts = list(self.pushed)
+        for host in hosts:
+            have = self.fresh_push(host)
+            if have:
+                out[host] = have["info"]
+        return out
+
+    def direct_covers(self):
+        """True when every device in the last runner list reports its own runner state, so the GitHub
+        runner list can be read less often. A PC with WSL runners needs both win-N and wsl-N to report."""
+        with self.lock:
+            devices = (self.runners or {}).get("devices") or []
+        if not devices:
+            return False
+        direct = self.direct_reports()
+        for d in devices:
+            if d["kind"] == "mac":
+                if d["host"] not in direct:
+                    return False
+                continue
+            needed = [d["host"]]
+            if any(WSL_RUNNER_RE.match(r["name"].lower()) for r in d["runners"]):
+                needed.append("wsl-" + d["host"].split("-", 1)[1])
+            if any(h not in direct for h in needed):
+                return False
+        return True
+
     def touch(self):
         """Called on every API read: starts the background refresh and wakes it after idling."""
         self.last_seen = time.time()
@@ -1038,7 +1097,11 @@ class State:
             self.wake.clear()
             if time.time() - self.last_seen > IDLE_AFTER:
                 continue
-            schedule("runners", RUNNERS_EVERY, lambda: self.get_runners(force=True))
+            schedule(
+                "runners",
+                RUNNERS_EVERY_DIRECT if self.direct_covers() else RUNNERS_EVERY,
+                lambda: self.get_runners(force=True),
+            )
             schedule("runs", RUNS_TTL, lambda: self.get_runs(force=True))
             schedule("ci", CI_TTL, lambda: self.get_ci(force=True))
             schedule("jobs", JOBS_TTL, lambda: self.get_jobs(force=True))
@@ -1270,9 +1333,12 @@ class State:
         limits = load_limits()
         with self.lock:
             status = {h: dict(v) for h, v in self.limit_status.items()}
+        devices = with_limits(answer.get("devices", []), infos, limits)
+        if answer.get("devices"):
+            devices = overlay_busy(devices, self.direct_reports())
         return {
             **answer,
-            "devices": with_limits(answer.get("devices", []), infos, limits),
+            "devices": devices,
             "limits": limits,
             "limit_status": status,
             "actions_in_flight": self.actions_in_flight(),
@@ -1432,7 +1498,7 @@ def offline_reason(rc, text):
 
 
 def is_push_host(host):
-    """win-N: a Windows PC that pushes its own info."""
+    """win-N (a Windows PC) or wsl-N (its Linux side): hosts that push their own info."""
     return bool(PC_PUSH_RE.match(host or ""))
 
 
@@ -1467,14 +1533,28 @@ def _num(v):
 
 
 def validate_push(info, host):
-    """Why INFO is not a Windows info object from HOST, or None. `winrunner info` prints it."""
+    """Why INFO is not an info object from HOST, or None. `winrunner info` (win-N) or `linuxrunner info`
+    (wsl-N) prints it."""
     if not isinstance(info, dict):
         return "body must be the JSON info object"
     if info.get("host") != host or not HOST_RE.match(str(info.get("host"))):
         return f"info.host must be {host}"
-    if info.get("platform") != "windows":
-        return "info.platform must be windows"
-    for key in ("cores", "memory_gb", "uptime_s", "disk_total_gb", "disk_free_gb", "memory_free_pct"):
+    platform = "linux" if host.startswith("wsl-") else "windows"
+    if info.get("platform") != platform:
+        return f"info.platform must be {platform}"
+    keys = (
+        ("cores", "memory_gb")
+        if platform == "linux"
+        else (
+            "cores",
+            "memory_gb",
+            "uptime_s",
+            "disk_total_gb",
+            "disk_free_gb",
+            "memory_free_pct",
+        )
+    )
+    for key in keys:
         if not _num(info.get(key)):
             return f"info.{key} must be a number"
     for key in ("settings", "battery"):

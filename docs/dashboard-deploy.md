@@ -192,3 +192,27 @@ pushes more than once per 5 s (or after 20 bad tokens in a minute), and 503 whil
 ## Webhook receiver
 
 A third container, `ci-webhook`, takes the GitHub App's `workflow_job` and `workflow_run` webhooks into a shared store so the dashboard stops polling GitHub: setup, Funnel and rollback are in [webhook.md](webhook.md).
+
+### Linux and WSL boxes (`wsl-N`)
+
+A Linux box that runs `linuxrunner` (the PC's WSL distro, named `wsl-1` by `linuxrunner bootstrap wsl-1`)
+reports the same way, so the dashboard learns its runners' state without asking GitHub. Add a
+`wsl-1=<token>` line to the same push tokens item, run `scripts/provision-secrets.sh --push` and
+redeploy, then on the box, as root, with the token in a file:
+
+```bash
+linuxrunner push-setup https://runners.example.com /root/push-token.txt   # or a tailnet address
+rm /root/push-token.txt
+linuxrunner push-test                                                     # "push accepted (HTTP 200)"
+```
+
+`push-setup` writes `/opt/git-runner/dashboard-push.json` and the token (root only) and starts the
+`linuxrunner-push` service, which pushes every 30 s. The address may be any URL the box can reach,
+such as the dashboard's Tailscale name, so the report never leaves your network.
+
+### Fewer GitHub calls
+
+While every device reports its own runner state (each Mac over SSH, each `win-N` and `wsl-N` by
+push) the dashboard reads GitHub's runner list once a minute instead of every 10 s, and shows each
+runner's `busy` as its device reports it. As soon as one device stops reporting it goes back to every
+10 s. Workflow runs, jobs and the CI panel still come from GitHub.
