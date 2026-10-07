@@ -51,7 +51,7 @@ ssh_args() {
     ramdisk-on) printf '%s\n' ramdisk on "$size" ;;
     ramdisk-off) printf '%s\n' ramdisk off ;;
     cores) printf '%s\n' cores "$cores" ;;
-    limit) printf '%s\n' limit "$name" "${lim[@]}" ;;
+    limit) case $name in ''|*-admin) return 1 ;; esac; printf '%s\n' limit "$name" ${lim[@]+"${lim[@]}"} ;;
     *) return 1 ;;
   esac
 }
@@ -492,7 +492,7 @@ case $cmd in
     esac ;;
   postgres) [ $# -eq 1 ] || die "postgres HOST"; mac_only "$1" postgres; admin "$1" postgres-install ;;
   ci) [ $# -eq 2 ] && [[ "$2" =~ ^(on|off)$ ]] || die "ci HOST on|off"; admin "$1" "ci-$2" ;;
-  cores) [ $# -eq 2 ] || die "cores HOST N|all"; admin "$1" cores "cores=$2" ;;
+  cores) [ $# -eq 2 ] && [[ "$2" =~ ^([0-9]+|all)$ ]] || die "cores HOST N|all"; admin "$1" cores "cores=$2" ;;
   slots) [ $# -ge 2 ] && [ $# -le 4 ] || die "slots HOST N|off [THREADS] | hold|release [NAME [TIMEOUT]]"
     case $2 in
       hold|release)

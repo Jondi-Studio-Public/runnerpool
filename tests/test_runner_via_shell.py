@@ -103,9 +103,19 @@ def test_bad_runner_via_is_rejected(tmp_path):
 
 
 def test_unsafe_value_never_reaches_ssh(tmp_path):
-    r, ssh, gh = run(tmp_path, "cores", "air-1", "4; touch /tmp/x")
+    r, ssh, gh = run(tmp_path, "logs", "air-1", "x; touch /tmp/x")
     assert ssh == []
     assert "not safe to send over ssh" in r.stderr
+
+
+def test_cores_must_be_a_number_or_all(tmp_path):
+    r, ssh, gh = run(tmp_path, "cores", "air-1", "4; touch /tmp/x")
+    assert r.returncode != 0 and ssh == [] and gh == []
+
+
+def test_limit_on_an_admin_runner_skips_ssh(tmp_path):
+    r, ssh, gh = run(tmp_path, "limit", "air-1", "air-1-admin", "cores=2")
+    assert ssh == []
 
 
 def test_non_mac_hosts_never_use_ssh(tmp_path):
