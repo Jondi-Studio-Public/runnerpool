@@ -112,6 +112,27 @@ def test_push_test_explains_the_dashboards_answer(tmp_path):
     assert run({**env, "STUB_CODE": "fail"}, "push-test").returncode == 1
 
 
+def test_push_setup_rejects_a_malformed_token_or_url(tmp_path):
+    env, home, _, tok = setup(tmp_path)
+    tok.write_text('short"token\n')
+    assert run(env, "push-setup", "https://x.example.com", str(tok)).returncode != 0
+    tok.write_text("  \n")
+    assert run(env, "push-setup", "https://x.example.com", str(tok)).returncode != 0
+    tok.write_text(TOKEN)
+    assert run(env, "push-setup", 'https://x.example.com/"x', str(tok)).returncode != 0
+    assert not (home / "dashboard-push.json").exists()
+
+
+def test_push_leaves_no_token_file_behind(tmp_path):
+    env, _, _, tok = setup(tmp_path)
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    env["TMPDIR"] = str(tmp)
+    assert run(env, "push-setup", "https://runners.example.com", str(tok)).returncode == 0
+    assert run(env, "push").returncode == 0
+    assert list(tmp.iterdir()) == []
+
+
 def test_push_before_setup_says_how_to_set_it_up(tmp_path):
     env, *_ = setup(tmp_path)
     r = run(env, "push")

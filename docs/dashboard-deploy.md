@@ -215,4 +215,4 @@ such as the dashboard's Tailscale name, so the report never leaves your network.
 While every device reports its own runner state (each Mac over SSH, each `win-N` and `wsl-N` by
 push) the dashboard reads GitHub's runner list once a minute instead of every 10 s, and shows each
 runner's `busy` as its device reports it. As soon as one device stops reporting it goes back to every
-10 s. Workflow runs, jobs and the CI panel still come from GitHub.
+10 s. A runner's online/offline state still comes from GitHub, so a runner going offline can show up to a minute late in this mode. Workflow runs, jobs and the CI panel still come from GitHub.

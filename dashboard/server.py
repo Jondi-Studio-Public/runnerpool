@@ -10,7 +10,8 @@ Started by `./runner dashboard [--port N] [--no-open]`. It reads:
 Setting changes go over SSH too, and through the Admin workflow (`runner ...`) when SSH can't
 connect. A Windows PC (`win-N`) is not polled: it pushes its own health JSON (`winrunner info`) to
 POST /api/push-info every 30 s with its own bearer token (MACS_PUSH_TOKENS_FILE), and the page shows the
-latest push. While every device reports itself, the GitHub runner list is read every RUNNERS_EVERY_DIRECT s. Its changes go through the Admin workflow. Every action names a Mac found through its
+latest push. Its changes go through the Admin workflow. While every device reports itself, the GitHub runner list
+is read only every RUNNERS_EVERY_DIRECT s. Every action names a Mac found through its
 `<host>-admin` runner or a listed PC, and nothing else.
 
 Only this PC can reach it (127.0.0.1), and every API call must carry the random token printed
@@ -781,17 +782,37 @@ def device_groups(repos, macs):
     return ordered, other
 
 
+def device_reporters(host, runner_name):
+    """The hosts whose own report may speak for RUNNER_NAME on device HOST: the device itself, and for a
+    PC's WSL runners (win-N-wsl-M, wsl-N-admin) its wsl-N."""
+    n = host.split("-", 1)[1] if host.startswith("win-") else None
+    if n and (WSL_RUNNER_RE.match(runner_name) or runner_name.startswith(f"wsl-{n}-")):
+        return ["wsl-" + n]
+    return [host]
+
+
 def overlay_busy(devices, direct):
-    """Copy of devices where each runner's `busy` is what its device last reported itself (`direct`:
-    {host: info}, with info["runners"] = [{name, busy}]), which is fresher than GitHub's runner list."""
-    busy = {}
-    for info in direct.values():
-        for r in (info or {}).get("runners") or []:
-            if isinstance(r, dict) and isinstance(r.get("name"), str) and isinstance(r.get("busy"), bool):
-                busy[r["name"].lower()] = r["busy"]
-    return [
-        {**d, "runners": [{**r, "busy": busy.get(r["name"].lower(), r["busy"])} for r in d["runners"]]} for d in devices
-    ]
+    """Copy of devices where each online runner's `busy` is what its own device last reported (`direct`:
+    {host: info}, with info["runners"] = [{name, busy}]), which is fresher than GitHub's runner list. A
+    report only speaks for runners of its own device."""
+    out = []
+    for d in devices:
+        runners = []
+        for r in d["runners"]:
+            name = r["name"].lower()
+            busy = r["busy"]
+            if r.get("status") == "online":
+                for host in device_reporters(d["host"], name):
+                    for x in ((direct.get(host) or {}).get("runners")) or []:
+                        if (
+                            isinstance(x, dict)
+                            and str(x.get("name")).lower() == name
+                            and isinstance(x.get("busy"), bool)
+                        ):
+                            busy = x["busy"]
+            runners.append({**r, "busy": busy})
+        out.append({**d, "runners": runners})
+    return out
 
 
 def default_limits(cores, ram_mb, n_ci):
@@ -1054,10 +1075,25 @@ class State:
                     return False
                 continue
             needed = [d["host"]]
-            if any(WSL_RUNNER_RE.match(r["name"].lower()) for r in d["runners"]):
-                needed.append("wsl-" + d["host"].split("-", 1)[1])
+            n = d["host"].split("-", 1)[1]
+            if any(
+                WSL_RUNNER_RE.match(r["name"].lower()) or r["name"].lower().startswith(f"wsl-{n}-")
+                for r in d["runners"]
+            ):
+                needed.append("wsl-" + n)
             if any(h not in direct for h in needed):
                 return False
+        for d in devices:  # every runner must be named in its device's report, or its dot would sit at 60 s
+            for r in d["runners"]:
+                name = r["name"].lower()
+                hosts = device_reporters(d["host"], name)
+                if not any(
+                    str(x.get("name")).lower() == name
+                    for h in hosts
+                    for x in ((direct.get(h) or {}).get("runners")) or []
+                    if isinstance(x, dict)
+                ):
+                    return False
         return True
 
     def touch(self):
@@ -1097,11 +1133,7 @@ class State:
             self.wake.clear()
             if time.time() - self.last_seen > IDLE_AFTER:
                 continue
-            schedule(
-                "runners",
-                RUNNERS_EVERY_DIRECT if self.direct_covers() else RUNNERS_EVERY,
-                lambda: self.get_runners(force=True),
-            )
+            schedule("runners", self.runners_ttl(), lambda: self.get_runners(force=True))
             schedule("runs", RUNS_TTL, lambda: self.get_runs(force=True))
             schedule("ci", CI_TTL, lambda: self.get_ci(force=True))
             schedule("jobs", JOBS_TTL, lambda: self.get_jobs(force=True))
@@ -1116,9 +1148,14 @@ class State:
                     lambda host=host: self.get_info(host, fresh=True),
                 )
 
+    def runners_ttl(self):
+        """How long the GitHub runner list may be reused: longer while every device reports itself."""
+        return RUNNERS_EVERY_DIRECT if self.direct_covers() else RUNNERS_EVERY
+
     def get_runners(self, force=False):
+        ttl = self.runners_ttl()  # not under the lock: direct_covers takes it
         with self.lock:
-            if not force and self.runners and time.time() - self.runners_at < RUNNERS_EVERY:
+            if not force and self.runners and time.time() - self.runners_at < ttl:
                 return self.runners
 
         def one(repo):
@@ -1334,7 +1371,7 @@ class State:
         with self.lock:
             status = {h: dict(v) for h, v in self.limit_status.items()}
         devices = with_limits(answer.get("devices", []), infos, limits)
-        if answer.get("devices"):
+        if answer.get("devices") and self.direct_covers():
             devices = overlay_busy(devices, self.direct_reports())
         return {
             **answer,

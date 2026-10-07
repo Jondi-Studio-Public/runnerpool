@@ -31,7 +31,13 @@ def linux_info(host="wsl-1", busy=False):
 
 
 def win_info(host="win-1"):
-    return {"host": host, "platform": "windows", "cores": 16, "memory_gb": 32, "runners": []}
+    return {
+        "host": host,
+        "platform": "windows",
+        "cores": 16,
+        "memory_gb": 32,
+        "runners": [{"name": host, "kind": "ci", "state": "running", "busy": False}],
+    }
 
 
 def device_list():
@@ -53,7 +59,7 @@ def state(monkeypatch):
 
 
 def mac_ok(st, s):
-    st.infos["air-1"] = {"ok": True, "info": {"host": "air-1", "runners": []}}
+    st.infos["air-1"] = {"ok": True, "info": {"host": "air-1", "runners": [{"name": "air-1-ci", "busy": False}]}}
     st.info_at["air-1"] = s.time.time()
 
 
@@ -121,6 +127,44 @@ def test_overlay_busy_uses_the_devices_own_report():
     assert [r["busy"] for r in out[1]["runners"]] == [False, True]
     assert [r["busy"] for r in out[0]["runners"]] == [False]
     assert device_list()[1]["runners"][1]["busy"] is False  # the input is not changed
+
+
+def test_overlay_only_speaks_for_its_own_device_and_online_runners():
+    s = load()
+    devs = device_list()
+    spoof = {"host": "wsl-1", "runners": [{"name": "air-1-ci", "busy": True}, {"name": "win-1", "busy": True}]}
+    out = s.overlay_busy(devs, {"wsl-1": spoof})
+    assert out[0]["runners"][0]["busy"] is False and out[1]["runners"][0]["busy"] is False  # not wsl-1's runners
+    devs[1]["runners"][1]["status"] = "offline"
+    out = s.overlay_busy(devs, {"wsl-1": linux_info(busy=True)})
+    assert out[1]["runners"][1]["busy"] is False
+
+
+def test_wsl_admin_runner_needs_wsl_report_and_runners_must_be_listed(state):
+    s, st = state
+    st.runners["devices"][1]["runners"] = [runner("win-1"), runner("wsl-1-admin")]
+    mac_ok(st, s)
+    st.push_info("win-1", win_info())
+    assert not st.direct_covers()
+    st.clock[0] += s.PUSH_MIN_GAP + 1
+    st.push_info("wsl-1", {**linux_info(), "runners": [{"name": "wsl-1-admin", "busy": False}]})
+    assert st.direct_covers()
+    st.clock[0] += s.PUSH_MIN_GAP + 1
+    st.push_info("wsl-1", {**linux_info(), "runners": []})  # a runner missing from the report
+    assert not st.direct_covers()
+
+
+def test_get_runners_cache_follows_coverage(state, monkeypatch):
+    s, st = state
+    mac_ok(st, s)
+    st.push_info("win-1", win_info())
+    st.push_info("wsl-1", linux_info())
+    st.runners_at = s.time.time() - 20
+    monkeypatch.setattr(s, "run", lambda *a, **k: pytest.fail("covered: the 20 s old list must be reused"))
+    assert st.get_runners() is st.runners
+    st.infos["air-1"]["ok"] = False  # no longer covered: 20 s is too old, so GitHub is read again
+    with pytest.raises(BaseException):
+        st.get_runners()
 
 
 def test_overlay_ignores_malformed_runner_reports():
