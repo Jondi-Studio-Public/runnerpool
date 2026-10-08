@@ -39,6 +39,7 @@ FUNCS = [
     "New-HvUserData",
     "Read-HvSshKey",
     "Get-HvWslMemoryGB",
+    "Assert-HvSpace",
     "Test-HvPowerWatchConflict",
     "Get-HvPrefix",
     "Get-NextHvName",
@@ -56,7 +57,7 @@ FUNCS = [
     "Invoke-HvEjectSeed",
     "Invoke-Hyperv",
 ]
-VARS = ["HvDefaultDir", "HvMarkerName", "HvNotesPrefix", "HvOptions"]
+VARS = ["HvDefaultDir", "HvMarkerName", "HvNotesPrefix", "HvOptions", "HvFootprintGB", "HvHeadroomGB", "HvWarnFreeGB"]
 PRELUDE = f"""
 $ErrorActionPreference = 'Stop'
 $HomeDir = $env:TEST_HOME
@@ -110,7 +111,7 @@ def test_defaults(tmp_path):
             "$o = ConvertFrom-HvArgs 'create' @(); '{0} {1} {2} {3} {4} {5} {6}' -f $o.Name, $o.VCpu, $o.RamGB, $o.DiskGB, $o.Runners, $o.Tags, $o.CiRepo",
         )
     )
-    assert "hv-ci 4 16 100 2 linux-ci example-org" in o
+    assert "hv-ci 4 16 20 2 linux-ci example-org" in o
 
 
 def test_options_are_parsed(tmp_path):
@@ -345,7 +346,43 @@ def test_stop_needs_yes(tmp_path):
 
 def test_compact_refuses_a_running_vm(tmp_path):
     d = make_vm_dir(tmp_path)
-    assert "compacting needs it off" in run(tmp_path, d, "'compact'", state="Running")
+    assert "add -Yes to stop it" in run(tmp_path, d, "'compact'", state="Running")
+
+
+COMPACT = (
+    "function Stop-VM { param($Name) Write-Host 'STOP' }; function Start-VM { param($Name) Write-Host 'START' };"
+    "function Get-VHD { [pscustomobject]@{ FileSize = 6GB } }; function Mount-VHD { Write-Host 'MOUNT' }; function Dismount-VHD { Write-Host 'DISMOUNT' };"
+    "function Optimize-VHD { param($Path, $Mode) Write-Host \"OPT $Mode\"; if ('%FAIL%' -eq '1') { throw 'optimize failed' } };"
+)
+
+
+def test_compact_with_yes_stops_compacts_and_restarts(tmp_path):
+    d = make_vm_dir(tmp_path)
+    o = out(
+        ps(
+            tmp_path,
+            f"Run {{ {vm(d, state='Running')} {COMPACT.replace('%FAIL%', '0')} Invoke-Hyperv @('compact','-Yes') }}",
+        )
+    )
+    lines = [k for k in o.splitlines() if k in ("STOP", "MOUNT", "OPT Full", "DISMOUNT", "START")]
+    assert lines == ["STOP", "MOUNT", "OPT Full", "DISMOUNT", "START"], o
+
+
+def test_compact_restarts_the_vm_even_when_it_fails(tmp_path):
+    d = make_vm_dir(tmp_path)
+    o = out(
+        ps(
+            tmp_path,
+            f"Run {{ {vm(d, state='Running')} {COMPACT.replace('%FAIL%', '1')} Invoke-Hyperv @('compact','-Yes') }}",
+        )
+    )
+    assert "optimize failed" in o and o.rstrip().splitlines().count("START") == 1 and "DISMOUNT" in o
+
+
+def test_compact_on_a_stopped_vm_needs_no_yes_and_does_not_start_it(tmp_path):
+    d = make_vm_dir(tmp_path)
+    o = out(ps(tmp_path, f"Run {{ {vm(d, state='Off')} {COMPACT.replace('%FAIL%', '0')} Invoke-Hyperv @('compact') }}"))
+    assert "OPT Full" in o and "STOP" not in o.splitlines() and "START" not in o.splitlines()
 
 
 def test_eject_seed_works_on_a_running_vm(tmp_path):
@@ -454,6 +491,22 @@ def test_firstboot_removes_the_seed_files_even_on_failure_and_checks_hv_utils(tm
     assert "hv_utils" in o.split("modules-load.d")[0].splitlines()[-1] or "modules-load.d/hyperv.conf" in o
 
 
+def test_firstboot_leaves_a_small_disk(tmp_path):
+    o = out(ps(tmp_path, CLOUD + "$fb"))
+    assert "swapoff -a" in o and "rm -f /swapfile" in o  # no swap file in the guest
+    assert o.index("swapoff -a") < o.index("bash ./linux-provision.sh")
+    assert "UV_CACHE_DIR=/dev/shm/uv-cache" in o and "PIP_CACHE_DIR=/dev/shm/pip-cache" in o and "hv-caches.conf" in o
+    assert o.index("hv-caches.conf") < o.index("add-runner")  # the runners start with the tmpfs caches
+    end = o[o.index("add-runner") :]
+    assert (
+        end.index("apt-get clean; rm -rf /var/lib/apt/lists/*")
+        < end.index("fstrim -av")
+        < end.index('echo "firstboot done"')
+    )
+    assert "systemctl enable --now fstrim.timer" in o
+    assert o.index("rm -rf /root/hv-seed", o.index("add-runner")) < o.index("fstrim -av")
+
+
 def test_user_data_is_cloud_config_with_lf_files(tmp_path):
     o = out(ps(tmp_path, CLOUD + "$ud"))
     assert o.startswith("#cloud-config\n") and "hostname: hv-1" in o
@@ -545,7 +598,7 @@ function Get-WslConfigTexts { }
 function Get-SlotConfig { $null }
 function Get-PSDrive { [pscustomobject]@{ Free = %FREE%GB } }
 function Get-VMSwitch { 1 }
-function Resolve-HvImageSource($o) { Write-Host 'STEP image'; if ('%BADIMG%' -eq '1') { Die 'no such image' }; 'image.vhdx' }
+function Resolve-HvImageSource($o) { Write-Host 'STEP image'; if ('%BADIMG%' -eq '1') { Die 'no such image' }; if ($o.Image) { return $o.Image }; $f = Join-Path '%DL%' 'dl.img'; Set-Content -Path $f -Value img; $f }
 function Test-OnGitHub { $false }
 function New-GhToken { Write-Host 'STEP token'; 'tok' }
 function Protect-HvDir([string]$dir) { Write-Host "STEP acl dir=$(Test-Path $dir) marker=$(Test-Path (Join-Path $dir 'hyperv-vm.json')) seed=$(Test-Path (Join-Path $dir 'seed.vhdx'))" }
@@ -575,11 +628,11 @@ def create(tmp_path, args="", sys="C:", conflict="$false", free=500, badimg="0",
         .replace("%FREE%", str(free))
         .replace("%BADIMG%", badimg)
         .replace("%FAIL%", fail)
+        .replace("%DL%", str(tmp_path))
     )
     r = ps(
         tmp_path,
-        pre
-        + f"Run {{ Invoke-Hyperv @('create','-Yes','-AdminRepo','example-org/runnerpool','-AllowSystemDrive','-WaitMin','0'{args}) }}",
+        pre + f"Run {{ Invoke-Hyperv @('create','-Yes','-AdminRepo','example-org/runnerpool','-WaitMin','0'{args}) }}",
     )
     return out(r), base, target
 
@@ -628,30 +681,58 @@ def test_create_refuses_an_existing_folder_and_leaves_it_alone(tmp_path):
     assert "already exists" in o and "STEP token" not in o and (target / "mine.txt").read_text() == "x"
 
 
-def test_create_refuses_the_system_drive_without_the_flag(tmp_path):
-    base = tmp_path / "vmdir"
-    base.mkdir()
-    pre = (
-        CREATE.replace("%SYS%", "D:")
-        .replace("%CONFLICT%", "$false")
-        .replace("%DIR%", str(base / "hv-ci"))
-        .replace("%FREE%", "500")
-        .replace("%BADIMG%", "0")
-        .replace("%FAIL%", "")
-    )
-    o = out(
-        ps(
-            tmp_path,
-            pre
-            + "Run { Invoke-Hyperv @('create','-Yes','-AdminRepo','example-org/runnerpool','-VhdxDir','D:\\hv','-WaitMin','0') }",
-        )
-    )
-    assert "system drive D:" in o and "STEP token" not in o
+def test_create_on_the_system_drive_is_the_normal_case(tmp_path):
+    o, _, target = create(tmp_path, sys="C:")  # no flag, nothing about the system drive
+    assert "STEP start" in o and "system drive" not in o and target.exists()
 
 
 def test_create_refuses_too_little_disk_space(tmp_path):
-    o, _, target = create(tmp_path, free=110)  # -DiskGB 100 + 20 GB headroom
-    assert "has under 120 GB free" in o and not target.exists()
+    o, _, target = create(tmp_path, free=12)  # footprint 8 GB + headroom 8 GB = 16 GB
+    assert "the VM needs about 8 GB plus 8 GB headroom (16 GB)" in o and "STEP token" not in o and not target.exists()
+
+
+def test_create_refuses_a_disk_that_could_outgrow_free_space(tmp_path):
+    o, _, target = create(tmp_path, ",'-DiskGB','30'", free=26)  # 26 - 8 headroom = 18 GB at most
+    assert "could grow past the 26 GB free" in o and "the most is 18 GB" in o and not target.exists()
+
+
+@pytest.mark.parametrize(
+    "free, disk, refused, warned",
+    [
+        (15, 20, "needs about 8 GB", False),
+        (26, 20, "could grow past", False),
+        (26, 18, None, False),  # 26 - 16 = 10: not under 10
+        (25, 16, None, True),  # 25 - 16 = 9: warn, not refuse
+        (20, 10, None, True),
+        (60, 20, None, False),
+    ],
+)
+def test_space_verdicts(tmp_path, free, disk, refused, warned):
+    o = err_of(tmp_path, f"Assert-HvSpace {free} {disk} 'C'")
+    assert (refused in o) if refused else ("ERR" not in o)
+    assert ("warning:" in o) == warned
+
+
+def test_create_deletes_the_downloaded_image_unless_kept_or_supplied(tmp_path):
+    o, _, _ = create(tmp_path)
+    assert "deleted the downloaded cloud image" in o and not (tmp_path / "dl.img").exists()
+
+
+def test_keep_image_keeps_it(tmp_path):
+    o, _, _ = create(tmp_path, ",'-KeepImage'")
+    assert "deleted the downloaded" not in o and (tmp_path / "dl.img").exists()
+
+
+def test_a_supplied_image_is_never_deleted(tmp_path):
+    mine = tmp_path / "mine.vhdx"
+    mine.write_text("x")
+    o, _, _ = create(tmp_path, f",'-Image','{mine}'")
+    assert "STEP start" in o and mine.exists()
+
+
+def test_a_failed_create_keeps_the_image_for_the_retry(tmp_path):
+    create(tmp_path, fail="seed")
+    assert (tmp_path / "dl.img").exists()
 
 
 def test_create_refuses_on_a_laptop_with_the_power_watch_unless_ignored(tmp_path):
@@ -671,13 +752,14 @@ def test_create_warns_when_slots_and_vcpus_exceed_the_cpus(tmp_path):
         .replace("%FREE%", "500")
         .replace("%BADIMG%", "0")
         .replace("%FAIL%", "")
+        .replace("%DL%", str(tmp_path))
         + "function Get-SlotConfig { @{ slots = 2; threads = 8 } };"
     )
     o = out(
         ps(
             tmp_path,
             pre
-            + "Run { Invoke-Hyperv @('create','-Yes','-AdminRepo','example-org/runnerpool','-AllowSystemDrive','-WaitMin','0','-VCpu','4') }",
+            + "Run { Invoke-Hyperv @('create','-Yes','-AdminRepo','example-org/runnerpool','-WaitMin','0','-VCpu','4') }",
         )
     )
     assert (
@@ -712,4 +794,10 @@ def test_hyperv_is_dispatched_and_documented():
     t = WINRUNNER.read_text()
     assert "'hyperv' { Invoke-Hyperv $r }" in t
     usage = re.search(r"function Show-Usage.*?'@", t, re.S).group(0)
-    assert "hyperv create" in usage and "hyperv remove" in usage and "-IgnorePowerWatch" in usage
+    assert (
+        "hyperv create" in usage
+        and "hyperv remove" in usage
+        and "-IgnorePowerWatch" in usage
+        and "-KeepImage" in usage
+        and "AllowSystemDrive" not in usage
+    )

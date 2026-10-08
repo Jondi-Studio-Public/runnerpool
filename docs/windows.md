@@ -147,9 +147,37 @@ distro. It is off by default and is never part of the installer. The VM runs Ubu
 | Follows the PC's battery, `ci off`, `cores`, `slots` | Yes (the follower service) | **No**: the VM is a separate machine; use `runner ci hv-N off` |
 | Needs | WSL | Windows 11 **Pro, Enterprise or Education** (not Home), the Hyper-V feature, an elevated PowerShell |
 
-Pick Hyper-V when you want the Linux CI on a bigger or different drive than `C:`, a hard RAM and CPU ceiling, or an
+Pick Hyper-V when you want a hard RAM and CPU ceiling, the option of putting the disk on another drive (`-VhdxDir`), or an
 isolated machine that survives a `wsl --shutdown`. Stay on WSL for the lighter setup, dynamic memory and the job-slot
 integration. WSL and the VM can **coexist**; the model below keeps them out of each other's way.
+
+### Disk: small footprint on C:
+
+The default is to keep the VM on `C:` (`%ProgramData%\win-runners\hyperv`) with as little disk as possible and to spend RAM instead.
+The VHDX is dynamic, so what it takes on `C:` is roughly the size of the guest's used data, not `-DiskGB` (default **20**).
+Estimates, not measurements (nothing has run on real Hyper-V yet):
+
+| Piece | Estimate on `C:` |
+| --- | --- |
+| Cloud image download (`%ProgramData%\win-runners\cache`) | about 0.6 GB while `create` runs, then deleted (`-KeepImage` keeps it) |
+| VHDX after first boot, trimmed and compacted | about 5 to 7 GB (Ubuntu, build tools, Postgres 16 binaries, uv) |
+| VM configuration, seed disk (deleted after the first boot) | well under 0.1 GB |
+| **Expected footprint** | **about 8 GB** with room for the runners and logs to grow |
+
+What keeps it there: runner workspaces are on tmpfs (`-RamdiskMB`, the existing `linuxrunner ramdisk`); uv, pip and XDG caches
+point at `/dev/shm` for every service (a `DefaultEnvironment` drop-in), so they cost RAM, not disk; the guest has no swap file (and no
+zram); first boot ends with `apt-get clean`, removing `/var/lib/apt/lists` and `/root/.cache`, enabling `fstrim.timer` and running
+`fstrim -av`, so freed blocks return to the host. The `/dev/shm` caches count against the VM's static RAM with the RAM disks.
+`create` needs the footprint plus 8 GB headroom (16 GB) free on the drive, refuses a `-DiskGB` larger than the free space minus
+that 8 GB headroom (a dynamic VHDX could otherwise grow until `C:` is full), and warns when less than 10 GB would be left after
+the footprint and the headroom. With about 26 GB free on `C:` the most `-DiskGB` allows is 18, so pass `-DiskGB 16` (or free some
+space); the guest's own disk still has to hold the image (3.5 GB) and the tools.
+
+**Final step: `hyperv compact -Yes`.** A dynamic VHDX does not shrink by itself, and first boot writes the most. After the runners
+register and the seed is ejected, run `hyperv compact -Yes` once the VM is idle: it stops the VM (a guest shutdown, which ends any
+job in it, hence the same `-Yes` as `stop`), runs `Optimize-VHD -Mode Full`, and starts it again, also if the compaction fails.
+`create` prints this as its last line instead of doing it, because stopping a VM that has just started taking jobs is the riskier
+choice. Run it again whenever the VHDX has grown well past the guest's used space.
 
 ### Sizing: the CPU budget is shared
 
@@ -170,23 +198,23 @@ two are separate pools that both grow, so set `memory=` in `.wslconfig` or lower
 
 ```powershell
 $wr = "$env:ProgramData\win-runners\winrunner.ps1"
-& $wr hyperv create -Yes -AdminRepo example-org/runnerpool -VCpu 8 -RamGB 24 -DiskGB 200 -VhdxDir D:\hyperv -Runners 2 -RamdiskMB 4096
+& $wr hyperv create -Yes -AdminRepo example-org/runnerpool -VCpu 8 -RamGB 24 -DiskGB 16 -Runners 2 -RamdiskMB 4096    # on C:; add -VhdxDir D:\hyperv to use another drive
 & $wr hyperv status            # state, heartbeat, address, disks, whether the runners are on GitHub; ejects the seed when ready
 & $wr hyperv stop -Yes         # guest shutdown (a job running in the VM ends); start with: hyperv start
 & $wr hyperv eject-seed        # detach and delete the seed disk now (works on a running VM)
-& $wr hyperv compact           # VM off: Optimize-VHD -Mode Full (run `sudo fstrim -av` in the VM first)
+& $wr hyperv compact -Yes      # the final step: stop the VM, Optimize-VHD -Mode Full, start it again (a stopped VM needs no -Yes)
 & $wr hyperv remove -ConfirmRemove hv-ci                 # removes the VM, keeps the disks
 & $wr hyperv remove -ConfirmRemove hv-ci -DeleteVhdx     # also deletes the disks the tool made, and unregisters its runners
 ```
 
 Options (all optional except `-AdminRepo`; defaults in brackets): `-Name` [hv-ci, the Hyper-V VM name], `-VCpu` [4],
-`-RamGB` [16], `-DiskGB` [100, a dynamic VHDX that grows up to this], `-VhdxDir` [`%ProgramData%\win-runners\hyperv`; a local
+`-RamGB` [16], `-DiskGB` [20, a dynamic VHDX that grows up to this], `-VhdxDir` [`%ProgramData%\win-runners\hyperv`; a local
 drive path; used by `create`, and by `remove` only once the VM is gone], `-Runners` [2], `-Tags` [the runners' labels,
 comma-separated; default and must include `linux-ci`], `-CiRepo` [the org], `-Image` [a local `.img`, `.vhd` or
 `.vhdx`; default: Ubuntu's 24.04 cloud image, downloaded and checked against Ubuntu's published SHA-256], `-Switch`
 [Default Switch], `-RamdiskMB`, `-CoresPerJob`, `-SshKeyFile` [a public key for the image's `ubuntu` user; without it the VM
 has no login, only the runner tooling and the Hyper-V console], `-WaitMin` [30; how long `create` waits for the guest and its
-runners, 0 = do not wait; `status -WaitMin N` waits too], `-IgnorePowerWatch`, `-AllowSystemDrive`.
+runners, 0 = do not wait; `status -WaitMin N` waits too], `-IgnorePowerWatch`, `-KeepImage` [keep the downloaded cloud image in the cache; a `-Image` you pass is never deleted].
 
 Every command after `create` finds the VM by its Hyper-V notes (which carry the marker's id) and the VM's folder from the VM's own
 `disk.vhdx`, so it works wherever `-VhdxDir` put the disks. `-Name` picks one by name; without it the only VM made by this tool is used.
@@ -194,8 +222,8 @@ Every command after `create` finds the VM by its Hyper-V notes (which carry the 
 ### What `create` does
 
 1. Checks it is elevated, the Hyper-V feature and `vmms` are on, the VM name and folder are free, no other VM of this tool
-   exists (one per PC), the switch exists, vCPUs and RAM fit, and the drive has `-DiskGB` plus 20 GB free. It **refuses the
-   system drive** unless `-AllowSystemDrive` (a growing VHDX can fill it), and **refuses a PC that has a battery while the power
+   exists (one per PC), the switch exists, vCPUs and RAM fit, and the drive has the footprint plus headroom free (see "Disk"
+   above; `C:` is fine). It **refuses a PC that has a battery while the power
    watch is installed** unless `-IgnorePowerWatch`: the power watch pauses CI on battery for the Windows and WSL runners but
    cannot pause the VM.
 2. Checks the SSH key, downloads and verifies the image (to a `.part` file, renamed only when the checksum matches; TLS 1.2 is
@@ -209,14 +237,14 @@ Every command after `create` finds the VM by its Hyper-V notes (which carry the 
    Windows and the network are up first; a VM you stopped stays stopped), `AutomaticStopAction ShutDown`, checkpoints off, Secure
    Boot on with the `MicrosoftUEFICertificateAuthority` template, and the seed disk as a second (SCSI) drive. It starts.
 5. **If any step fails, `create` rolls back**: it stops and removes the VM if it made it, deletes only the files it made (the marker's
-   disks, the marker, the `vm` and seed-mount folders) and the folder if nothing else is in it. The downloaded image stays cached.
+   disks, the marker, the `vm` and seed-mount folders) and the folder if nothing else is in it. The downloaded image stays cached for the retry.
 6. On first boot the VM runs `linux-provision.sh`, **then** `linuxrunner bootstrap`, `install-admin`, `add-runner` for each
    runner and the optional `cores` and `ramdisk` settings. A trap deletes `/root/hv-seed` (tokens and scripts) whether this
-   worked or not. If provisioning fails nothing is registered; read `/var/log/hv-firstboot.log` in the VM console (Hyper-V
+   worked or not. It also turns swap off, moves the tool caches to tmpfs, and finishes with `apt-get clean` and `fstrim`. If provisioning fails nothing is registered; read `/var/log/hv-firstboot.log` in the VM console (Hyper-V
    Manager), `remove -DeleteVhdx`, and `create` again. Tokens expire after an hour, so a VM that cannot boot within the hour needs a
    fresh `create`.
 7. `create` then waits (up to `-WaitMin`) for the guest heartbeat and for every runner to show on GitHub, and **ejects the seed disk**
-   (a SCSI hot-remove, deleting the file). If it times out, `hyperv status` does the same check and the same eject once it passes.
+   (a SCSI hot-remove, deleting the file). Once the VM is created, the downloaded image is deleted (unless `-KeepImage`; `-Image` files are never touched). If it times out, `hyperv status` does the same check and the same eject once it passes.
 
 **Hyper-V guest services (`hv_utils`).** Clean shutdown, the heartbeat and the address in `status` need the kernel module `hv_utils`.
 The first-boot script installs `linux-cloud-tools-virtual`, and if `modinfo hv_utils` still finds nothing it tries

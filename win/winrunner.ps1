@@ -1582,21 +1582,24 @@ $HvMarkerName = 'hyperv-vm.json'
 $HvNotesPrefix = 'win-runners hyperv vm '
 $HvImageBase = 'https://cloud-images.ubuntu.com/releases/noble/release'
 $HvImageFile = 'ubuntu-24.04-server-cloudimg-amd64.img'
+$HvFootprintGB = 8    # estimate: the VHDX after first boot and compaction, plus the VM's config; the image download (about 0.6 GB) is deleted
+$HvHeadroomGB = 8     # free space that must stay free on top of the footprint
+$HvWarnFreeGB = 10    # warn when less than this is left after footprint and headroom
 
 # Option table: name -> kind. 'v' takes a value, 's' is a switch.
 $HvOptions = @{
     '-Name' = 'v'; '-VCpu' = 'v'; '-RamGB' = 'v'; '-DiskGB' = 'v'; '-VhdxDir' = 'v'; '-Runners' = 'v'; '-Tags' = 'v'
     '-AdminRepo' = 'v'; '-CiRepo' = 'v'; '-Image' = 'v'; '-Switch' = 'v'; '-RamdiskMB' = 'v'; '-CoresPerJob' = 'v'
     '-SshKeyFile' = 'v'; '-ConfirmRemove' = 'v'; '-WaitMin' = 'v'
-    '-Yes' = 's'; '-DeleteVhdx' = 's'; '-IgnorePowerWatch' = 's'; '-AllowSystemDrive' = 's'
+    '-Yes' = 's'; '-DeleteVhdx' = 's'; '-IgnorePowerWatch' = 's'; '-KeepImage' = 's'
 }
 
 # Parses the words after `hyperv SUB` into a settings table, or throws a usage error. Pure: no host access.
 function ConvertFrom-HvArgs([string]$sub, [string[]]$words) {
     $o = @{
-        Name = 'hv-ci'; VCpu = 4; RamGB = 16; DiskGB = 100; VhdxDir = $HvDefaultDir; Runners = 2; Tags = 'linux-ci'
+        Name = 'hv-ci'; VCpu = 4; RamGB = 16; DiskGB = 20; VhdxDir = $HvDefaultDir; Runners = 2; Tags = 'linux-ci'
         AdminRepo = ''; CiRepo = $AppOrg; Image = ''; Switch = 'Default Switch'; RamdiskMB = 0; CoresPerJob = 0; WaitMin = 30
-        SshKeyFile = ''; ConfirmRemove = ''; Yes = $false; DeleteVhdx = $false; IgnorePowerWatch = $false; AllowSystemDrive = $false
+        SshKeyFile = ''; ConfirmRemove = ''; Yes = $false; DeleteVhdx = $false; IgnorePowerWatch = $false; KeepImage = $false
     }
     $given = @{}
     for ($i = 0; $i -lt $words.Count; $i++) {
@@ -1730,6 +1733,7 @@ function New-HvFirstBoot($o, [string]$hostName, [string]$prefix, [string[]]$ciNa
     $l.Add('cd /root/hv-seed')
     $l.Add('export DEBIAN_FRONTEND=noninteractive')
     $l.Add('needs_reboot=0')
+    $l.Add('swapoff -a 2>/dev/null || true; sed -i "/\sswap\s/d" /etc/fstab; rm -f /swapfile /swap.img   # no swap file: it would sit on the VHDX')
     # Hyper-V's shutdown, heartbeat and address services are the kernel module hv_utils (plus the hv_*_daemon tools). The
     # generic cloud kernel normally has it; if not, try the extra modules, then the Azure kernel (which has it built for Hyper-V).
     $l.Add('apt-get install -y -qq linux-cloud-tools-virtual >/dev/null 2>&1 || echo "note: linux-cloud-tools-virtual not installed"')
@@ -1743,6 +1747,10 @@ function New-HvFirstBoot($o, [string]$hostName, [string]$prefix, [string[]]$ciNa
     $l.Add('printf "hv_vmbus\nhv_utils\nhv_netvsc\nhv_storvsc\n" > /etc/modules-load.d/hyperv.conf')
     $l.Add('modprobe hv_utils >/dev/null 2>&1 || true')
     $l.Add('bash ./linux-provision.sh')
+    # tool caches (uv, pip, anything using XDG) go to tmpfs for every service, so jobs leave nothing on the VHDX
+    $l.Add('mkdir -p /etc/systemd/system.conf.d')
+    $l.Add("printf '[Manager]\nDefaultEnvironment=UV_CACHE_DIR=/dev/shm/uv-cache PIP_CACHE_DIR=/dev/shm/pip-cache XDG_CACHE_HOME=/dev/shm/xdg-cache\n' > /etc/systemd/system.conf.d/hv-caches.conf")
+    $l.Add('systemctl daemon-reexec')
     $l.Add('install -m 755 ./linuxrunner /tmp/linuxrunner')
     $l.Add("bash /tmp/linuxrunner bootstrap $hostName")
     $l.Add('rm -f /tmp/linuxrunner')
@@ -1751,6 +1759,11 @@ function New-HvFirstBoot($o, [string]$hostName, [string]$prefix, [string[]]$ciNa
     foreach ($n in $ciNames) { $l.Add("`$LR add-runner $($o.CiRepo) $n $($o.Tags) `"`$(cat ci-token)`" ci") }
     if ($o.CoresPerJob -gt 0) { $l.Add("`$LR cores $($o.CoresPerJob)") }
     if ($o.RamdiskMB -gt 0) { $l.Add("`$LR ramdisk on $($o.RamdiskMB)") }
+    # leave the VHDX as small as possible: package caches and lists out, free blocks returned to the host (fstrim.timer keeps doing it)
+    $l.Add('apt-get clean; rm -rf /var/lib/apt/lists/* /root/.cache')
+    $l.Add('cd /; rm -rf /root/hv-seed')
+    $l.Add('systemctl enable --now fstrim.timer >/dev/null 2>&1 || true')
+    $l.Add('fstrim -av || true')
     $l.Add('echo "firstboot done"')
     $l.Add('if [ "$needs_reboot" = 1 ]; then echo "rebooting into the new kernel"; (sleep 20; systemctl reboot) & fi')
     ($l -join "`n") + "`n"
@@ -1798,6 +1811,20 @@ function Get-WslConfigTexts {
 function Protect-HvDir([string]$dir) {
     & icacls.exe $dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
     if ($LASTEXITCODE) { Die "could not restrict access to $dir" }
+}
+
+# Disk space on the VM's drive (C: is the normal case): the expected footprint plus headroom must be free, and a disk that could
+# grow past free space minus headroom is refused. Warns, without refusing, when little is left after that.
+function Assert-HvSpace([double]$freeGB, [int]$diskGB, [string]$letter) {
+    $need = $HvFootprintGB + $HvHeadroomGB
+    $free = [math]::Round($freeGB, 1)
+    if ($freeGB -lt $need) { Die "drive ${letter}: has $free GB free; the VM needs about $HvFootprintGB GB plus $HvHeadroomGB GB headroom ($need GB)" }
+    if ($diskGB -gt $freeGB - $HvHeadroomGB) {
+        Die "-DiskGB $diskGB could grow past the $free GB free on drive ${letter}: with $HvHeadroomGB GB headroom the most is $([math]::Floor($freeGB - $HvHeadroomGB)) GB (lower -DiskGB, or free space)"
+    }
+    if ($freeGB - $need -lt $HvWarnFreeGB) {
+        Log "warning: drive ${letter}: has $free GB free; after the VM's expected $HvFootprintGB GB and the $HvHeadroomGB GB headroom under $HvWarnFreeGB GB is left: keep an eye on it (hyperv compact shrinks the VHDX)"
+    }
 }
 
 # What WSL may take, in GB: 0 when this PC has no WSL set, else the memory= cap in a user's .wslconfig, else WSL's default of
@@ -2002,10 +2029,7 @@ function New-HvVmHost($o) {
     $letter = $o.VhdxDir.Substring(0, 1)
     $drive = Get-PSDrive -Name $letter -ErrorAction SilentlyContinue
     if (-not $drive) { Die "drive ${letter}: does not exist" }
-    if ($drive.Free -lt ([int64]($o.DiskGB + 20) * 1GB)) { Die "drive ${letter}: has under $($o.DiskGB + 20) GB free (-DiskGB $($o.DiskGB) plus 20 GB for the image and Windows)" }
-    if ($letter -ieq $env:SystemDrive.Substring(0, 1) -and -not $o.AllowSystemDrive) {
-        Die "-VhdxDir is on the system drive ${letter}: a growing VHDX can fill it and stop Windows; use another drive, or add -AllowSystemDrive"
-    }
+    Assert-HvSpace ($drive.Free / 1GB) $o.DiskGB $letter
     if (-not (Get-VMSwitch -Name $o.Switch -ErrorAction SilentlyContinue)) { Die "no Hyper-V virtual switch named '$($o.Switch)' (Get-VMSwitch lists them; -Switch picks one)" }
     $provision = Join-Path $HomeDir 'linux-provision.sh'
     $lrSrc = Join-Path $HomeDir 'linuxrunner'
@@ -2055,12 +2079,17 @@ function New-HvVmHost($o) {
         Undo-HvCreate $dir $n $id $vmMade
         throw $why
     }
+    if (-not $o.Image -and -not $o.KeepImage) {   # the downloaded image is only needed to build the disk
+        Remove-Item -LiteralPath $src, "$src.part" -Force -ErrorAction SilentlyContinue
+        Log 'deleted the downloaded cloud image (-KeepImage keeps it for the next create)'
+    }
     Log "VM $n started: $($o.VCpu) vCPU, $($o.RamGB) GB (static), disk up to $($o.DiskGB) GB at $disk"
     Log "first boot installs the tools and registers $($ciNames -join ', ') and $hostName-admin (some minutes)"
     $t = @{ Vm = (Get-VM -Name $n); Dir = $dir; Marker = (Read-HvMarker $dir) }
     if ($o.WaitMin -gt 0 -and (Wait-HvReady $t ($o.WaitMin * 60))) { Log 'the guest is up and its runners are registered' }
     elseif ($o.WaitMin -gt 0) { Log "not ready after $($o.WaitMin) minutes: check with winrunner hyperv status, which ejects the seed disk once the runners show on GitHub" }
     else { Log 'run winrunner hyperv status until the runners show on GitHub: it then ejects the seed disk (it holds one-hour registration tokens)' }
+    Log 'last step, once it is idle: winrunner hyperv compact -Yes (stops the VM, shrinks the VHDX with Optimize-VHD, starts it again)'
 }
 
 function Show-HvStatus($o) {
@@ -2142,13 +2171,24 @@ function Remove-HvVmHost($o) {
 function Invoke-HvCompact($o) {
     Assert-HvReady
     $t = Resolve-HvTarget $o
-    if ($t.Vm.State -ne 'Off') { Die "VM $($t.Vm.Name) is $($t.Vm.State): compacting needs it off (hyperv stop -Yes; run fstrim -av in it first so freed space is released)" }
+    $vm = $t.Vm
+    $restart = $false
+    if ($vm.State -ne 'Off') {
+        # Never automatic: stopping the VM ends any job running in it, so this takes the same -Yes as `stop`.
+        if (-not $o.Yes) { Die "VM $($vm.Name) is $($vm.State): compacting needs it off, which ends any job in it: add -Yes to stop it, compact, and start it again (or run hyperv stop -Yes first)" }
+        Stop-VM -Name $vm.Name
+        $restart = $true
+    }
     $vhdx = [string]$t.Marker.vhdx
-    $before = (Get-VHD -Path $vhdx).FileSize
-    Mount-VHD -Path $vhdx -ReadOnly -NoDriveLetter
-    try { Optimize-VHD -Path $vhdx -Mode Full } finally { Dismount-VHD -Path $vhdx }
-    $after = (Get-VHD -Path $vhdx).FileSize
-    Log "compacted ${vhdx}: $([math]::Round($before / 1GB, 1)) GB -> $([math]::Round($after / 1GB, 1)) GB"
+    try {
+        $before = (Get-VHD -Path $vhdx).FileSize
+        Mount-VHD -Path $vhdx -ReadOnly -NoDriveLetter
+        try { Optimize-VHD -Path $vhdx -Mode Full } finally { Dismount-VHD -Path $vhdx }
+        $after = (Get-VHD -Path $vhdx).FileSize
+        Log "compacted ${vhdx}: $([math]::Round($before / 1GB, 1)) GB -> $([math]::Round($after / 1GB, 1)) GB"
+    } finally {
+        if ($restart) { Start-VM -Name $vm.Name; Log "VM $($vm.Name) started again" }
+    }
 }
 
 function Invoke-HvEjectSeed($o) {
@@ -2210,14 +2250,14 @@ winrunner: GitHub Actions runners on this Windows PC (run in an administrator Po
   bootstrap ENVFILE               first install (win-runners.ps1 does this)
   power-watch                     the power loop (a scheduled task runs this)
   install-power-watch             (re)create that scheduled task
-  hyperv create -Yes -AdminRepo OWNER/REPO [-Name hv-ci] [-VCpu 4] [-RamGB 16] [-DiskGB 100] [-VhdxDir D:\hyperv]
-         [-Runners 2] [-Tags linux-ci] [-CiRepo ORG] [-WaitMin 30] [-IgnorePowerWatch] [-AllowSystemDrive] [-Image FILE] [-Switch NAME] [-RamdiskMB MB] [-CoresPerJob N] [-SshKeyFile F.pub]
+  hyperv create -Yes -AdminRepo OWNER/REPO [-Name hv-ci] [-VCpu 4] [-RamGB 16] [-DiskGB 20] [-VhdxDir D:\hyperv]
+         [-Runners 2] [-Tags linux-ci] [-CiRepo ORG] [-WaitMin 30] [-IgnorePowerWatch] [-KeepImage] [-Image FILE] [-Switch NAME] [-RamdiskMB MB] [-CoresPerJob N] [-SshKeyFile F.pub]
                                   opt-in: ONE Ubuntu 24.04 Hyper-V VM (static CPU and RAM, starts with Windows) running the Linux
                                   runners win-N-hv-M (tagged linux-ci) and the admin runner hv-N-admin; needs Hyper-V on Windows 11 Pro+
   hyperv status|start [-Name N]   the VM's state, address, disks and whether its runners are on GitHub (-WaitMin N waits) / start it
   hyperv stop -Yes [-Name N]      shut the VM down (a running job in it ends)
   hyperv eject-seed [-Name N]     detach and delete the seed disk (one-hour tokens); works on a running VM. create and status do it on their own
-  hyperv compact [-Name N]        shrink the VHDX (Optimize-VHD -Mode Full); VM must be off
+  hyperv compact [-Yes] [-Name N] shrink the VHDX (Optimize-VHD -Mode Full); a running VM is stopped and started again only with -Yes
   hyperv remove -ConfirmRemove N [-DeleteVhdx] [-Name N] [-VhdxDir D]
                                   remove the VM; with -DeleteVhdx also its disks, but only the files its marker names
 '@ | Write-Host
