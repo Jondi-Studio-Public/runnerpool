@@ -154,7 +154,7 @@ integration. WSL and the VM can **coexist**; the model below keeps them out of e
 ### Disk: small footprint on C:
 
 The default is to keep the VM on `C:` (`%ProgramData%\win-runners\hyperv`) with as little disk as possible and to spend RAM instead.
-The VHDX is dynamic, so what it takes on `C:` is roughly the size of the guest's used data, not `-DiskGB` (default **20**).
+The VHDX is dynamic, so what it takes on `C:` is roughly the size of the guest's used data, not `-DiskGB` (default **16**).
 Estimates, not measurements (nothing has run on real Hyper-V yet):
 
 | Piece | Estimate on `C:` |
@@ -170,8 +170,8 @@ zram); first boot ends with `apt-get clean`, removing `/var/lib/apt/lists` and `
 `fstrim -av`, so freed blocks return to the host. The `/dev/shm` caches count against the VM's static RAM with the RAM disks.
 `create` needs the footprint plus 8 GB headroom (16 GB) free on the drive, refuses a `-DiskGB` larger than the free space minus
 that 8 GB headroom (a dynamic VHDX could otherwise grow until `C:` is full), and warns when less than 10 GB would be left after
-the footprint and the headroom. With about 26 GB free on `C:` the most `-DiskGB` allows is 18, so pass `-DiskGB 16` (or free some
-space); the guest's own disk still has to hold the image (3.5 GB) and the tools.
+the footprint and the headroom. With about 26 GB free on `C:` the most `-DiskGB` allows is 18, so the default 16 passes (a `-DiskGB 20` would be refused until more
+is free); the guest's own disk still has to hold the image (3.5 GB) and the tools.
 
 **Final step: `hyperv compact -Yes`.** A dynamic VHDX does not shrink by itself, and first boot writes the most. After the runners
 register and the seed is ejected, run `hyperv compact -Yes` once the VM is idle: it stops the VM (a guest shutdown, which ends any
@@ -208,7 +208,7 @@ $wr = "$env:ProgramData\win-runners\winrunner.ps1"
 ```
 
 Options (all optional except `-AdminRepo`; defaults in brackets): `-Name` [hv-ci, the Hyper-V VM name], `-VCpu` [4],
-`-RamGB` [16], `-DiskGB` [20, a dynamic VHDX that grows up to this], `-VhdxDir` [`%ProgramData%\win-runners\hyperv`; a local
+`-RamGB` [16], `-DiskGB` [16, a dynamic VHDX that grows up to this], `-VhdxDir` [`%ProgramData%\win-runners\hyperv`; a local
 drive path; used by `create`, and by `remove` only once the VM is gone], `-Runners` [2], `-Tags` [the runners' labels,
 comma-separated; default and must include `linux-ci`], `-CiRepo` [the org], `-Image` [a local `.img`, `.vhd` or
 `.vhdx`; default: Ubuntu's 24.04 cloud image, downloaded and checked against Ubuntu's published SHA-256], `-Switch`

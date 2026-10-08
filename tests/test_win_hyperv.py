@@ -111,7 +111,7 @@ def test_defaults(tmp_path):
             "$o = ConvertFrom-HvArgs 'create' @(); '{0} {1} {2} {3} {4} {5} {6}' -f $o.Name, $o.VCpu, $o.RamGB, $o.DiskGB, $o.Runners, $o.Tags, $o.CiRepo",
         )
     )
-    assert "hv-ci 4 16 20 2 linux-ci example-org" in o
+    assert "hv-ci 4 16 16 2 linux-ci example-org" in o
 
 
 def test_options_are_parsed(tmp_path):
@@ -133,7 +133,7 @@ def test_options_are_parsed(tmp_path):
         ("'-VCpu','x'", "whole number"),
         ("'-VCpu','0'", "-VCpu is 1 to 64"),
         ("'-RamGB','1'", "-RamGB is 2 to 512"),
-        ("'-DiskGB','5'", "-DiskGB is 20 to 4000"),
+        ("'-DiskGB','5'", "-DiskGB is 10 to 4000"),
         ("'-Name','bad name'", "-Name is letters"),
         ("'-VhdxDir','relative\\dir'", "-VhdxDir is a full local path"),
         ("'-VhdxDir','\\\\server\\share'", "-VhdxDir is a full local path"),
@@ -689,6 +689,13 @@ def test_create_on_the_system_drive_is_the_normal_case(tmp_path):
 def test_create_refuses_too_little_disk_space(tmp_path):
     o, _, target = create(tmp_path, free=12)  # footprint 8 GB + headroom 8 GB = 16 GB
     assert "the VM needs about 8 GB plus 8 GB headroom (16 GB)" in o and "STEP token" not in o and not target.exists()
+
+
+def test_default_create_passes_at_26_gb_free(tmp_path):
+    o, _, target = create(
+        tmp_path, free=26
+    )  # the default -DiskGB 16 <= 26 - 8 headroom; 26 - 16 = 10 is not under the warning line
+    assert "STEP start" in o and "could grow past" not in o and "warning: drive" not in o and target.exists()
 
 
 def test_create_refuses_a_disk_that_could_outgrow_free_space(tmp_path):

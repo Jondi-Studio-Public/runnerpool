@@ -1597,7 +1597,7 @@ $HvOptions = @{
 # Parses the words after `hyperv SUB` into a settings table, or throws a usage error. Pure: no host access.
 function ConvertFrom-HvArgs([string]$sub, [string[]]$words) {
     $o = @{
-        Name = 'hv-ci'; VCpu = 4; RamGB = 16; DiskGB = 20; VhdxDir = $HvDefaultDir; Runners = 2; Tags = 'linux-ci'
+        Name = 'hv-ci'; VCpu = 4; RamGB = 16; DiskGB = 16; VhdxDir = $HvDefaultDir; Runners = 2; Tags = 'linux-ci'
         AdminRepo = ''; CiRepo = $AppOrg; Image = ''; Switch = 'Default Switch'; RamdiskMB = 0; CoresPerJob = 0; WaitMin = 30
         SshKeyFile = ''; ConfirmRemove = ''; Yes = $false; DeleteVhdx = $false; IgnorePowerWatch = $false; KeepImage = $false
     }
@@ -1621,7 +1621,7 @@ function ConvertFrom-HvArgs([string]$sub, [string[]]$words) {
     if ($o.Name -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,30}$') { Die 'hyperv: -Name is letters, digits and dashes (31 at most)' }
     if ($o.VCpu -lt 1 -or $o.VCpu -gt 64) { Die 'hyperv: -VCpu is 1 to 64' }
     if ($o.RamGB -lt 2 -or $o.RamGB -gt 512) { Die 'hyperv: -RamGB is 2 to 512' }
-    if ($o.DiskGB -lt 20 -or $o.DiskGB -gt 4000) { Die 'hyperv: -DiskGB is 20 to 4000' }
+    if ($o.DiskGB -lt 10 -or $o.DiskGB -gt 4000) { Die 'hyperv: -DiskGB is 10 to 4000' }
     if ($o.Runners -lt 1 -or $o.Runners -gt 16) { Die 'hyperv: -Runners is 1 to 16' }
     if ($o.WaitMin -lt 0 -or $o.WaitMin -gt 240) { Die 'hyperv: -WaitMin is 0 (do not wait) to 240' }
     if ($o.CoresPerJob -lt 0 -or $o.CoresPerJob -gt $o.VCpu) { Die 'hyperv: -CoresPerJob is 0 (no limit) to -VCpu' }
@@ -2250,7 +2250,7 @@ winrunner: GitHub Actions runners on this Windows PC (run in an administrator Po
   bootstrap ENVFILE               first install (win-runners.ps1 does this)
   power-watch                     the power loop (a scheduled task runs this)
   install-power-watch             (re)create that scheduled task
-  hyperv create -Yes -AdminRepo OWNER/REPO [-Name hv-ci] [-VCpu 4] [-RamGB 16] [-DiskGB 20] [-VhdxDir D:\hyperv]
+  hyperv create -Yes -AdminRepo OWNER/REPO [-Name hv-ci] [-VCpu 4] [-RamGB 16] [-DiskGB 16] [-VhdxDir D:\hyperv]
          [-Runners 2] [-Tags linux-ci] [-CiRepo ORG] [-WaitMin 30] [-IgnorePowerWatch] [-KeepImage] [-Image FILE] [-Switch NAME] [-RamdiskMB MB] [-CoresPerJob N] [-SshKeyFile F.pub]
                                   opt-in: ONE Ubuntu 24.04 Hyper-V VM (static CPU and RAM, starts with Windows) running the Linux
                                   runners win-N-hv-M (tagged linux-ci) and the admin runner hv-N-admin; needs Hyper-V on Windows 11 Pro+
