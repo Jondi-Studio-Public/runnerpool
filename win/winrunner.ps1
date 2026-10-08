@@ -251,9 +251,15 @@ function New-GhToken([string]$kind, [string]$repo) {  # registration|remove -> a
 # Whether GitHub lists runner NAME in REPO|ORG: $true, $false, or $null when it could not ask,
 # so heal never re-registers a runner on a guess.
 function Test-OnGitHub([string]$repo, [string]$name) {
-    try { $r = Invoke-Gh 'GET' "$(Api-Path $repo)/actions/runners?per_page=100" } catch { return $null }
-    if ($null -eq $r.total_count) { return $null }
-    return [bool]($r.runners | Where-Object { $_.name -eq $name })
+    # GitHub pages runner lists at 100: walk the pages (at most 30), so a name beyond the first 100 is still found.
+    for ($page = 1; $page -le 30; $page++) {
+        try { $r = Invoke-Gh 'GET' "$(Api-Path $repo)/actions/runners?per_page=100&page=$page" } catch { return $null }
+        if ($null -eq $r.total_count) { return $null }
+        $list = @($r.runners)
+        if ($list | Where-Object { $_.name -eq $name }) { return $true }
+        if ($list.Count -lt 100 -or $page * 100 -ge [int]$r.total_count) { return $false }
+    }
+    return $null   # more pages than we read: do not claim the name is free
 }
 
 # The lowest win-N that neither repo has a runner for.
@@ -1573,6 +1579,685 @@ function Invoke-Uninstall {
     Write-Host "removed. Delete the runners' entries under each repo's Settings > Actions > Runners."
 }
 
+# --- Hyper-V VM host (opt-in): ONE Ubuntu 24.04 VM that runs the same linuxrunner as the WSL distro -------------------
+# `hyperv create` builds a Generation 2 VM from Ubuntu's cloud image and a cloud-init NoCloud seed disk (a small FAT32 VHDX
+# named CIDATA). On first boot the VM provisions itself (linux-provision.sh), then registers its runners with linuxrunner
+# (admin runner hv-N-admin, CI runners win-N-hv-M tagged linux-ci). The VM is static (fixed vCPUs and RAM) and starts and
+# stops with Windows. Nothing here touches WSL, .wslconfig or the Windows runners. Every file the tool makes is listed in a
+# marker file beside the disk, and `remove` deletes only what that marker names. Commands find the VM by its notes (which
+# carry the marker's id) and the marker by the VM's own disk path, so -VhdxDir only matters to create and to remove once the
+# VM is gone.
+
+$HvDefaultDir = Join-Path $HomeDir 'hyperv'
+$HvMarkerName = 'hyperv-vm.json'
+$HvNotesPrefix = 'win-runners hyperv vm '
+$HvImageBase = 'https://cloud-images.ubuntu.com/releases/noble/release'
+$HvImageFile = 'ubuntu-24.04-server-cloudimg-amd64.img'
+$HvFootprintGB = 8    # estimate: the VHDX after first boot and compaction, plus the VM's config; the image download (about 0.6 GB) is deleted
+$HvHeadroomGB = 8     # free space that must stay free on top of the footprint
+$HvWarnFreeGB = 10    # warn when less than this is left after footprint and headroom
+
+# Option table: name -> kind. 'v' takes a value, 's' is a switch.
+$HvOptions = @{
+    '-Name' = 'v'; '-VCpu' = 'v'; '-RamGB' = 'v'; '-DiskGB' = 'v'; '-VhdxDir' = 'v'; '-Runners' = 'v'; '-Tags' = 'v'
+    '-AdminRepo' = 'v'; '-CiRepo' = 'v'; '-Image' = 'v'; '-Switch' = 'v'; '-RamdiskMB' = 'v'; '-CoresPerJob' = 'v'
+    '-SshKeyFile' = 'v'; '-ConfirmRemove' = 'v'; '-WaitMin' = 'v'; '-CacheMB' = 'v'
+    '-Yes' = 's'; '-DeleteVhdx' = 's'; '-IgnorePowerWatch' = 's'; '-KeepImage' = 's'
+}
+
+# Parses the words after `hyperv SUB` into a settings table, or throws a usage error. Pure: no host access.
+function ConvertFrom-HvArgs([string]$sub, [string[]]$words) {
+    $o = @{
+        Name = 'hv-ci'; VCpu = 4; RamGB = 16; DiskGB = 16; VhdxDir = $HvDefaultDir; Runners = 2; Tags = 'linux-ci'
+        AdminRepo = ''; CiRepo = $AppOrg; Image = ''; Switch = 'Default Switch'; RamdiskMB = 2048; CacheMB = 1024; CoresPerJob = 0; WaitMin = 30
+        SshKeyFile = ''; ConfirmRemove = ''; Yes = $false; DeleteVhdx = $false; IgnorePowerWatch = $false; KeepImage = $false
+    }
+    $given = @{}
+    for ($i = 0; $i -lt $words.Count; $i++) {
+        $w = $words[$i]
+        $kind = $HvOptions[$w]
+        if (-not $kind) { Die "hyperv ${sub}: unknown option $w (winrunner help)" }
+        $key = $w.Substring(1)
+        $given[$key] = $true
+        if ($kind -eq 's') { $o[$key] = $true; continue }
+        if ($i + 1 -ge $words.Count) { Die "hyperv ${sub}: $w needs a value" }
+        $i++
+        $o[$key] = $words[$i]
+    }
+    foreach ($k in 'VCpu', 'RamGB', 'DiskGB', 'Runners', 'RamdiskMB', 'CacheMB', 'CoresPerJob', 'WaitMin') {
+        $n = 0
+        if (-not [int]::TryParse([string]$o[$k], [ref]$n)) { Die "hyperv ${sub}: -$k is a whole number" }
+        $o[$k] = $n
+    }
+    if ($o.Name -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,30}$') { Die 'hyperv: -Name is letters, digits and dashes (31 at most)' }
+    if ($o.VCpu -lt 1 -or $o.VCpu -gt 64) { Die 'hyperv: -VCpu is 1 to 64' }
+    if ($o.RamGB -lt 2 -or $o.RamGB -gt 512) { Die 'hyperv: -RamGB is 2 to 512' }
+    if ($o.DiskGB -lt 16 -or $o.DiskGB -gt 4000) { Die 'hyperv: -DiskGB is 16 to 4000' }
+    if ($o.Runners -lt 1 -or $o.Runners -gt 16) { Die 'hyperv: -Runners is 1 to 16' }
+    if ($o.WaitMin -lt 0 -or $o.WaitMin -gt 240) { Die 'hyperv: -WaitMin is 0 (do not wait) to 240' }
+    if ($o.CoresPerJob -lt 0 -or $o.CoresPerJob -gt $o.VCpu) { Die 'hyperv: -CoresPerJob is 0 (no limit) to -VCpu' }
+    if ($o.CacheMB -ne 0 -and ($o.CacheMB -lt 256 -or $o.CacheMB -gt 65536)) { Die 'hyperv: -CacheMB is 0 (no cache disk) or 256 to 65536' }
+    # static memory: the RAM disks, the cache disk and the jobs share it, so the tmpfs caps may take about two thirds at most
+    $cap = [math]::Floor($o.RamGB * 1024 * 0.65)
+    if (-not $given.RamdiskMB) {
+        # the default is 2048 MB per runner when that fits, else the workspaces stay on disk (-RamdiskMB 0 is also that)
+        if ($o.Runners * 2048 + $o.CacheMB -gt $cap) { $o.RamdiskMB = 0 }
+    } elseif ($o.RamdiskMB -ne 0 -and $o.RamdiskMB -lt 256) { Die 'hyperv: -RamdiskMB is 0 (off) or at least 256' }
+    if ($o.Runners * $o.RamdiskMB + $o.CacheMB -gt $cap) {
+        Die "hyperv: -Runners x -RamdiskMB plus -CacheMB ($($o.Runners * $o.RamdiskMB + $o.CacheMB) MB) is over 65% of the VM's $($o.RamGB) GB: the jobs need the rest"
+    }
+    if ($o.Tags -notmatch '^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$') { Die 'hyperv: -Tags is a comma-separated list of runner label names' }
+    if ($o.Tags -split ',' -notcontains 'linux-ci') { Die 'hyperv: -Tags must include linux-ci' }
+    if ($o.AdminRepo -and $o.AdminRepo -notmatch '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$') { Die 'hyperv: -AdminRepo is OWNER/REPO' }
+    if ($o.CiRepo -notmatch '^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?$') { Die 'hyperv: -CiRepo is an ORG or OWNER/REPO' }
+    if ($o.VhdxDir -notmatch '^[A-Za-z]:[\\/]') { Die 'hyperv: -VhdxDir is a full local path such as D:\hyperv (no relative or network path)' }
+    $o.VhdxDir = $o.VhdxDir.TrimEnd('\', '/')
+    $o.Given = $given
+    $o
+}
+
+function Get-HvDir($o) { Join-Path $o.VhdxDir $o.Name }
+
+function Assert-HvReady {
+    Assert-Admin
+    if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) {
+        Die 'the Hyper-V PowerShell module is missing: Hyper-V needs Windows 11 Pro, Enterprise or Education (not Home); enable it with: Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All, then restart'
+    }
+    $f = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction SilentlyContinue
+    if (-not $f -or $f.State -ne 'Enabled') {
+        Die 'the Hyper-V feature is not enabled: run Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All, restart Windows, then try again'
+    }
+    $svc = Get-Service vmms -ErrorAction SilentlyContinue
+    if (-not $svc -or $svc.Status -ne 'Running') { Die 'the Hyper-V Virtual Machine Management service (vmms) is not running: restart Windows, or check that virtualization is on in the firmware' }
+}
+
+# The marker the tool leaves beside a VM's disk: the only proof that a disk is ours. $null when there is none.
+function Read-HvMarker([string]$dir) {
+    $f = Join-Path $dir $HvMarkerName
+    if (-not (Test-Path -LiteralPath $f)) { return $null }
+    try { $m = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json } catch { return $null }
+    if ($m.tool -ne 'win-runners' -or $m.kind -ne 'hyperv-vm' -or -not $m.id -or -not $m.name) { return $null }
+    $m
+}
+
+# Any VM this tool made, by its notes: there is one VM per PC.
+function Get-HvToolVms { @(Get-VM -ErrorAction SilentlyContinue | Where-Object { $_.Notes -like "$HvNotesPrefix*" }) }
+
+# The VM to act on, its folder and its marker. The VM is found by name (-Name) or, without one, as the only VM this tool made;
+# the folder is the one holding the VM's own disk.vhdx, never derived from -VhdxDir, and the marker there must carry the id in
+# the VM's notes. With no VM (and NEEDVM false) the folder is -VhdxDir\-Name, which is only what `remove` and `status` need.
+function Resolve-HvTarget($o, [bool]$needVm = $true) {
+    $vm = $null
+    if ($o.Given.Name) { $vm = Get-VM -Name $o.Name -ErrorAction SilentlyContinue }
+    else {
+        $ours = @(Get-HvToolVms)
+        if ($ours.Count -gt 1) { Die "more than one VM made by this tool ($(($ours | ForEach-Object { $_.Name }) -join ', ')): pick one with -Name" }
+        if ($ours.Count -eq 1) { $vm = $ours[0] }
+    }
+    if ($vm) {
+        $disk = Get-VMHardDiskDrive -VMName $vm.Name | Where-Object { [IO.Path]::GetFileName([string]$_.Path) -ieq 'disk.vhdx' } | Select-Object -First 1
+        if (-not $disk) { Die "VM $($vm.Name) has no disk.vhdx drive, so it was not made by this tool: use Hyper-V Manager" }
+        $dir = Split-Path -Parent ([string]$disk.Path)
+        $m = Read-HvMarker $dir
+        if (-not $m -or $vm.Notes -ne ($HvNotesPrefix + $m.id) -or [string]$m.vhdx -ine [string]$disk.Path) {
+            Die "VM $($vm.Name) was not created by this tool (no matching $HvMarkerName beside its disk): use Hyper-V Manager"
+        }
+        return @{ Vm = $vm; Dir = $dir; Marker = $m }
+    }
+    if ($needVm) { Die "no VM$(if ($o.Given.Name) { ' named ' + $o.Name } else { ' made by this tool' })" }
+    $d = Get-HvDir $o
+    @{ Vm = $null; Dir = $d; Marker = (Read-HvMarker $d) }
+}
+
+# Throws unless every path remove would delete is inside DIR, named by the marker, and the marker is ours and matches
+# NAME and the VM's notes ($null when the VM is already gone). Returns the paths to delete (the disks, then the marker).
+function Get-HvRemovable([string]$dir, [string]$name, $vmNotes) {
+    $m = Read-HvMarker $dir
+    if (-not $m) { Die "no $HvMarkerName in ${dir}: this tool did not create a VM there, so it will not delete anything" }
+    if ($m.name -ne $name) { Die "the marker in $dir belongs to VM $($m.name), not $name" }
+    if ($null -ne $vmNotes -and $vmNotes -ne ($HvNotesPrefix + $m.id)) { Die "VM $name was not created by this tool (its notes do not carry marker $($m.id)): remove it in Hyper-V Manager" }
+    $root = [IO.Path]::GetFullPath($dir).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    $out = @()
+    foreach ($p in @($m.vhdx, $m.seed)) {
+        if (-not $p) { continue }
+        $full = [IO.Path]::GetFullPath([string]$p)
+        $leaf = [IO.Path]::GetFileName($full)
+        if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) -or $leaf -notmatch '\.vhdx$' -or [IO.Path]::GetDirectoryName($full).TrimEnd('\', '/') -ne $root.TrimEnd('\', '/')) {
+            Die "the marker names $p, which is not a .vhdx directly inside ${dir}: refusing"
+        }
+        $out += $full
+    }
+    $out += (Join-Path $dir $HvMarkerName)
+    $out
+}
+
+function ConvertTo-Lf([string]$s) { $s -replace "`r`n", "`n" }
+function ConvertTo-B64([string]$s) { [Convert]::ToBase64String((New-Object Text.UTF8Encoding($false)).GetBytes((ConvertTo-Lf $s))) }
+
+# The script cloud-init runs once on first boot, as root: provision, then register the runners. Tokens are read from files
+# in /root/hv-seed, which an EXIT trap deletes whether the script worked or not. Provisioning must succeed first (set -e),
+# so no runner exists on a box that cannot run jobs.
+function New-HvFirstBoot($o, [string]$hostName, [string]$prefix, [string[]]$ciNames) {
+    $l = New-Object Collections.Generic.List[string]
+    $l.Add('#!/bin/bash')
+    $l.Add('# runs once, from cloud-init; log: /var/log/hv-firstboot.log')
+    $l.Add('set -euo pipefail')
+    $l.Add('exec > >(tee -a /var/log/hv-firstboot.log) 2>&1')
+    $l.Add("trap 'cd /; rm -rf /root/hv-seed' EXIT")
+    $l.Add('cd /root/hv-seed')
+    $l.Add('export DEBIAN_FRONTEND=noninteractive')
+    $l.Add('needs_reboot=0')
+    $l.Add('swapoff -a 2>/dev/null || true; sed -i "/^[^#]*\sswap\s/d" /etc/fstab; rm -f /swapfile /swap.img   # no swap file: it would sit on the VHDX')
+    # Hyper-V's shutdown, heartbeat and address services are the kernel module hv_utils (plus the hv_*_daemon tools). The
+    # generic cloud kernel normally has it; if not, try the extra modules, then the Azure kernel (which has it built for Hyper-V).
+    $l.Add('apt-get install -y -qq linux-cloud-tools-virtual >/dev/null 2>&1 || echo "note: linux-cloud-tools-virtual not installed"')
+    $l.Add('if ! modinfo hv_utils >/dev/null 2>&1; then')
+    $l.Add('  apt-get install -y -qq "linux-modules-extra-$(uname -r)" >/dev/null 2>&1 || true')
+    $l.Add('fi')
+    $l.Add('if ! modinfo hv_utils >/dev/null 2>&1; then')
+    $l.Add('  echo "hv_utils is missing from the running kernel: installing linux-azure"')
+    $l.Add('  apt-get install -y -qq linux-azure >/dev/null 2>&1 && needs_reboot=1 || echo "WARNING: no hv_utils: the host cannot shut this VM down cleanly"')
+    $l.Add('fi')
+    $l.Add('printf "hv_vmbus\nhv_utils\nhv_netvsc\nhv_storvsc\n" > /etc/modules-load.d/hyperv.conf')
+    $l.Add('modprobe hv_utils >/dev/null 2>&1 || true')
+    $l.Add('bash ./linux-provision.sh')
+    $l.Add('install -m 755 ./linuxrunner /tmp/linuxrunner')
+    $l.Add("bash /tmp/linuxrunner bootstrap $hostName")
+    $l.Add('rm -f /tmp/linuxrunner')
+    $l.Add('LR=/opt/git-runner/linuxrunner')
+    if ($o.CacheMB -gt 0) {
+        # A capped tmpfs for tool caches, owned by the CI user, mounted by a unit. Only the CI runners' own .env points at it
+        # (below): no global environment, and XDG_CACHE_HOME is left alone.
+        $l.Add('id runner >/dev/null 2>&1 || useradd -m -s /bin/bash runner')
+        $l.Add("printf '[Unit]\nDescription=Tool caches in RAM\n[Mount]\nWhat=tmpfs\nWhere=/mnt/cicache\nType=tmpfs\nOptions=size=$($o.CacheMB)M,mode=0755,uid=%s,gid=%s,nosuid,nodev\n[Install]\nWantedBy=multi-user.target\n' `"`$(id -u runner)`" `"`$(id -g runner)`" > /etc/systemd/system/mnt-cicache.mount")
+        $l.Add('systemctl daemon-reload; systemctl enable --now mnt-cicache.mount')
+    }
+    $l.Add("`$LR install-admin $($o.AdminRepo) `"`$(cat admin-token)`" $hostName-admin")
+    foreach ($n in $ciNames) { $l.Add("`$LR add-runner $($o.CiRepo) $n $($o.Tags) `"`$(cat ci-token)`" ci") }
+    if ($o.CacheMB -gt 0) {
+        foreach ($n in $ciNames) { $l.Add("printf 'UV_CACHE_DIR=/mnt/cicache/uv\nPIP_CACHE_DIR=/mnt/cicache/pip\nUV_LINK_MODE=copy\n' >> /opt/git-runner/runners/$n/.env") }
+        $l.Add('$LR restart   # the runners read .env when they start')
+    }
+    if ($o.CoresPerJob -gt 0) { $l.Add("`$LR cores $($o.CoresPerJob)") }
+    if ($o.RamdiskMB -gt 0) { $l.Add("`$LR ramdisk on $($o.RamdiskMB)") }
+    # leave the VHDX as small as possible: package caches and lists out, free blocks returned to the host (fstrim.timer keeps doing it)
+    $l.Add('apt-get clean; rm -rf /var/lib/apt/lists/* /root/.cache')
+    $l.Add('cd /; rm -rf /root/hv-seed')
+    $l.Add('systemctl enable --now fstrim.timer >/dev/null 2>&1 || true')
+    $l.Add('fstrim -av || true')
+    $l.Add('echo "firstboot done"')
+    $l.Add('if [ "$needs_reboot" = 1 ]; then echo "rebooting into the new kernel"; (sleep 20; systemctl reboot) & fi')
+    ($l -join "`n") + "`n"
+}
+
+# The cloud-config (NoCloud user-data). $files: name -> content, all delivered base64 into /root/hv-seed.
+function New-HvUserData($o, [string]$hostName, [hashtable]$files, [string]$sshKey) {
+    $l = New-Object Collections.Generic.List[string]
+    $l.Add('#cloud-config')
+    $l.Add("hostname: $hostName")
+    $l.Add('manage_etc_hosts: true')
+    $l.Add('ssh_pwauth: false')
+    $l.Add('disable_root: true')
+    if ($sshKey) { $l.Add('ssh_authorized_keys:'); $l.Add("  - $sshKey") }   # the image's default user (ubuntu)
+    $l.Add('write_files:')
+    foreach ($k in ($files.Keys | Sort-Object)) {
+        $mode = if ($k -match 'token$') { '0600' } else { '0700' }
+        $l.Add("  - path: /root/hv-seed/$k")
+        $l.Add('    encoding: b64')
+        $l.Add("    permissions: '$mode'")
+        $l.Add("    content: $(ConvertTo-B64 $files[$k])")
+    }
+    $l.Add('runcmd:')
+    $l.Add('  - [ bash, /root/hv-seed/firstboot.sh ]')
+    ($l -join "`n") + "`n"
+}
+
+# The first two fields of a public key file (type and data), or throws. The comment is dropped.
+function Read-HvSshKey([string]$file) {
+    if (-not (Test-Path -LiteralPath $file)) { Die "no such file: $file" }
+    $line = (Get-Content -LiteralPath $file -TotalCount 1)
+    if ($line -notmatch '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp\d+) ([A-Za-z0-9+/=]+)') { Die "$file is not an OpenSSH public key (one line: ssh-ed25519 AAAA...)" }
+    "$($Matches[1]) $($Matches[2])"
+}
+
+# The text of every user's .wslconfig on this PC.
+function Get-WslConfigTexts {
+    foreach ($f in (Get-ChildItem (Join-Path $env:SystemDrive 'Users') -Directory -ErrorAction SilentlyContinue)) {
+        $c = Join-Path $f.FullName '.wslconfig'
+        if (Test-Path -LiteralPath $c) { Get-Content -LiteralPath $c -Raw }
+    }
+}
+
+# Only SYSTEM and Administrators (by well-known SID) may touch the VM's folder: the seed disk holds registration tokens.
+function Protect-HvDir([string]$dir) {
+    & icacls.exe $dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+    if ($LASTEXITCODE) { Die "could not restrict access to $dir" }
+}
+
+# Disk space on the VM's drive (C: is the normal case): the expected footprint plus headroom must be free, and a disk that could
+# grow past free space minus headroom is refused. Warns, without refusing, when little is left after that.
+function Assert-HvSpace([double]$freeGB, [int]$diskGB, [string]$letter) {
+    $need = $HvFootprintGB + $HvHeadroomGB
+    $free = [math]::Round($freeGB, 1)
+    if ($freeGB -lt $need) { Die "drive ${letter}: has $free GB free; the VM needs about $HvFootprintGB GB plus $HvHeadroomGB GB headroom ($need GB)" }
+    if ($diskGB -gt $freeGB - $HvHeadroomGB) {
+        Die "-DiskGB $diskGB could grow past the $free GB free on drive ${letter}: with $HvHeadroomGB GB headroom the most is $([math]::Floor($freeGB - $HvHeadroomGB)) GB (lower -DiskGB, or free space)"
+    }
+    if ($freeGB - $need -lt $HvWarnFreeGB) {
+        Log "warning: drive ${letter}: has $free GB free; after the VM's expected $HvFootprintGB GB and the $HvHeadroomGB GB headroom under $HvWarnFreeGB GB is left: keep an eye on it (hyperv compact shrinks the VHDX)"
+    }
+}
+
+# What WSL may take, in GB: 0 when this PC has no WSL set, else the memory= cap in a user's .wslconfig, else WSL's default of
+# half the PC's RAM. TEXTS are the contents of the .wslconfig files that exist.
+function Get-HvWslMemoryGB([bool]$hasWsl, [string[]]$texts, [double]$hostGB) {
+    if (-not $hasWsl) { return 0 }
+    $cap = 0
+    foreach ($t in $texts) {
+        if ($t -match '(?im)^\s*memory\s*=\s*(\d+(?:\.\d+)?)\s*(GB|G|MB|M)?\s*$') {
+            $v = [double]$Matches[1]
+            $gb = if ($Matches[2] -match '^(?i)M') { $v / 1024 } else { $v }
+            if ($gb -gt $cap) { $cap = $gb }
+        }
+    }
+    if ($cap -gt 0) { return [math]::Ceiling($cap) }
+    [math]::Floor($hostGB / 2)
+}
+
+# True when the power watch would pause CI on battery for the Windows and WSL runners but cannot pause this VM: the task is
+# installed and the PC has a battery.
+function Test-HvPowerWatchConflict {
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $task) { return $false }
+    [bool](Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue)
+}
+
+# The cloud image (downloaded and checked, or -Image), as a path. Everything that can fail cheaply fails here, before any
+# registration token is minted: a missing file, a missing qemu-img.
+function Resolve-HvImageSource($o) {
+    $src = $o.Image
+    if (-not $src) {
+        $src = Join-Path $Cache $HvImageFile
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12   # Windows PowerShell 5.1 defaults to older TLS
+        New-Item -ItemType Directory -Force -Path $Cache | Out-Null
+        $sums = (Invoke-WebRequest -UseBasicParsing -Uri "$HvImageBase/SHA256SUMS").Content
+        $want = ($sums -split "`r?`n" | Where-Object { $_ -match [regex]::Escape($HvImageFile) + '$' } | Select-Object -First 1) -replace '\s.*$', ''
+        if ($want -notmatch '^[0-9a-f]{64}$') { Die "could not read the checksum of $HvImageFile from $HvImageBase/SHA256SUMS" }
+        if (-not (Test-Path $src) -or (Get-FileHash $src -Algorithm SHA256).Hash.ToLower() -ne $want) {
+            Log "downloading $HvImageFile (about 600 MB)"
+            $part = "$src.part"
+            Remove-Item -Force $part -ErrorAction SilentlyContinue
+            Invoke-WebRequest -UseBasicParsing -Uri "$HvImageBase/$HvImageFile" -OutFile $part
+            if ((Get-FileHash $part -Algorithm SHA256).Hash.ToLower() -ne $want) { Remove-Item -Force $part; Die 'the downloaded image does not match its published SHA-256: deleted it' }
+            Move-Item -Force $part $src   # a half-written download is never named like the image
+        }
+    }
+    if (-not (Test-Path -LiteralPath $src)) { Die "no such image: $src" }
+    if ($src -notmatch '\.(vhd|vhdx)$' -and -not (Get-Command qemu-img -ErrorAction SilentlyContinue)) {
+        Die 'qemu-img is needed to convert a .img cloud image: install QEMU for Windows and put qemu-img on PATH, or pass -Image a .vhd or .vhdx'
+    }
+    $src
+}
+
+function New-HvDisk($o, [string]$src, [string]$dir) {   # -> DIR\disk.vhdx, dynamic, grown to DiskGB
+    $disk = Join-Path $dir 'disk.vhdx'
+    if ($src -match '\.(vhd|vhdx)$') {
+        Convert-VHD -Path $src -DestinationPath $disk -VHDType Dynamic
+    } else {
+        & (Get-Command qemu-img).Source convert -O vhdx -o subformat=dynamic $src $disk
+        if ($LASTEXITCODE) { Die 'qemu-img could not convert the image' }
+    }
+    $want = [uint64]$o.DiskGB * 1GB
+    $have = (Get-VHD -Path $disk).Size
+    if ($have -gt $want) { Die "the image is $([math]::Round($have / 1GB)) GB, larger than -DiskGB $($o.DiskGB)" }
+    if ($have -lt $want) { Resize-VHD -Path $disk -SizeBytes $want }
+    $disk
+}
+
+# A FAT32 VHDX named CIDATA holding user-data and meta-data: cloud-init's NoCloud datasource finds it by label. It is
+# mounted on a folder inside the (locked-down) VM folder, never on a drive letter, and the volume is given time to come up.
+function New-HvSeedDisk([string]$path, [string]$userData, [string]$metaData) {
+    New-VHD -Path $path -SizeBytes 128MB -Dynamic -LogicalSectorSizeBytes 512 | Out-Null
+    $mnt = Join-Path (Split-Path -Parent $path) 'seedmnt'
+    $mounted = $false
+    $part = $null
+    try {
+        $d = Mount-VHD -Path $path -Passthru
+        $mounted = $true
+        $d = $d | Initialize-Disk -PartitionStyle GPT -PassThru
+        $part = New-Partition -InputObject $d -UseMaximumSize
+        $done = $false
+        for ($try = 1; $try -le 10 -and -not $done; $try++) {
+            try {
+                Format-Volume -Partition $part -FileSystem FAT32 -NewFileSystemLabel CIDATA -Confirm:$false | Out-Null
+                New-Item -ItemType Directory -Force -Path $mnt | Out-Null
+                Add-PartitionAccessPath -DiskNumber $d.Number -PartitionNumber $part.PartitionNumber -AccessPath $mnt
+                $done = $true
+            } catch {
+                if ($try -eq 10) { throw }
+                Start-Sleep -Seconds 2   # the new volume is not ready yet
+            }
+        }
+        $enc = New-Object Text.UTF8Encoding($false)
+        [IO.File]::WriteAllText((Join-Path $mnt 'user-data'), (ConvertTo-Lf $userData), $enc)
+        [IO.File]::WriteAllText((Join-Path $mnt 'meta-data'), (ConvertTo-Lf $metaData), $enc)
+    } finally {
+        if ($part) { Remove-PartitionAccessPath -DiskNumber $d.Number -PartitionNumber $part.PartitionNumber -AccessPath $mnt -ErrorAction SilentlyContinue }
+        if ($mounted) { Dismount-VHD -Path $path }
+        Remove-Item -LiteralPath $mnt -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-HvPrefix { (Get-Content $HostFile -Raw).Trim() }
+
+function Get-NextHvName([string]$adminRepo) {
+    foreach ($n in 1..50) {
+        $a = Test-OnGitHub $adminRepo "hv-$n-admin"
+        if ($null -eq $a) { Die 'could not list runners on GitHub (token or network)' }
+        if (-not $a) { return "hv-$n" }
+    }
+    Die 'no free hv-N name'
+}
+
+# The marker's runners that GitHub does not list yet, or $null when GitHub could not be asked.
+function Get-HvMissingRunners($m) {
+    $missing = @()
+    foreach ($r in @($m.runners)) {
+        $repo = if ($r -like '*-admin') { $m.admin_repo } else { $m.ci_repo }
+        $on = Test-OnGitHub $repo $r
+        if ($null -eq $on) { return $null }
+        if (-not $on) { $missing += $r }
+    }
+    return , $missing   # the comma keeps an empty list an empty list (not $null, which means "could not ask")
+}
+
+function Get-HvHeartbeat($vm) {
+    $s = Get-VMIntegrationService -VMName $vm.Name -Name Heartbeat -ErrorAction SilentlyContinue
+    if ($s) { [string]$s.PrimaryStatusDescription } else { '' }
+}
+
+# Detaches the seed disk (a SCSI disk, so this works on a running VM) and deletes its file. Quiet when it is already gone.
+function Remove-HvSeed($t) {
+    $m = $t.Marker
+    $d = Get-VMHardDiskDrive -VMName $t.Vm.Name | Where-Object { [string]$_.Path -ieq [string]$m.seed }
+    if ($d) { Remove-VMHardDiskDrive -VMName $t.Vm.Name -ControllerType $d.ControllerType -ControllerNumber $d.ControllerNumber -ControllerLocation $d.ControllerLocation }
+    if (Test-Path -LiteralPath $m.seed) { Remove-Item -LiteralPath $m.seed -Force }
+    if ($d) { Log 'seed disk detached and deleted' }
+}
+
+# Waits up to SECONDS for the guest heartbeat and every runner on GitHub; the seed disk (and its one-hour tokens) goes as soon as
+# both are true. Returns whether that happened.
+function Wait-HvReady($t, [int]$seconds) {
+    $deadline = (Get-Date).AddSeconds($seconds)
+    while ($true) {
+        $t.Vm = Get-VM -Name $t.Vm.Name
+        $hb = Get-HvHeartbeat $t.Vm
+        $missing = $null
+        if ($hb -like 'OK*') { $missing = Get-HvMissingRunners $t.Marker }
+        if ($hb -like 'OK*' -and $null -ne $missing -and -not $missing) { Remove-HvSeed $t; return $true }
+        if ((Get-Date) -ge $deadline) { return $false }
+        Start-Sleep -Seconds 10
+    }
+}
+
+# Undo a failed create: stop and remove the VM if this run made it, delete only the files this run made (the ones the marker
+# names, the VM's config folder and the seed mount folder), then the folder if nothing else is in it.
+function Undo-HvCreate([string]$dir, [string]$name, [string]$id, [bool]$vmMade) {
+    try {
+        if ($vmMade) {
+            $vm = Get-VM -Name $name -ErrorAction SilentlyContinue
+            if ($vm -and $vm.Notes -eq ($HvNotesPrefix + $id)) {
+                if ($vm.State -ne 'Off') { Stop-VM -Name $name -TurnOff -Force -ErrorAction SilentlyContinue }
+                Remove-VM -Name $name -Force
+            }
+        }
+        foreach ($f in 'disk.vhdx', 'disk.vhdx.tmp', 'seed.vhdx', $HvMarkerName) { Remove-Item -LiteralPath (Join-Path $dir $f) -Force -ErrorAction SilentlyContinue }
+        foreach ($s in 'vm', 'seedmnt') { Remove-Item -LiteralPath (Join-Path $dir $s) -Recurse -Force -ErrorAction SilentlyContinue }
+        if (-not (Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue }
+        Log "create failed: removed what this run made in $dir"
+    } catch { Log "create failed and the clean-up did too ($($_.Exception.Message)): look in $dir" }
+}
+
+function New-HvVmHost($o) {
+    if (-not $o.Yes) { Die 'hyperv create reserves the VM''s RAM and CPUs and writes a disk up to -DiskGB: add -Yes to go ahead' }
+    Assert-HvReady
+    if (-not $o.AdminRepo) { Die 'hyperv create needs -AdminRepo OWNER/REPO (where the admin runner hv-N-admin registers)' }
+    if (-not (Test-Path $HostFile)) { Die 'this PC has no runner name yet: run the installer first' }
+    if (-not $o.IgnorePowerWatch -and (Test-HvPowerWatchConflict)) {
+        Die 'this PC has a battery and the power watch pauses CI on battery for the Windows and WSL runners, but it cannot pause this VM: the VM would keep running jobs on battery. Add -IgnorePowerWatch to accept that'
+    }
+    if (Get-VM -Name $o.Name -ErrorAction SilentlyContinue) { Die "a VM named $($o.Name) already exists" }
+    $others = @(Get-HvToolVms)
+    if ($others.Count) { Die "this PC already has a VM host ($($others[0].Name)): one per PC; remove it first" }
+    $dir = Get-HvDir $o
+    if (Test-Path -LiteralPath $dir) { Die "$dir already exists: pick another -Name or -VhdxDir (it is never reused or overwritten)" }
+    $key = if ($o.SshKeyFile) { Read-HvSshKey $o.SshKeyFile } else { '' }
+    $prefix = Get-HvPrefix
+    if ($prefix -notmatch '^[A-Za-z0-9-]+$') { Die "this PC's runner name '$prefix' is not usable in a runner name" }
+    # resources: Windows keeps 4 GB, WSL keeps what it may take, the drive holds the disk with room to spare
+    $hostGB = [math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+    $wslGB = Get-HvWslMemoryGB (Test-Path (Join-Path $HomeDir 'wsl-host')) @(Get-WslConfigTexts) $hostGB
+    if ($o.RamGB -gt $hostGB - 4) { Die "-RamGB $($o.RamGB) leaves Windows under 4 GB of this PC's $hostGB GB" }
+    if ($o.RamGB + $wslGB -gt $hostGB - 4) {
+        Log "warning: $($o.RamGB) GB for the VM plus up to $wslGB GB that WSL may take (its memory= cap, or half the RAM by default) leaves Windows under 4 GB of $hostGB GB: set memory= in .wslconfig or lower -RamGB"
+    }
+    $cores = Get-TotalCores
+    if ($o.VCpu -gt $cores) { Die "-VCpu $($o.VCpu) is more than this PC's $cores logical processors" }
+    $sc = Get-SlotConfig
+    if ($sc -and ($sc.slots * $sc.threads + $o.VCpu) -gt $cores) {
+        Log "warning: job slots ($($sc.slots) x $($sc.threads) threads) plus the VM's $($o.VCpu) vCPUs is more than the $cores logical processors: lower one (winrunner slots, or -VCpu)"
+    }
+    $letter = $o.VhdxDir.Substring(0, 1)
+    $drive = Get-PSDrive -Name $letter -ErrorAction SilentlyContinue
+    if (-not $drive) { Die "drive ${letter}: does not exist" }
+    Assert-HvSpace ($drive.Free / 1GB) $o.DiskGB $letter
+    if (-not (Get-VMSwitch -Name $o.Switch -ErrorAction SilentlyContinue)) { Die "no Hyper-V virtual switch named '$($o.Switch)' (Get-VMSwitch lists them; -Switch picks one)" }
+    $provision = Join-Path $HomeDir 'linux-provision.sh'
+    $lrSrc = Join-Path $HomeDir 'linuxrunner'
+    if (-not (Test-Path $provision) -or -not (Test-Path $lrSrc)) { Die "linux-provision.sh and linuxrunner are missing from ${HomeDir} (update winrunner from the installer build)" }
+    $src = Resolve-HvImageSource $o   # downloads and checks everything big before a token exists
+    # GitHub: free names, then the one-hour tokens (minted last, so little of their hour is spent before the VM is up)
+    $hostName = Get-NextHvName $o.AdminRepo
+    $ciNames = @(1..$o.Runners | ForEach-Object { "$prefix-hv-$_" })
+    foreach ($n in $ciNames) {
+        $t = Test-OnGitHub $o.CiRepo $n
+        if ($null -eq $t) { Die 'could not list runners on GitHub (token or network)' }
+        if ($t) { Die "runner $n is already registered on GitHub (another box?)" }
+    }
+    $adminToken = New-GhToken 'registration' $o.AdminRepo
+    $ciToken = New-GhToken 'registration' $o.CiRepo
+    $files = @{
+        'firstboot.sh' = (New-HvFirstBoot $o $hostName $prefix $ciNames)
+        'linux-provision.sh' = (Get-Content $provision -Raw)
+        'linuxrunner' = (Get-Content $lrSrc -Raw)
+        'admin-token' = $adminToken
+        'ci-token' = $ciToken
+    }
+    $userData = New-HvUserData $o $hostName $files $key
+    $id = [guid]::NewGuid().ToString()
+    $n = $o.Name
+    $vmMade = $false
+    try {
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        Protect-HvDir $dir   # before the first token reaches a file
+        $marker = [ordered]@{
+            tool = 'win-runners'; kind = 'hyperv-vm'; id = $id; name = $n; vhdx = (Join-Path $dir 'disk.vhdx'); seed = (Join-Path $dir 'seed.vhdx')
+            hostname = $hostName; admin_repo = $o.AdminRepo; ci_repo = $o.CiRepo; runners = @($ciNames + "$hostName-admin"); created = (Get-Date).ToString('o')
+        }
+        Set-Content -LiteralPath (Join-Path $dir $HvMarkerName) -Value ($marker | ConvertTo-Json) -Encoding UTF8
+        Log "building the disk in $dir"
+        $disk = New-HvDisk $o $src $dir
+        New-HvSeedDisk (Join-Path $dir 'seed.vhdx') $userData "instance-id: $id`nlocal-hostname: $hostName`n"
+        New-VM -Name $n -Generation 2 -MemoryStartupBytes ([int64]$o.RamGB * 1GB) -VHDPath $disk -SwitchName $o.Switch -Path (Join-Path $dir 'vm') | Out-Null
+        $vmMade = $true
+        Set-VM -Name $n -StaticMemory -AutomaticStartAction StartIfRunning -AutomaticStartDelay 60 -AutomaticStopAction ShutDown -CheckpointType Disabled -Notes ($HvNotesPrefix + $id)
+        Set-VMProcessor -VMName $n -Count $o.VCpu
+        Set-VMFirmware -VMName $n -EnableSecureBoot On -SecureBootTemplate MicrosoftUEFICertificateAuthority
+        Add-VMHardDiskDrive -VMName $n -Path (Join-Path $dir 'seed.vhdx')
+        Start-VM -Name $n
+    } catch {
+        $why = $_
+        Undo-HvCreate $dir $n $id $vmMade
+        throw $why
+    }
+    if (-not $o.Image -and -not $o.KeepImage) {   # the downloaded image is only needed to build the disk
+        Remove-Item -LiteralPath $src, "$src.part" -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $src) { Log "could not delete the downloaded cloud image $src (about 0.6 GB): delete it yourself" }
+        else { Log 'deleted the downloaded cloud image (-KeepImage keeps it for the next create)' }
+    }
+    Log "VM $n started: $($o.VCpu) vCPU, $($o.RamGB) GB (static), disk up to $($o.DiskGB) GB at $disk"
+    Log "first boot installs the tools and registers $($ciNames -join ', ') and $hostName-admin (some minutes)"
+    $t = @{ Vm = (Get-VM -Name $n); Dir = $dir; Marker = (Read-HvMarker $dir) }
+    if ($o.WaitMin -gt 0 -and (Wait-HvReady $t ($o.WaitMin * 60))) { Log 'the guest is up and its runners are registered' }
+    elseif ($o.WaitMin -gt 0) { Log "not ready after $($o.WaitMin) minutes: check with winrunner hyperv status, which ejects the seed disk once the runners show on GitHub" }
+    else { Log 'run winrunner hyperv status until the runners show on GitHub: it then ejects the seed disk (it holds one-hour registration tokens)' }
+    Log 'last step, once it is idle: winrunner hyperv compact -Yes (stops the VM, shrinks the VHDX with Optimize-VHD, starts it again)'
+}
+
+function Show-HvStatus($o) {
+    Assert-HvReady
+    $t = Resolve-HvTarget $o $false
+    $vm = $t.Vm
+    $m = $t.Marker
+    if (-not $vm) { Write-Host "VM $($o.Name): none$(if ($m) { ' (files from an earlier create are in ' + $t.Dir + ')' })"; return }
+    Write-Host "VM:        $($vm.Name) (made by this tool, files in $($t.Dir))"
+    $hb = Get-HvHeartbeat $vm
+    Write-Host "state:     $($vm.State), heartbeat $hb"
+    Write-Host "cpu / ram: $($vm.ProcessorCount) vCPU, $([math]::Round($vm.MemoryStartup / 1GB, 1)) GB, dynamic memory $($vm.DynamicMemoryEnabled)"
+    Write-Host "autostart: start=$($vm.AutomaticStartAction) after $($vm.AutomaticStartDelay) s, stop=$($vm.AutomaticStopAction)"
+    $ips = @(Get-VMNetworkAdapter -VMName $vm.Name | ForEach-Object { $_.IPAddresses } | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' })
+    Write-Host "address:   $(if ($ips) { $ips -join ', ' } else { 'not reported (guest tools may still be installing)' })"
+    foreach ($d in Get-VMHardDiskDrive -VMName $vm.Name) {
+        $v = Get-VHD -Path $d.Path -ErrorAction SilentlyContinue
+        $what = if ($v) { "$([math]::Round($v.FileSize / 1GB, 1)) GB used of $([math]::Round($v.Size / 1GB)) GB" } else { 'unreadable' }
+        Write-Host "disk:      $($d.Path) ($what)"
+    }
+    $missing = Get-HvMissingRunners $m
+    if ($null -eq $missing) { Write-Host 'runners:   could not ask GitHub' }
+    elseif ($missing) { Write-Host "runners:   not on GitHub yet: $($missing -join ', ') (of $(@($m.runners) -join ', '))" }
+    else { Write-Host "runners:   all on GitHub: $(@($m.runners) -join ', ')" }
+    $seedAttached = [bool](Get-VMHardDiskDrive -VMName $vm.Name | Where-Object { [string]$_.Path -ieq [string]$m.seed })
+    if ($seedAttached) {
+        if ($o.WaitMin -gt 0 -and $o.Given.WaitMin) { [void](Wait-HvReady $t ($o.WaitMin * 60)) }
+        elseif ($hb -like 'OK*' -and $null -ne $missing -and -not $missing) { Remove-HvSeed $t }
+        else { Write-Host 'seed:      still attached (it holds one-hour tokens; it is ejected here once the guest is up and the runners are on GitHub; -WaitMin N waits)' }
+    }
+}
+
+function Set-HvPower($o, [string]$what) {
+    Assert-HvReady
+    $t = Resolve-HvTarget $o
+    $vm = $t.Vm
+    if ($what -eq 'start') { if ($vm.State -eq 'Running') { Log 'already running' } else { Start-VM -Name $vm.Name; Log "VM $($vm.Name) started" }; return }
+    if (-not $o.Yes) { Die 'hyperv stop shuts the VM down, which ends any job running in it: add -Yes (or run `ci off` for hv-N first and wait for it to go idle)' }
+    if ($vm.State -eq 'Off') { Log 'already off'; return }
+    Stop-VM -Name $vm.Name   # a guest shutdown through Hyper-V, never -TurnOff
+    Log "VM $($vm.Name) stopped"
+}
+
+# Unregisters a runner of ours from GitHub once it shows offline (it takes up to a minute after the guest stops); best effort.
+function Remove-HvGhRunner([string]$repo, [string]$name) {
+    for ($try = 1; $try -le 12; $try++) {
+        try {
+            $list = Invoke-Gh 'GET' "$(Api-Path $repo)/actions/runners?per_page=100"
+            $hit = @($list.runners | Where-Object { $_.name -eq $name })
+            if (-not $hit.Count) { return }
+            if ($hit[0].status -eq 'offline') { Invoke-Gh 'DELETE' "$(Api-Path $repo)/actions/runners/$($hit[0].id)" | Out-Null; Log "unregistered $name"; return }
+        } catch { if ($try -eq 12) { Log "could not unregister ${name}: $($_.Exception.Message)"; return } }
+        Start-Sleep -Seconds 5
+    }
+    Log "$name is still online on GitHub: delete it in the repo's Settings > Actions > Runners"
+}
+
+function Remove-HvVmHost($o) {
+    Assert-HvReady
+    $t = Resolve-HvTarget $o $false
+    if (-not $t.Marker) { Die "no VM made by this tool$(if ($o.Given.Name) { ' named ' + $o.Name }), and no $HvMarkerName in $($t.Dir) (-VhdxDir names the folder holding a removed VM's files): nothing to remove" }
+    $m = $t.Marker
+    if ($o.ConfirmRemove -ne $m.name) { Die "hyperv remove deletes the VM: repeat its name as -ConfirmRemove $($m.name)" }
+    $vm = $t.Vm
+    $del = Get-HvRemovable $t.Dir $(if ($vm) { $vm.Name } else { $o.Name }) $(if ($vm) { [string]$vm.Notes } else { $null })   # throws unless the marker and the notes prove it is ours
+    if ($vm) {
+        if ($vm.State -ne 'Off') { Die "VM $($vm.Name) is $($vm.State): run hyperv stop -Yes first" }
+        Remove-VM -Name $vm.Name -Force
+        Log "VM $($vm.Name) removed from Hyper-V"
+    }
+    if (-not $o.DeleteVhdx) { Log "the disks are kept in $($t.Dir) (add -DeleteVhdx to delete them); the GitHub runners stay registered"; return }
+    foreach ($r in @($m.runners)) { Remove-HvGhRunner $(if ($r -like '*-admin') { $m.admin_repo } else { $m.ci_repo }) $r }
+    foreach ($f in $del) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force; Log "deleted $f" } }
+    $vmDir = Join-Path $t.Dir 'vm'
+    if (Test-Path -LiteralPath $vmDir) { Remove-Item -LiteralPath $vmDir -Recurse -Force }
+    if (-not (Get-ChildItem -LiteralPath $t.Dir -Force)) { Remove-Item -LiteralPath $t.Dir }
+}
+
+# $true when a job is running in the guest, $false when it is idle, $null when the guest cannot be asked (no ssh.exe, no address, or
+# no key: the VM has a login only if create got -SshKeyFile).
+function Get-HvGuestBusy($vm) {
+    $ssh = Get-Command ssh.exe -ErrorAction SilentlyContinue
+    if (-not $ssh) { return $null }
+    $ip = @(Get-VMNetworkAdapter -VMName $vm.Name | ForEach-Object { $_.IPAddresses } | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' }) | Select-Object -First 1
+    if (-not $ip) { return $null }
+    & $ssh.Source -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "ubuntu@$ip" 'pgrep -f Runner.Worker >/dev/null' 2>$null
+    switch ($LASTEXITCODE) { 0 { return $true } 1 { return $false } default { return $null } }
+}
+
+# Compacting needs the VM off. A VM that is running is only stopped when it is ready (heartbeat, every runner on GitHub, seed
+# ejected), nothing is running a job, and -Yes says the shutdown is wanted. The VM is started again afterwards, also after a
+# failure, but only if it is Off. A Windows restart in the middle leaves it Off (its auto-start does not start a VM that was stopped).
+function Invoke-HvCompact($o) {
+    Assert-HvReady
+    $t = Resolve-HvTarget $o
+    $vm = $t.Vm
+    $m = $t.Marker
+    $restart = $false
+    if ($vm.State -ne 'Off') {
+        if ((Get-HvHeartbeat $vm) -notlike 'OK*') { Die "VM $($vm.Name) has no OK heartbeat: it is not ready to be stopped for compacting (hyperv status)" }
+        $missing = Get-HvMissingRunners $m
+        if ($null -eq $missing) { Die 'could not ask GitHub whether the runners are registered: try again' }
+        if ($missing) { Die "runners not on GitHub yet: $($missing -join ', '): wait for the first boot (hyperv status)" }
+        if (Get-VMHardDiskDrive -VMName $vm.Name | Where-Object { [string]$_.Path -ieq [string]$m.seed }) { Die 'the seed disk is still attached: run hyperv eject-seed first' }
+        $busy = Get-HvGuestBusy $vm
+        if ($busy) { Die 'a job is running in the VM: compact when it is idle' }
+        if ($null -eq $busy) { Log 'warning: cannot look inside the guest (no ssh login), so a running job cannot be ruled out; stopping the VM would end it' }
+        if (-not $o.Yes) { Die "VM $($vm.Name) is $($vm.State): compacting stops it, which ends any job in it: add -Yes to stop it, compact, and start it again" }
+        $restart = $true   # set first: if Stop-VM fails half way, the finally below still brings the VM back
+    }
+    $vhdx = [string]$m.vhdx
+    try {
+        if ($restart) { Stop-VM -Name $vm.Name }
+        if ((Get-VM -Name $vm.Name).State -ne 'Off') { Die "VM $($vm.Name) did not shut down: not touching its disk" }
+        $before = (Get-VHD -Path $vhdx).FileSize
+        Mount-VHD -Path $vhdx -ReadOnly -NoDriveLetter
+        try { Optimize-VHD -Path $vhdx -Mode Full } finally { Dismount-VHD -Path $vhdx }
+        $after = (Get-VHD -Path $vhdx).FileSize
+        Log "compacted ${vhdx}: $([math]::Round($before / 1GB, 1)) GB -> $([math]::Round($after / 1GB, 1)) GB"
+    } finally {
+        if ($restart -and (Get-VM -Name $vm.Name).State -eq 'Off') { Start-VM -Name $vm.Name; Log "VM $($vm.Name) started again" }
+    }
+}
+
+function Invoke-HvEjectSeed($o) {
+    Assert-HvReady
+    Remove-HvSeed (Resolve-HvTarget $o)   # the seed is a SCSI disk: it detaches from a running VM
+}
+
+function Invoke-Hyperv([string[]]$words) {
+    $usage = 'hyperv create|status|start|stop|remove|compact|eject-seed [options] (winrunner help)'
+    if ($words.Count -lt 1) { Die $usage }
+    $sub = $words[0]
+    if ($sub -notin 'create', 'status', 'start', 'stop', 'remove', 'compact', 'eject-seed') { Die $usage }
+    $o = ConvertFrom-HvArgs $sub @($words | Select-Object -Skip 1)
+    switch ($sub) {
+        'create' { New-HvVmHost $o }
+        'status' { Show-HvStatus $o }
+        'start' { Set-HvPower $o 'start' }
+        'stop' { Set-HvPower $o 'stop' }
+        'remove' { Remove-HvVmHost $o }
+        'compact' { Invoke-HvCompact $o }
+        'eject-seed' { Invoke-HvEjectSeed $o }
+    }
+}
+
 function Show-Usage {
     @'
 winrunner: GitHub Actions runners on this Windows PC (run in an administrator PowerShell)
@@ -1610,6 +2295,16 @@ winrunner: GitHub Actions runners on this Windows PC (run in an administrator Po
   bootstrap ENVFILE               first install (win-runners.ps1 does this)
   power-watch                     the power loop (a scheduled task runs this)
   install-power-watch             (re)create that scheduled task
+  hyperv create -Yes -AdminRepo OWNER/REPO [-Name hv-ci] [-VCpu 4] [-RamGB 16] [-DiskGB 16] [-VhdxDir D:\hyperv]
+         [-Runners 2] [-Tags linux-ci] [-CiRepo ORG] [-WaitMin 30] [-IgnorePowerWatch] [-KeepImage] [-Image FILE] [-Switch NAME] [-RamdiskMB MB] [-CacheMB MB] [-CoresPerJob N] [-SshKeyFile F.pub]
+                                  opt-in: ONE Ubuntu 24.04 Hyper-V VM (static CPU and RAM, starts with Windows) running the Linux
+                                  runners win-N-hv-M (tagged linux-ci) and the admin runner hv-N-admin; needs Hyper-V on Windows 11 Pro+
+  hyperv status|start [-Name N]   the VM's state, address, disks and whether its runners are on GitHub (-WaitMin N waits) / start it
+  hyperv stop -Yes [-Name N]      shut the VM down (a running job in it ends)
+  hyperv eject-seed [-Name N]     detach and delete the seed disk (one-hour tokens); works on a running VM. create and status do it on their own
+  hyperv compact [-Yes] [-Name N] shrink the VHDX (Optimize-VHD -Mode Full); a running VM is stopped and started again only with -Yes
+  hyperv remove -ConfirmRemove N [-DeleteVhdx] [-Name N] [-VhdxDir D]
+                                  remove the VM; with -DeleteVhdx also its disks, but only the files its marker names
 '@ | Write-Host
 }
 
@@ -1644,6 +2339,7 @@ try {
         'bootstrap' { Need 1 'bootstrap ENVFILE'; Invoke-Bootstrap $r[0] }
         'power-watch' { Invoke-PowerWatch }
         'install-power-watch' { Assert-Admin; Install-PowerWatch }
+        'hyperv' { Invoke-Hyperv $r }
         { $_ -in 'help', '-h', '--help' } { Show-Usage }
         default { Show-Usage; exit 2 }
     }
