@@ -121,6 +121,7 @@ def test_runner_cli_gets_the_dashboards_org_and_admin_repo_in_the_container(monk
     s.macs(["info", "air-1"], 5)
     assert seen["cmd"][2:] == ["info", "air-1"]
     assert seen["env"]["GITRUNNER_ORG"] == "acme" and seen["env"]["GITRUNNER_REPO"] == "acme/fleet"
+    assert seen["env"]["RUNNER_VIA"] == "github"  # the dashboard already tried SSH
 
 
 def test_runner_dashboard_on_the_pc_keeps_the_callers_org_and_repo_default(monkeypatch):

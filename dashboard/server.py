@@ -340,7 +340,8 @@ def macs(args, timeout):
     script = os.environ.get("MACS_SCRIPT") or str(HERE.parent / "runner")
     # The CLI needs its org (runner, line 9). In the container nothing else sets it, so it gets the
     # dashboard's org and admin repo; `runner dashboard` on the PC has already exported its own.
-    env = dict(os.environ)
+    # The dashboard already tried SSH itself: tell the script to go straight to the workflow.
+    env = {**os.environ, "RUNNER_VIA": "github"}
     if "GITRUNNER_ORG" not in env:
         env["GITRUNNER_ORG"] = ORG
         env.setdefault("GITRUNNER_REPO", ADMIN_REPO)

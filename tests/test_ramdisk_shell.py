@@ -659,7 +659,13 @@ def run_runner(tmp_path, *args):
         '#!/bin/sh\necho "$*" >> "$GH_LOG"\ncase "$1 $2" in\n  "run list") echo 42 ;;\n  "run view") echo completed ;;\nesac\nexit 0\n'
     )
     (bindir / "gh").chmod(0o755)
-    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "GH_LOG": str(log), "GITRUNNER_ORG": "example-org"}
+    env = {
+        **os.environ,
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "GH_LOG": str(log),
+        "GITRUNNER_ORG": "example-org",
+        "RUNNER_VIA": "github",
+    }
     r = subprocess.run(
         [str(ROOT / "runner"), "ramdisk", *args],
         env=env,
