@@ -74,30 +74,73 @@ Report vulnerabilities privately: see [SECURITY.md](SECURITY.md).
 - A control machine with `bash` and a signed-in [`gh`](https://cli.github.com): Linux, macOS, or Windows with
   Git for Windows (`runner.cmd` wraps it for PowerShell). Python 3.8+ for the local dashboard.
 - Devices: Apple Silicon Macs (macOS 13+ expected; developed on 15 and 26), Windows 10/11 PCs, or Linux/WSL2 boxes with systemd.
-- To build the Mac installer: Linux or WSL with `build-essential cpio golang-go libxml2-dev libssl-dev zlib1g-dev autoconf`
-  (see [docs/architecture.md](docs/architecture.md)); the first build also compiles `mkbom` and `xar`.
+- To build the Mac installer (`mac/build-local.sh`): Linux or WSL (Ubuntu) with
+  `sudo apt-get install -y build-essential cpio golang-go libxml2-dev libssl-dev zlib1g-dev autoconf`. The first
+  build also compiles `mkbom` (bomutils) and `xar` into `~/pkgtools`. `golang-go` on Ubuntu 24.04 is Go 1.22; if a
+  tool the build fetches needs a newer Go, install a newer toolchain. `runner build-local` is written for a
+  Windows control machine with a WSL distro named `Ubuntu`; on Linux (or another distro name) run
+  `GITRUNNER_ORG=<org> mac/build-local.sh out`, then upload `out/git-runner-mac.pkg` to the `installer` release
+  of your repo:
+  `gh release create installer -R <org>/runnerpool --title "Mac installer" --notes "Mac installer"` (once), then
+  `gh release upload installer out/git-runner-mac.pkg -R <org>/runnerpool --clobber`.
+- To build the Windows installer (`win/build.sh`): only `bash` (Git Bash is enough); no WSL or packaging tools.
 
 ## Quickstart
 
 ### 1. Get the code and name your org
 
-Fork or clone this repository into your organisation (say `example-org/runnerpool`) and keep it **private**:
-the installers you build carry credentials. Replace `example-org` in workflow files and docs where you see it,
-and set the values in [Configuration reference](#configuration-reference) below. Nothing in the code carries a
-default org, server or host of its own: unset required variables fail with a message that names them.
+Keep your copy **private**: the installers you build carry credentials. You cannot fork a public repository
+into a private one, so create an empty private repo in your organisation (say `example-org/runnerpool`), clone
+this repository, and push it there. Keep this repository as the `upstream` remote to pull updates later.
+Push to `main` (the default branch), because `gh workflow run` finds the Admin workflows there.
+
+PowerShell:
+
+```powershell
+gh repo create example-org/runnerpool --private
+git clone https://github.com/<upstream-owner>/runnerpool.git
+cd runnerpool
+git remote rename origin upstream
+git remote add origin https://github.com/example-org/runnerpool.git
+git push -u origin main
+```
+
+bash:
+
+```bash
+gh repo create example-org/runnerpool --private
+git clone https://github.com/<upstream-owner>/runnerpool.git && cd runnerpool
+git remote rename origin upstream
+git remote add origin https://github.com/example-org/runnerpool.git
+git push -u origin main
+# later: git fetch upstream && git merge upstream/main
+```
+
+Then set the values in [Configuration reference](#configuration-reference) below. The workflows contain no
+org name, and the tools take the org from `GITRUNNER_ORG` (it is baked into the installers at build time), so
+you set `GITRUNNER_ORG` rather than edit files. Unset required variables fail with a message that names them.
 In `.github/ISSUE_TEMPLATE/config.yml`, point the security-advisory URL at your own repository.
+The Actions variable `RUNNERPOOL_SELF_HOSTED` switches the self-hosted workflows on; you set it at the end of
+[step 5](#5-build-and-install), once your first runner is installed.
 
 ### Configuration reference
 
 | Name | Used by | Meaning |
 | --- | --- | --- |
 | `GITRUNNER_ORG` (required) | `runner`/`rp`, `win/build.sh`, `mac/build-local.sh`, `scripts/deploy.sh`, `compose.yaml` | Your GitHub org. Baked into the Mac and Windows installers at build time (the Mac pkg writes it to `/usr/local/mac-runners/org`); `GITRUNNER_APP_ORG` overrides it for the App lookup |
-| `RUNNERPOOL_SELF_HOSTED` (Actions variable) | `admin*.yml`, `build*.yml`, `deploy.yml` | Set to `true` in your own repo to enable the workflows that need your self-hosted runners and secrets. Unset (forks, fresh clones) they are skipped. This repo's own `ci.yml` runs on GitHub-hosted `ubuntu-latest` and needs no setup |
+| `RUNNERPOOL_SELF_HOSTED` (Actions variable) | `admin*.yml`, `build*.yml`, `deploy.yml` | Set to `true` in your own repo to enable the workflows that need your self-hosted runners and secrets. Unset (forks, fresh clones) their jobs are skipped; `runner` stops with a message when a job it dispatched was skipped. See the note below the table |
 | `GITRUNNER_REPO` | `runner` | Repo holding the Admin workflows; default `<org>/runnerpool` |
 | `GITRUNNER_BUNDLE_ID` | Mac build, `mac/gitrunner` | launchd label prefix and pkg id; default `io.github.git-runner.mac-runners`. Also settable as an Actions variable for `build.yml` |
 | `DEPLOY_HOST`, `REMOTE_CONTEXT` | `scripts/*.sh` | ssh target and Docker context of the dashboard server |
 | `MACS_ALLOWED_HOSTS` (required), `MAC_1_IP`, `MAC_2_IP`, `MACS_CI_EXTRA`, `MACS_CI_TOKEN_FILES`, `WATCHDOG_TZ` (default `UTC`) | `compose.yaml` | Dashboard host names, the Macs' tailnet IPs, extra repos and their token, digest timezone |
 | Secrets `CI_APP_ID`, `CI_APP_PRIVATE_KEY` (or `RUNNER_PAT`), `TS_AUTHKEY`, `DEPLOY_SSH_KEY`, `DEPLOY_HOST`; variables `DEPLOY_HEALTH_URL`, `MACS_ALLOWED_HOSTS`, `GITRUNNER_BUNDLE_ID` | Actions | Installers and the automated deploy; details in [docs/dashboard-deploy.md](docs/dashboard-deploy.md) |
+
+About `RUNNERPOOL_SELF_HOSTED`: it gates the Admin and build workflows (what `runner` dispatches) and
+`deploy.yml`. **`deploy.yml` also runs after every green push to `main` once the variable is `true`**, and fails
+without `DEPLOY_HOST`, `DEPLOY_SSH_KEY` and a server. If you do not want the dashboard, leave the deploy secrets
+unset and disable that one workflow in the Actions tab. Set it when your first runner is installed, or when you
+want `runner publish`, `test`, `publish-win` or the Admin fallback; `build-local`, `build-win` and the SSH path of
+`runner` do not need it. This repo's own `ci.yml` runs on GitHub-hosted `ubuntu-latest` and needs no setup.
 
 `rp` is a short alias for `runner` (`./rp list`, `.\rp.cmd list`).
 
@@ -136,19 +179,36 @@ found, `build-local` asks for each value at a hidden prompt.
 
 ### 5. Build and install
 
+The first installer has to be built on your control machine: `runner publish` and `runner publish-win` build in
+Actions and need a self-hosted runner (`mac-ci` for the Mac pkg, `linux-ci` for the Windows installer) that does
+not exist until an installer has run somewhere. So the order for an empty org is:
+
 ```bash
-./runner build-local        # builds the Mac pkg (and Windows installer) on this machine, no Actions minutes
+./runner build-local        # the Mac pkg only (git-runner-mac.pkg), built here with no Actions minutes
+./runner build-win          # the Windows installer only (win-runners.ps1), plain bash, no WSL needed
 ```
 
-Upload the result to a **private** place only (see SECURITY). Then per OS:
+Both upload the file to a private `installer` release in your repo (and delete the local copy);
+`./runner link` prints the download links. Never put them anywhere public (see SECURITY). Install the first
+machine from that link (per OS, below). Use `build-local`/`build-win` again any time no matching runner is online.
 
 - **Mac:** open the `.pkg`, allow it under System Settings > Privacy & Security > **Open Anyway**, Install, type
   the Mac's password, then delete the file. The Mac names itself `air-1`, `air-2`, ... A password is needed again
   after a reboot (FileVault).
-- **Windows:** run the generated `win-runners.ps1` in an administrator PowerShell on the PC. It names itself
+- **Windows:** download `win-runners.ps1` (from `./runner link`) and run it in an administrator PowerShell on the PC. It names itself
   `win-1`, ... and can add WSL Linux runners. See [docs/windows.md](docs/windows.md); **untested on real hardware**.
-- **Linux / WSL:** copy `linux/linuxrunner` to the box and run `bash linuxrunner bootstrap wsl-1`, then register the
+- **Linux / WSL:** (the PC's WSL runners come with the Windows installer; this is for a box on its own) copy `linux/linuxrunner` to the box and run `bash linuxrunner bootstrap wsl-1`, then register the
   admin runner. See [docs/linux.md](docs/linux.md).
+
+Once the first runner is installed, switch the self-hosted workflows on:
+
+```bash
+gh variable set RUNNERPOOL_SELF_HOSTED -b true -R example-org/runnerpool
+```
+
+From then on you can rebuild with `./runner publish` (Mac, needs a `mac-ci` runner online) and
+`./runner publish-win` (Windows, needs a `linux-ci` runner online, which you have if you answered Y to the
+installer's WSL prompt and WSL is installed), and use the Admin workflows.
 
 ### 6. Check the fleet
 
@@ -162,6 +222,10 @@ Upload the result to a **private** place only (see SECURITY). Then per OS:
 - `./runner dashboard` serves a local control panel on `127.0.0.1` only.
 - For an always-on one, run the `dashboard/` and `watchdog/` containers with `compose.yaml` behind a private
   reverse proxy: [docs/dashboard-deploy.md](docs/dashboard-deploy.md), [docs/watchdog.md](docs/watchdog.md).
+
+Before `docker compose up` the nine secret files must exist (two are required, see
+[docs/dashboard-deploy.md](docs/dashboard-deploy.md)), and `compose.yaml` publishes port 8765 on every
+interface, so keep the host behind your LAN/tailnet.
 
 ### 8. Use the runners from a workflow
 
@@ -224,7 +288,7 @@ suite between machines. Details: [docs/architecture.md](docs/architecture.md), [
 `./runner help` lists everything: `list`, `link`, `status`, `doctor`, `logs`, `restart`, `reregister`,
 `remove`, `add`/`drop` (a runner for another repo), `update` (push a new on-device tool), `battery pause|run`,
 `cores N|all`, `slots HOST N|off`, `limit HOST RUNNER cores=N|default ram=MB|default`, `ramdisk HOST on [GB]|off` (a Mac, or the PC's WSL runners),
-`postgres`, `tailscale`, `rotate-token`, `set-app`, `ssh`.
+`postgres`, `tailscale`, `rotate-token`, `set-app`, `ssh`, `ci`, `publish`, `publish-win`, `test`, `build-win`.
 
 Rotating keys: for the App key, generate a new one, update your secret manager and `CI_APP_PRIVATE_KEY`, run
 `./runner set-app`, then delete the old key. For a PAT, create a new one, update `RUNNER_PAT`, run

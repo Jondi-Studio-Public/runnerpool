@@ -1305,7 +1305,7 @@ function Invoke-Bootstrap([string]$envFile) {
     $e = Get-Content $envFile -Raw | ConvertFrom-Json
     Remove-Item -Force $envFile
     foreach ($d in $HomeDir, $Runners, $Logs, $Conf) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
-    if ($e.GITRUNNER_ORG) { $script:AppOrg = ([string]$e.GITRUNNER_ORG).Trim() }
+    if ($e.GITRUNNER_ORG -and -not $env:GITRUNNER_APP_ORG) { $script:AppOrg = ([string]$e.GITRUNNER_ORG).Trim() }
     if ($script:AppOrg) { Write-Private $OrgFile $script:AppOrg }
     if ($e.GITHUB_APP_ID -and $e.GITHUB_APP_KEY_B64) {
         try { Assert-AppOrg } catch { Die $_.Exception.Message }

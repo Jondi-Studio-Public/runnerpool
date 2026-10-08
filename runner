@@ -42,6 +42,17 @@ step_output() {  # run-id step-name
     grep -vE $'^\e\\[36;1m|^##\\[(end)?group\\]|^shell: |^env:|^  [A-Z_]+: ' || true
 }
 
+# die_if_skipped ID: a dispatched run whose job was skipped (the workflow's `if:` is false) still
+# "succeeds"; say so instead of reporting success for work that never ran.
+die_if_skipped() {
+  local skipped
+  skipped=$(gh run view "$1" -R "$REPO" --json jobs --jq '.jobs | length > 0 and all(.[]; .conclusion == "skipped")' 2>/dev/null || true)
+  if [ "$skipped" = true ]; then
+    die "the workflow job was skipped, so nothing ran. Set the repo variable: gh variable set RUNNERPOOL_SELF_HOSTED -b true -R $REPO ($REPO run $1)"
+  fi
+  return 0
+}
+
 # admin HOST ACTION [key=value ...]: run one Admin action on a Mac and show its output.
 admin() {
   local host=$1 action=$2 req id status workflow=admin.yml
@@ -73,6 +84,7 @@ admin() {
   fi
   local rc=0
   gh run watch "$id" -R "$REPO" --exit-status >/dev/null 2>&1 || rc=$?
+  die_if_skipped "$id"
   step_output "$id" "$action"
   [ "$rc" = 0 ] || die "$action failed on $host (exit $rc): https://github.com/$REPO/actions/runs/$id"
 }
@@ -104,6 +116,7 @@ cmd_build() {  # build true|false: build and check a test package on a Mac runne
   echo "building: https://github.com/$REPO/actions/runs/$id"
   local rc=0
   gh run watch "$id" -R "$REPO" --exit-status >/dev/null 2>&1 || rc=$?
+  die_if_skipped "$id"
   [ "$rc" = 0 ] || die "build failed: https://github.com/$REPO/actions/runs/$id"
   if [ "$test" = true ]; then
     step_output "$id" "Check the test package" | tail -25
@@ -204,7 +217,10 @@ cmd_build_win() {
   gh workflow run build-win.yml -R "$REPO" ${MACS_REF:+--ref "$MACS_REF"} -f "request=$req" >/dev/null
   id=$(find_run build-win.yml "$req")
   echo "building: https://github.com/$REPO/actions/runs/$id"
-  gh run watch "$id" -R "$REPO" --exit-status >/dev/null 2>&1 || die "build failed: https://github.com/$REPO/actions/runs/$id"
+  local rc=0
+  gh run watch "$id" -R "$REPO" --exit-status >/dev/null 2>&1 || rc=$?
+  die_if_skipped "$id"
+  [ "$rc" = 0 ] || die "build failed: https://github.com/$REPO/actions/runs/$id"
   echo "published: $WIN_LINK"
 }
 
@@ -331,10 +347,10 @@ runner: manage the Mac and Windows CI runners from this PC
 
   runner list                         every runner of the org and its admin repo, online or not
   runner link                         the installers' download links and install steps (Mac and Windows)
-  runner publish                      rebuild the installer (after changing mac/ or a secret)
+  runner publish                      rebuild the installer in Actions (needs a mac-ci runner online; the first time use build-local)
   runner build-local [--dry]          build it on this PC (WSL) and upload it: no Actions minutes
   runner test                         build a test package on a Mac runner and check its contents
-  runner publish-win                  rebuild the Windows installer (after changing win/ or a secret)
+  runner publish-win                  rebuild the Windows installer in Actions (needs a linux-ci runner online; the first time use build-win)
   runner build-win [--dry]            build it on this PC and upload it (the token from 1Password)
   runner rotate-token                 give every Mac and PC the new RUNNER_PAT secret (switches a device back to the PAT), rebuild both installers
   runner set-app                      switch every Mac and PC to the CI GitHub App (CI_APP_ID, CI_APP_PRIVATE_KEY secrets), rebuild both installers
