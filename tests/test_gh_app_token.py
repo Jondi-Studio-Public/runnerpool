@@ -111,6 +111,19 @@ def test_token_is_cached_and_refreshed_ten_minutes_before_expiry():
     assert sum(1 for _, p, _ in gh.calls if p.endswith("/installation")) == 1
 
 
+def test_a_caller_needing_longer_gets_a_token_that_outlives_its_call():
+    gh, clock = FakeGitHub(), Clock()
+    s = G.TokenProvider("", source(gh, clock))
+    assert s.token() == "token-1"
+    clock.t += 3600 - 800  # 13 minutes 20 seconds left: fine for most calls
+    assert s.token() == "token-1" and gh.minted == 1
+    assert s.token(min_ttl=900) == "token-2" and gh.minted == 2  # a 15-minute CLI call gets a fresh one
+    assert s.token() == "token-2" and gh.minted == 2
+    clock.t += 3600 - 800
+    gh.fail = 503  # a failed early refresh keeps the still-valid token rather than none
+    assert s.token(min_ttl=900) == "token-2"
+
+
 def test_failed_refresh_keeps_the_token_until_it_really_expires():
     gh, clock = FakeGitHub(), Clock()
     s = source(gh, clock)
@@ -190,6 +203,11 @@ def test_dashboard_gh_calls_keep_the_pat_without_the_app(monkeypatch):
     mod = load_server(monkeypatch)
     assert mod.gh_env() is None  # inherit GH_TOKEN, exactly as before
     assert mod.gh_env({"A": "b"}) == {"A": "b"}
+    seen = {}
+    monkeypatch.setattr(mod, "find_bash", lambda: "/bin/bash")
+    monkeypatch.setattr(mod, "run", lambda cmd, timeout, env=None: seen.update(env=env) or (0, "", ""))
+    mod.macs(["info", "air-1"], 900)  # the runner CLI keeps the PAT
+    assert seen["env"]["GH_TOKEN"] == "pat-1"
 
 
 def test_dashboard_gh_calls_use_the_app_token_and_never_override_a_personal_one(monkeypatch):
@@ -208,3 +226,6 @@ def test_dashboard_gh_calls_use_the_app_token_and_never_override_a_personal_one(
     assert seen["env"]["GH_TOKEN"] == "personal"
     mod.run(["bash", "x"], 5)
     assert seen["env"] is None
+    monkeypatch.setattr(mod, "find_bash", lambda: "/bin/bash")
+    mod.macs(["info", "air-1"], 5)  # the runner CLI's own gh calls need the App token too
+    assert seen["env"]["GH_TOKEN"] == "token-1" and seen["env"]["GITRUNNER_ORG"]

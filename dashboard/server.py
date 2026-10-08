@@ -153,15 +153,16 @@ def now():
 _TOKENS = gh_app_token.TokenProvider.from_env()
 
 
-def gh_env(env=None):
+def gh_env(env=None, min_ttl=0):
     """The environment for a `gh` call: with the GitHub App configured, GH_TOKEN is its current
-    installation token (minted and refreshed by gh_app_token). Otherwise env is returned as given
-    (None = inherit), so the PAT from the entrypoint is used exactly as before. A caller that
-    passes its own token (the personal-repo path) builds env itself and bypasses this."""
+    installation token (minted and refreshed by gh_app_token), valid for at least min_ttl s more.
+    Otherwise env is returned as given (None = inherit), so the PAT from the entrypoint is used exactly
+    as before. A caller that passes its own token (the personal-repo path) builds env itself and
+    bypasses this."""
     if not _TOKENS.source:
         return env
     try:
-        tok = _TOKENS.token()
+        tok = _TOKENS.token(min_ttl)
     except gh_app_token.AppTokenError as e:
         gh_app_token.log(f"GitHub App token unavailable: {e}")
         return env
@@ -331,7 +332,15 @@ def macs(args, timeout):
     if not bash:
         return 127, "", "Git for Windows' bash not found (winget install Git.Git): it runs macs"
     script = os.environ.get("MACS_SCRIPT") or str(HERE.parent / "runner")
-    return run([bash, script, *args], timeout)
+    # The CLI needs its org (runner, line 9). In the container nothing else sets it, so it gets the
+    # dashboard's org and admin repo; `runner dashboard` on the PC has already exported its own.
+    env = dict(os.environ)
+    if "GITRUNNER_ORG" not in env:
+        env["GITRUNNER_ORG"] = ORG
+        env.setdefault("GITRUNNER_REPO", ADMIN_REPO)
+    # Its gh calls get the App's token as the dashboard's own do (run() only adds it for a bare `gh`),
+    # one that outlives the whole call (plus a minute's slack): with the App set up the PAT may be gone.
+    return run([bash, script, *args], timeout, gh_env(env, min_ttl=timeout + 60))
 
 
 _MAIN_SHA = {"at": 0.0, "sha": ""}
@@ -1678,6 +1687,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     port = 0
     extra_hosts = ()  # Host names accepted besides 127.0.0.1 and localhost (MACS_ALLOWED_HOSTS)
 
+    @property
+    def url(self):
+        """The request target as the routes read it; the sign-in check gates this same path."""
+        return urlparse(self.path)
+
     def log_message(self, fmt, *args):
         if (
             not self.path.startswith(("/api/runners", "/api/runs", "/api/jobs", "/api/ci", "/healthz"))
@@ -1734,6 +1748,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def allowed(self):
+        # Only an origin-form target ("/path?query") is served. An absolute-form one ("http://h/api/..."),
+        # valid HTTP/1.1 that browsers never send, would otherwise skip the sign-in check while urlparse
+        # still routes it to the API. The checks below also look at the parsed path, as the routes do.
+        if not self.path.startswith("/"):
+            self.send(400, {"error": "bad request target"})
+            return False
+        path = self.url.path
         # Host check stops DNS rebinding; the token (a custom header, so a cross-site page can't
         # send it without a CORS preflight this server never answers) stops everything else.
         host = self.headers.get("Host") or ""
@@ -1742,12 +1763,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ):
             self.send(403, {"error": "wrong host"})
             return False
-        if self.path == "/healthz":  # for the container's health check; reveals nothing
+        if path == "/healthz":  # for the container's health check; reveals nothing
             self.send(200, {"ok": True})
             return False
-        if self.command == "POST" and self.path == "/api/push-info":  # bearer token, no cookie, no Origin
+        if self.command == "POST" and path == "/api/push-info":  # bearer token, no cookie, no Origin
             return True
-        if self.path.startswith("/api/") and not self.signed_in():
+        if path.startswith("/api/") and not self.signed_in():
             self.send(403, {"error": "not signed in: open the dashboard link with ?t=TOKEN"})
             return False
         if self.command == "POST":  # SameSite already blocks cross-site cookies; belt and braces
@@ -1762,7 +1783,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.allowed():
             return
-        url = urlparse(self.path)
+        url = self.url
         if url.path in ("/", "/index.html"):
             if "t" in parse_qs(url.query):  # sign in, then drop the token from the address bar
                 given = parse_qs(url.query)["t"][0]
@@ -1866,7 +1887,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.allowed():
             return
-        path = urlparse(self.path).path
+        path = self.url.path
         if path == "/api/push-info":
             return self.push_info()
         if path == "/logout":
