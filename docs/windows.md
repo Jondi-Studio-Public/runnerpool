@@ -28,7 +28,7 @@ bash; Git Bash is enough, no WSL):
 ```
 
 Install it on the first PC (below). Also set the repo variable `RUNNERPOOL_SELF_HOSTED=true` (README,
-Configuration reference), or the Actions-based commands are skipped. After that a `linux-ci` runner exists, and you
+Configuration reference), or the Actions-based commands are skipped. After that, if you answered Y to the installer's WSL prompt (and WSL is installed), a `linux-ci` runner exists, and you
 can rebuild in seconds in Actions whenever `win/` or the `CI_APP_ID` / `CI_APP_PRIVATE_KEY` (or `RUNNER_PAT`)
 secrets change:
 

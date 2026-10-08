@@ -122,3 +122,48 @@ def test_limit_rejects_bad_input(tmp_path):
         r = run(env, "limit", *args)
         assert r.returncode != 0, args
     assert not (home / "conf").exists() or not list((home / "conf").iterdir())
+
+
+GH_STUB = r"""#!/bin/bash
+# stub gh: one workflow run (id 123) whose jobs come from $STUB_JOBS, filtered by the caller's --jq
+case "$1 $2" in
+  "run list") echo 123 ;;
+  "run view")
+    expr=""
+    while [ $# -gt 0 ]; do [ "$1" = --jq ] && expr=$2; shift; done
+    [ -n "$expr" ] && printf '%s' "$STUB_JOBS" | jq -r "$expr" ;;
+  "secret list") echo RUNNER_PAT ;;
+esac
+exit 0
+"""
+
+
+def run_runner(tmp_path, jobs, *args):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "gh").write_text(GH_STUB)
+    (bindir / "gh").chmod(0o755)
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "GITRUNNER_ORG": "o", "STUB_JOBS": json.dumps(jobs)}
+    return subprocess.run(
+        ["bash", str(ROOT / "runner"), *args], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL
+    )
+
+
+def test_a_skipped_job_is_an_error_not_a_success(tmp_path):
+    skipped = {"jobs": [{"status": "completed", "conclusion": "skipped"}]}
+    for args in (("publish-win",), ("status", "air-1")):
+        d = tmp_path / args[0]
+        d.mkdir()
+        r = run_runner(d, skipped, *args)
+        assert r.returncode == 1 and "skipped" in r.stderr + r.stdout, (args, r.stderr)
+        assert "RUNNERPOOL_SELF_HOSTED" in r.stderr
+
+
+def test_success_and_no_jobs_are_not_reported_as_skipped(tmp_path):
+    ok = {"jobs": [{"status": "completed", "conclusion": "success"}]}
+    (tmp_path / "a").mkdir()
+    r = run_runner(tmp_path / "a", ok, "status", "air-1")
+    assert r.returncode == 0 and "skipped" not in r.stderr, r.stderr
+    (tmp_path / "b").mkdir()
+    r = run_runner(tmp_path / "b", {"jobs": []}, "publish-win")
+    assert r.returncode == 0 and "skipped" not in r.stderr, r.stderr

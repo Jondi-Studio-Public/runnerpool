@@ -82,9 +82,9 @@ admin() {
     if is_win "$host" || is_wsl "$host"; then die "$host did not pick the job up in ${START_WAIT}s: it is off, asleep or offline."; fi
     die "$host did not pick the job up in ${START_WAIT}s: it is off, asleep, offline or locked after a reboot (FileVault). Try: runner ssh $host"
   fi
-  die_if_skipped "$id"
   local rc=0
   gh run watch "$id" -R "$REPO" --exit-status >/dev/null 2>&1 || rc=$?
+  die_if_skipped "$id"
   step_output "$id" "$action"
   [ "$rc" = 0 ] || die "$action failed on $host (exit $rc): https://github.com/$REPO/actions/runs/$id"
 }
@@ -114,10 +114,9 @@ cmd_build() {  # build true|false: build and check a test package on a Mac runne
   gh workflow run build.yml -R "$REPO" -f "test=$test" -f "request=$req" >/dev/null
   id=$(find_run build.yml "$req")
   echo "building: https://github.com/$REPO/actions/runs/$id"
-  sleep 3
-  die_if_skipped "$id"
   local rc=0
   gh run watch "$id" -R "$REPO" --exit-status >/dev/null 2>&1 || rc=$?
+  die_if_skipped "$id"
   [ "$rc" = 0 ] || die "build failed: https://github.com/$REPO/actions/runs/$id"
   if [ "$test" = true ]; then
     step_output "$id" "Check the test package" | tail -25
@@ -218,9 +217,10 @@ cmd_build_win() {
   gh workflow run build-win.yml -R "$REPO" ${MACS_REF:+--ref "$MACS_REF"} -f "request=$req" >/dev/null
   id=$(find_run build-win.yml "$req")
   echo "building: https://github.com/$REPO/actions/runs/$id"
-  sleep 3
+  local rc=0
+  gh run watch "$id" -R "$REPO" --exit-status >/dev/null 2>&1 || rc=$?
   die_if_skipped "$id"
-  gh run watch "$id" -R "$REPO" --exit-status >/dev/null 2>&1 || die "build failed: https://github.com/$REPO/actions/runs/$id"
+  [ "$rc" = 0 ] || die "build failed: https://github.com/$REPO/actions/runs/$id"
   echo "published: $WIN_LINK"
 }
 

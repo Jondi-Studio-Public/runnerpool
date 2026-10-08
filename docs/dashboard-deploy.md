@@ -11,9 +11,11 @@ Where a setting can come from depends on how you deploy. The automated deploy (`
 `GITRUNNER_ORG` (the repo owner), `MACS_ALLOWED_HOSTS` (Actions **variable**) and the image tag to
 `docker compose` on the server. Every other setting in `compose.yaml` (`MAC_1_IP`, `MAC_2_IP`, `MACS_CI_EXTRA`,
 `MACS_CI_TOKEN_FILES`, `CI_STORE`, `WATCHDOG_TZ`, ...) is not forwarded: put it in a `.env` file next to the
-compose files on the server (`/root/macs-dashboard/.env`, which compose reads by itself), or the container gets
-the defaults (the Macs map to the placeholder `192.0.2.x` addresses, so SSH to them fails and changes fall back to
-the Admin workflow).
+compose files on the server (`/root/macs-dashboard/.env`, which compose reads by itself). Without an entry the
+container gets the defaults (for example the Macs map to the placeholder `192.0.2.x` addresses, so SSH to them
+fails and changes fall back to the Admin workflow). Do not put `MACS_ALLOWED_HOSTS` or `GITRUNNER_ORG` in that file:
+the deploy exports them in the shell and exported values override `.env`; set them as the Actions variable and the
+repo owner.
 
 Nothing here has a built-in value for your org or server: set these (shell environment for the scripts,
 `.env` next to `compose.yaml` or the repo's Actions secrets and variables for deploys).
