@@ -182,6 +182,14 @@ def test_winrunner_has_no_default_org_and_bootstrap_saves_and_checks_it():
     assert "@@GITRUNNER_ORG@@" in (ROOT / "win" / "install.template.ps1").read_text()
 
 
+def test_bootstrap_keeps_a_gitrunner_app_org_override():
+    src = (ROOT / "win" / "winrunner.ps1").read_text()
+    start = src.index("function Invoke-Bootstrap")
+    boot = src[start : src.index("\nfunction ", start + 1)]
+    assert "if ($e.GITRUNNER_ORG -and -not $env:GITRUNNER_APP_ORG) { $script:AppOrg" in boot
+    assert "if ($e.GITRUNNER_ORG) { $script:AppOrg" not in boot
+
+
 def test_no_leftover_old_names_in_the_windows_installer_and_docs():
     assert "macs doctor" not in (ROOT / "win" / "winrunner.ps1").read_text()
     win_doc = (ROOT / "docs" / "windows.md").read_text()

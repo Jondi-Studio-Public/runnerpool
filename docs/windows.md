@@ -18,11 +18,22 @@ Each PC names itself: the first becomes `win-1`, the next `win-2`. A reinstall k
 
 ## Installing
 
-Build and publish once (and again after changing `win/` or the `CI_APP_ID` / `CI_APP_PRIVATE_KEY` (or `RUNNER_PAT`) secrets):
+**First install (empty org).** `publish-win` builds in Actions on a self-hosted `linux-ci` runner
+(`build-win.yml`), and the first `linux-ci` runner is created by this very installer (its WSL step), so on an
+empty org `publish-win` would queue forever. Build the first installer on the control machine instead (plain
+bash; Git Bash is enough, no WSL):
 
 ```powershell
-.\runner.cmd publish-win     # on a self-hosted Linux runner, seconds
-.\runner.cmd build-win       # or on this PC, App key (or token) from your secret manager (op-secrets.conf), nothing on GitHub
+.\runner.cmd build-win       # App key (or token) from your secret manager (op-secrets.conf) or a hidden prompt; uploads to the private installer release
+```
+
+Install it on the first PC (below). Also set the repo variable `RUNNERPOOL_SELF_HOSTED=true` (README,
+Configuration reference), or the Actions-based commands are skipped. After that a `linux-ci` runner exists, and you
+can rebuild in seconds in Actions whenever `win/` or the `CI_APP_ID` / `CI_APP_PRIVATE_KEY` (or `RUNNER_PAT`)
+secrets change:
+
+```powershell
+.\runner.cmd publish-win     # on a self-hosted Linux runner, seconds; needs one online
 ```
 
 On each PC, signed in to GitHub, download the file from
@@ -38,8 +49,7 @@ file afterwards: it holds the GitHub App key, or the token on an older build (th
 
 ## The GitHub App
 
-The PC holds the CI GitHub App's id and private key instead of a long-lived token (README, "The CI GitHub App", has the
-whole picture and how to create the App). Windows PowerShell 5.1 runs on .NET Framework, which has no
+The PC holds the CI GitHub App's id and private key instead of a long-lived token ([dashboard-deploy.md](dashboard-deploy.md), "The CI GitHub App", lists its permissions; the README, step 2, says how to create it). Windows PowerShell 5.1 runs on .NET Framework, which has no
 `ImportFromPem`, and the installer does not guarantee Git for Windows' `openssl.exe`. So `winrunner.ps1` parses the
 PEM itself (`ConvertFrom-RsaPem`, about 40 lines: a PKCS#1 `BEGIN RSA PRIVATE KEY` as GitHub issues it, or a PKCS#8 key)
 into `RSAParameters`, and `RSA.SignData` (SHA-256, PKCS#1 v1.5) signs the JWT. No new dependency. The tests check the
