@@ -52,7 +52,7 @@ The GitHub token is a fine-grained PAT owned by example-org with:
 
 - Repository access: **All repositories**, so a new org repo shows up in the CI panel by itself.
 - Repository permissions: Actions read and write (runs panel, Admin-workflow fallback; write is
-  only used on git-runner), Administration read (repo runner lists), **Checks read** and
+  only used on runnerpool), Administration read (repo runner lists), **Checks read** and
   **Pull requests read** (CI panel), Metadata read.
 - Organization permission: Self-hosted runners read (org runner list; `MACS_ORG`, default
   example-org).
@@ -79,6 +79,7 @@ With both files non-empty the dashboard and the watchdog sign a JWT (RS256, 9 mi
 mint a token, cache it and mint a new one about 10 minutes before it expires
 (`dashboard/gh_app_token.py`, one helper for both). Without them, or when minting fails, both keep
 using `gh_token`, so the PAT stays valid until the App is proven; delete it afterwards.
+The App needs `GITRUNNER_ORG` (compose passes it on as `GH_APP_OWNER`); without an org the dashboard and watchdog log a warning and keep using `gh_token`.
 `gh_token_personal` is not affected: an org App cannot reach repos owned by a personal account.
 
 A fine-grained token belongs to one account, so it cannot see another account's private repos.

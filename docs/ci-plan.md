@@ -13,7 +13,7 @@ copying the routing code into every repo (it was first written for one repo's la
    a repo-specific label: `./runner add air-1 OWNER/REPO "self-hosted,macOS,ARM64,REPO-mac" REPO-mac`
    (or a bare ORG instead of OWNER/REPO) and the same for `air-2`. The Macs' GitHub token
    (the CI GitHub App's installation, or `RUNNER_PAT` on a device not yet switched) must cover that repo or org first.
-2. **Let the repo call this one.** If your `git-runner` copy is private, then in its Settings > Actions >
+2. **Let the repo call this one.** If your `runnerpool` copy is private, then in its Settings > Actions >
    General > Access, allow repositories in the organisation to use its workflows
    (`gh api -X PUT repos/example-org/runnerpool/actions/permissions/access -f access_level=organization`).
 3. **Give the repo a `RUNNER_STATUS_TOKEN` secret**: a fine-grained token owned by the org with

@@ -9,6 +9,7 @@
 $ErrorActionPreference = 'Stop'
 
 $Settings = [ordered]@{
+    GITRUNNER_ORG  = '@@GITRUNNER_ORG@@'
     CI_REPO        = '@@CI_REPO@@'
     CI_LABELS      = '@@CI_LABELS@@'
     ADMIN_REPO     = '@@ADMIN_REPO@@'

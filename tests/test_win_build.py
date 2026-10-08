@@ -163,3 +163,31 @@ def test_copy_to_wsl_builds_a_quoted_wslpath_copy():
         ["pwsh", "-NoProfile", "-Command", stub + fn + call], capture_output=True, text=True, check=True
     ).stdout.strip()
     assert out == f"gh-runner|install -m 755 \"$(wslpath -u '{src}')\" '/tmp/linuxrunner'"
+
+
+def test_the_org_is_baked_into_the_installer_settings(tmp_path):
+    text = build(tmp_path, RUNNER_PAT="t", GITRUNNER_ORG="my-org'x")
+    assert "GITRUNNER_ORG  = 'my-org''x'" in text and "@@" not in text
+
+
+def test_winrunner_has_no_default_org_and_bootstrap_saves_and_checks_it():
+    src = (ROOT / "win" / "winrunner.ps1").read_text()
+    assert "example-org" not in src
+    assert "GITRUNNER_ORG is not set" in src
+    start = src.index("function Invoke-Bootstrap")
+    boot = src[start : src.index("\nfunction ", start + 1)]  # the body of Invoke-Bootstrap only
+    assert "Write-Private $OrgFile" in boot
+    assert boot.index("Write-Private $OrgFile") < boot.index("Initialize-AppToken")
+    assert boot.index("Assert-AppOrg") < boot.index("Save-App")
+    assert "@@GITRUNNER_ORG@@" in (ROOT / "win" / "install.template.ps1").read_text()
+
+
+def test_no_leftover_old_names_in_the_windows_installer_and_docs():
+    assert "macs doctor" not in (ROOT / "win" / "winrunner.ps1").read_text()
+    win_doc = (ROOT / "docs" / "windows.md").read_text()
+    assert not re.search(r"`macs (ci|cores)", win_doc)
+    assert "git-runner" not in (ROOT / "docs" / "ci-plan.md").read_text()
+    assert (
+        "github.com/OWNER/REPO/security/advisories/new"
+        in (ROOT / ".github" / "ISSUE_TEMPLATE" / "config.yml").read_text()
+    )

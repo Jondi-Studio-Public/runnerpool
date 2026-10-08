@@ -14,6 +14,7 @@ services:
     environment:
       MACS_REF: main   # gh workflow run --ref main: skips the default-branch GraphQL lookup the token cannot do
       MACS_ORG: "${GITRUNNER_ORG}"
+      GH_APP_OWNER: "${GITRUNNER_ORG}"   # the org the GitHub App is installed on
       # Hostnames/IPs the dashboard is served on (Host header allowlist).
       MACS_ALLOWED_HOSTS: "${MACS_ALLOWED_HOSTS:?set MACS_ALLOWED_HOSTS, e.g. runners.example.com,192.0.2.10}"
       # Optional: repos outside the org to show in the CI panel, and the token that can read them
@@ -60,6 +61,7 @@ services:
     entrypoint: ["sh", "/app/watchdog/entrypoint.sh"]
     environment:
       WATCHDOG_ORG: "${GITRUNNER_ORG}"
+      GH_APP_OWNER: "${GITRUNNER_ORG}"
       # Thresholds and schedule: every WATCHDOG_* variable in docs/watchdog.md can be set here.
       WATCHDOG_NTFY_URL: "${WATCHDOG_NTFY_URL:-https://ntfy.sh}"
       WATCHDOG_DIGEST_HOUR: "${WATCHDOG_DIGEST_HOUR:-7}"

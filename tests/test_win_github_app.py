@@ -45,6 +45,8 @@ FUNCS = [
     "ConvertFrom-RsaPem",
     "Get-AppJwt",
     "Invoke-GhApp",
+    "Assert-AppOrg",
+    "Get-AppOrgLabel",
     "Get-AppInstallationId",
     "Update-AppToken",
     "Initialize-AppToken",
@@ -67,6 +69,7 @@ VARS = [
     "AppInstallFile",
     "AppTokenFile",
     "AppExpiryFile",
+    "OrgFile",
     "AppOrg",
     "AppRefreshMargin",
 ]
@@ -361,3 +364,21 @@ def test_set_token_switches_an_app_device_back_to_a_pat_and_restores_on_failure(
     r = b.ps("Set-NewToken 'example-org'", NEW_GITHUB_TOKEN="badpat")
     assert r.returncode != 0 and "kept the old credential" in r.stderr
     assert b.files() == before
+
+
+def test_no_org_anywhere_fails_naming_gitrunner_org_and_asks_github_nothing(box):
+    box.install_app()
+    env = {k: v for k, v in box.env.items() if k not in ("GITRUNNER_ORG", "GITRUNNER_APP_ORG")}
+    box.env = env
+    r = box.ps("Get-AppInstallationId")
+    assert r.returncode != 0 and "GITRUNNER_ORG" in r.stderr
+    assert box.calls() == []
+
+
+def test_the_org_the_installer_saved_is_used_when_the_environment_has_none(box):
+    box.install_app()
+    box.env = {k: v for k, v in box.env.items() if k not in ("GITRUNNER_ORG", "GITRUNNER_APP_ORG")}
+    (box.home / "org").write_text("example-org\n")
+    r = box.ps("Get-AppInstallationId")
+    assert r.returncode == 0, r.stderr
+    assert box.calls()[-1]["path"] == "orgs/example-org/installation"

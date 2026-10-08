@@ -7,6 +7,7 @@ import pathlib
 import urllib.error
 
 import jwt
+
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -67,6 +68,7 @@ class FakeGitHub:
 
 
 def source(gh, clock, **kw):
+    kw.setdefault("owner", "example-org")
     return G.AppTokenSource("12345", PEM, opener=gh, clock=clock, **kw)
 
 
@@ -155,6 +157,39 @@ def test_from_env_needs_both_id_and_key(tmp_path):
     )
     assert (s.app_id, s.owner, s.installation_id) == ("99", "Org", "5")
     assert s.jwt()
+
+
+def app_env(tmp_path, **extra):
+    idf, keyf = tmp_path / "id", tmp_path / "key"
+    idf.write_text("99\n")
+    keyf.write_text(PEM)
+    return {"GH_APP_ID_FILE": str(idf), "GH_APP_KEY_FILE": str(keyf), **extra}
+
+
+def test_owner_has_no_default_and_a_configured_app_without_an_org_is_an_error(tmp_path):
+    with pytest.raises(G.AppTokenError, match="GH_APP_OWNER"):
+        G.AppTokenSource.from_env(app_env(tmp_path))
+
+
+def test_provider_without_an_org_logs_and_falls_back_to_the_pat(tmp_path, capsys):
+    p = G.TokenProvider.from_env(app_env(tmp_path), pat="p")
+    assert p.source is None and p.token() == "p"
+    assert "GITRUNNER_ORG" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("var", ["GITRUNNER_ORG", "MACS_ORG", "WATCHDOG_ORG"])
+def test_owner_falls_back_to_the_org_variables(tmp_path, var):
+    assert G.AppTokenSource.from_env(app_env(tmp_path, **{var: "acme"})).owner == "acme"
+
+
+def test_gh_app_owner_wins_over_the_org_variables(tmp_path):
+    env = app_env(tmp_path, GH_APP_OWNER="a", GITRUNNER_ORG="b", MACS_ORG="c")
+    assert G.AppTokenSource.from_env(env).owner == "a"
+
+
+def test_compose_passes_the_org_to_the_dashboard_and_the_watchdog():
+    text = (pathlib.Path(__file__).resolve().parent.parent / "compose.yaml").read_text()
+    assert text.count('GH_APP_OWNER: "${GITRUNNER_ORG}"') == 2
 
 
 def test_provider_without_app_returns_the_pat():
