@@ -164,20 +164,39 @@ Estimates, not measurements (nothing has run on real Hyper-V yet):
 | VM configuration, seed disk (deleted after the first boot) | well under 0.1 GB |
 | **Expected footprint** | **about 8 GB** with room for the runners and logs to grow |
 
-What keeps it there: runner workspaces are on tmpfs (`-RamdiskMB`, the existing `linuxrunner ramdisk`); uv, pip and XDG caches
-point at `/dev/shm` for every service (a `DefaultEnvironment` drop-in), so they cost RAM, not disk; the guest has no swap file (and no
-zram); first boot ends with `apt-get clean`, removing `/var/lib/apt/lists` and `/root/.cache`, enabling `fstrim.timer` and running
-`fstrim -av`, so freed blocks return to the host. The `/dev/shm` caches count against the VM's static RAM with the RAM disks.
+What keeps it there:
+
+- **Workspaces are on tmpfs by default.** `-RamdiskMB` defaults to 2048 per runner when the RAM sizing rule below allows it (else 0, which keeps
+  the workspaces on the VHDX), using the existing `linuxrunner ramdisk`; an explicit value is validated against the same rule.
+- **Tool caches are on a capped tmpfs.** `-CacheMB` (default 1024, 0 = none) is a `tmpfs` mounted at `/mnt/cicache` by a systemd mount unit,
+  owned by the CI user `runner`. Only the CI runners' own `.env` files (not the root admin runner, and nothing global) get
+  `UV_CACHE_DIR=/mnt/cicache/uv`, `PIP_CACHE_DIR=/mnt/cicache/pip` and `UV_LINK_MODE=copy` (hard links cannot cross from the cache to the
+  workspace tmpfs); `XDG_CACHE_HOME` is not redirected. The cap counts in the RAM sizing check; a full cache makes a tool re-download, not fail.
+- **No swap or zram installed.** First boot turns swap off, deletes `/swapfile` and live fstab swap lines, and installs nothing in its place.
+- **Clean and trimmed.** First boot ends with `apt-get clean`, removing `/var/lib/apt/lists` and `/root/.cache`, enabling `fstrim.timer` and
+  running `fstrim -av`, so freed blocks return to the host. Package lists are gone afterwards: `linuxrunner install-docker` runs
+  `apt-get update` itself, and CI jobs run as a non-root user and do not install packages, so nothing else needed them.
+
 `create` needs the footprint plus 8 GB headroom (16 GB) free on the drive, refuses a `-DiskGB` larger than the free space minus
 that 8 GB headroom (a dynamic VHDX could otherwise grow until `C:` is full), and warns when less than 10 GB would be left after
-the footprint and the headroom. With about 26 GB free on `C:` the most `-DiskGB` allows is 18, so the default 16 passes (a `-DiskGB 20` would be refused until more
-is free); the guest's own disk still has to hold the image (3.5 GB) and the tools.
+the footprint and the headroom. With about 26 GB free on `C:` the most `-DiskGB` allows is 18, so the default 16 passes (a `-DiskGB 20`
+would be refused until more is free); the guest's own disk still has to hold the image (3.5 GB) and the tools.
 
-**Final step: `hyperv compact -Yes`.** A dynamic VHDX does not shrink by itself, and first boot writes the most. After the runners
-register and the seed is ejected, run `hyperv compact -Yes` once the VM is idle: it stops the VM (a guest shutdown, which ends any
-job in it, hence the same `-Yes` as `stop`), runs `Optimize-VHD -Mode Full`, and starts it again, also if the compaction fails.
-`create` prints this as its last line instead of doing it, because stopping a VM that has just started taking jobs is the riskier
-choice. Run it again whenever the VHDX has grown well past the guest's used space.
+**The 8 GB footprint and the 8 GB headroom are estimates, to be measured on the first real run** (`hyperv status` shows the VHDX's file
+size against its maximum; adjust `$HvFootprintGB` and `$HvHeadroomGB` in `winrunner.ps1` once you know). **WSL shares the drive:** its
+`ext4.vhdx` (under the user profile, on `C:`) also only grows, and `wsl --manage ... --set-sparse` or `Optimize-VHD` is how it comes back, so
+with both on one drive the headroom has to cover whichever of the two is growing, and `create` does not look at WSL's disk.
+
+**Final step: `hyperv compact -Yes`.** A dynamic VHDX does not shrink by itself, and first boot writes the most. `create` prints this as
+its last line instead of running it, because stopping a VM that has just started taking jobs is the riskier choice. `compact` on a
+running VM refuses unless all of these hold: the guest heartbeat is OK, every runner is on GitHub, the seed disk is ejected, and no job
+is running (it asks the guest over ssh when the VM has a login from `-SshKeyFile`; if the guest cannot be asked it prints a warning that a
+running job cannot be ruled out). Then, with `-Yes` (the same word as for `stop`: it ends any job in the VM), it stops the VM, checks it is
+**Off** before touching the disk, mounts the VHDX read-only, runs `Optimize-VHD -Mode Full`, and starts the VM again, also when the
+compaction fails (the restart is decided before the stop, so even a stop that times out after the VM went off brings it back). It only
+starts a VM that is Off. **A Windows restart in the middle leaves the VM off**: its auto-start does not start a VM that was stopped, so run
+`hyperv start`. A VM that is already off compacts without `-Yes` and stays off. Run it again whenever the VHDX has grown well past the
+guest's used space.
 
 ### Sizing: the CPU budget is shared
 
@@ -187,9 +206,10 @@ The VM's vCPUs come out of the same logical CPUs as the Windows jobs and the WSL
 Rule of thumb: `slots x threads + VCpu` is at most the logical CPU count minus what Windows itself needs. `create` warns when
 the sum is over the logical CPU count.
 
-RAM is **static**. The VM holds all of `-RamGB` while it runs, and inside it a RAM-disk workspace (`-RamdiskMB`, a tmpfs cap
-per runner) counts against that same memory together with the job's own use. `create` refuses `Runners x RamdiskMB` above 65% of
-`-RamGB`, so the jobs keep the rest. It also refuses a `-RamGB` that leaves Windows under 4 GB, and **warns** when the VM plus
+RAM is **static**. The VM holds all of `-RamGB` while it runs, and inside it the RAM-disk workspaces (`-RamdiskMB`, a tmpfs cap
+per runner, default 2048) and the cache tmpfs (`-CacheMB`, default 1024) count against that same memory together with the job's own
+use. `create` refuses `Runners x RamdiskMB + CacheMB` above 65% of `-RamGB`, so the jobs keep the rest (the default `-RamdiskMB`
+quietly becomes 0 when it would not fit, e.g. on a 4 GB VM). It also refuses a `-RamGB` that leaves Windows under 4 GB, and **warns** when the VM plus
 what WSL may take (the `memory=` cap in a user's `.wslconfig`, or WSL's default of half the RAM) leaves Windows under 4 GB: the
 two are separate pools that both grow, so set `memory=` in `.wslconfig` or lower `-RamGB`. `-CoresPerJob N` sets
 `linuxrunner cores N`, the per-job `CI_MAX_CORES`; per-runner limits (`runner limit hv-1 ...`) work as usual.
@@ -202,7 +222,7 @@ $wr = "$env:ProgramData\win-runners\winrunner.ps1"
 & $wr hyperv status            # state, heartbeat, address, disks, whether the runners are on GitHub; ejects the seed when ready
 & $wr hyperv stop -Yes         # guest shutdown (a job running in the VM ends); start with: hyperv start
 & $wr hyperv eject-seed        # detach and delete the seed disk now (works on a running VM)
-& $wr hyperv compact -Yes      # the final step: stop the VM, Optimize-VHD -Mode Full, start it again (a stopped VM needs no -Yes)
+& $wr hyperv compact -Yes      # the final step, once idle: stop the VM, Optimize-VHD -Mode Full, start it again (a stopped VM needs no -Yes)
 & $wr hyperv remove -ConfirmRemove hv-ci                 # removes the VM, keeps the disks
 & $wr hyperv remove -ConfirmRemove hv-ci -DeleteVhdx     # also deletes the disks the tool made, and unregisters its runners
 ```
@@ -212,7 +232,7 @@ Options (all optional except `-AdminRepo`; defaults in brackets): `-Name` [hv-ci
 drive path; used by `create`, and by `remove` only once the VM is gone], `-Runners` [2], `-Tags` [the runners' labels,
 comma-separated; default and must include `linux-ci`], `-CiRepo` [the org], `-Image` [a local `.img`, `.vhd` or
 `.vhdx`; default: Ubuntu's 24.04 cloud image, downloaded and checked against Ubuntu's published SHA-256], `-Switch`
-[Default Switch], `-RamdiskMB`, `-CoresPerJob`, `-SshKeyFile` [a public key for the image's `ubuntu` user; without it the VM
+[Default Switch], `-RamdiskMB` [2048 when it fits, else 0], `-CacheMB` [1024; 0 = no cache disk], `-CoresPerJob`, `-SshKeyFile` [a public key for the image's `ubuntu` user; without it the VM
 has no login, only the runner tooling and the Hyper-V console], `-WaitMin` [30; how long `create` waits for the guest and its
 runners, 0 = do not wait; `status -WaitMin N` waits too], `-IgnorePowerWatch`, `-KeepImage` [keep the downloaded cloud image in the cache; a `-Image` you pass is never deleted].
 

@@ -1590,7 +1590,7 @@ $HvWarnFreeGB = 10    # warn when less than this is left after footprint and hea
 $HvOptions = @{
     '-Name' = 'v'; '-VCpu' = 'v'; '-RamGB' = 'v'; '-DiskGB' = 'v'; '-VhdxDir' = 'v'; '-Runners' = 'v'; '-Tags' = 'v'
     '-AdminRepo' = 'v'; '-CiRepo' = 'v'; '-Image' = 'v'; '-Switch' = 'v'; '-RamdiskMB' = 'v'; '-CoresPerJob' = 'v'
-    '-SshKeyFile' = 'v'; '-ConfirmRemove' = 'v'; '-WaitMin' = 'v'
+    '-SshKeyFile' = 'v'; '-ConfirmRemove' = 'v'; '-WaitMin' = 'v'; '-CacheMB' = 'v'
     '-Yes' = 's'; '-DeleteVhdx' = 's'; '-IgnorePowerWatch' = 's'; '-KeepImage' = 's'
 }
 
@@ -1598,7 +1598,7 @@ $HvOptions = @{
 function ConvertFrom-HvArgs([string]$sub, [string[]]$words) {
     $o = @{
         Name = 'hv-ci'; VCpu = 4; RamGB = 16; DiskGB = 16; VhdxDir = $HvDefaultDir; Runners = 2; Tags = 'linux-ci'
-        AdminRepo = ''; CiRepo = $AppOrg; Image = ''; Switch = 'Default Switch'; RamdiskMB = 0; CoresPerJob = 0; WaitMin = 30
+        AdminRepo = ''; CiRepo = $AppOrg; Image = ''; Switch = 'Default Switch'; RamdiskMB = 2048; CacheMB = 1024; CoresPerJob = 0; WaitMin = 30
         SshKeyFile = ''; ConfirmRemove = ''; Yes = $false; DeleteVhdx = $false; IgnorePowerWatch = $false; KeepImage = $false
     }
     $given = @{}
@@ -1613,7 +1613,7 @@ function ConvertFrom-HvArgs([string]$sub, [string[]]$words) {
         $i++
         $o[$key] = $words[$i]
     }
-    foreach ($k in 'VCpu', 'RamGB', 'DiskGB', 'Runners', 'RamdiskMB', 'CoresPerJob', 'WaitMin') {
+    foreach ($k in 'VCpu', 'RamGB', 'DiskGB', 'Runners', 'RamdiskMB', 'CacheMB', 'CoresPerJob', 'WaitMin') {
         $n = 0
         if (-not [int]::TryParse([string]$o[$k], [ref]$n)) { Die "hyperv ${sub}: -$k is a whole number" }
         $o[$k] = $n
@@ -1621,16 +1621,19 @@ function ConvertFrom-HvArgs([string]$sub, [string[]]$words) {
     if ($o.Name -notmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,30}$') { Die 'hyperv: -Name is letters, digits and dashes (31 at most)' }
     if ($o.VCpu -lt 1 -or $o.VCpu -gt 64) { Die 'hyperv: -VCpu is 1 to 64' }
     if ($o.RamGB -lt 2 -or $o.RamGB -gt 512) { Die 'hyperv: -RamGB is 2 to 512' }
-    if ($o.DiskGB -lt 10 -or $o.DiskGB -gt 4000) { Die 'hyperv: -DiskGB is 10 to 4000' }
+    if ($o.DiskGB -lt 16 -or $o.DiskGB -gt 4000) { Die 'hyperv: -DiskGB is 16 to 4000' }
     if ($o.Runners -lt 1 -or $o.Runners -gt 16) { Die 'hyperv: -Runners is 1 to 16' }
     if ($o.WaitMin -lt 0 -or $o.WaitMin -gt 240) { Die 'hyperv: -WaitMin is 0 (do not wait) to 240' }
     if ($o.CoresPerJob -lt 0 -or $o.CoresPerJob -gt $o.VCpu) { Die 'hyperv: -CoresPerJob is 0 (no limit) to -VCpu' }
-    if ($o.RamdiskMB -ne 0) {
-        if ($o.RamdiskMB -lt 256) { Die 'hyperv: -RamdiskMB is 0 (off) or at least 256' }
-        # static memory: the RAM disks and the jobs share it, so the disks may take about two thirds at most
-        if ($o.Runners * $o.RamdiskMB -gt [math]::Floor($o.RamGB * 1024 * 0.65)) {
-            Die "hyperv: -Runners x -RamdiskMB ($($o.Runners * $o.RamdiskMB) MB) is over 65% of the VM's $($o.RamGB) GB: the jobs need the rest"
-        }
+    if ($o.CacheMB -ne 0 -and ($o.CacheMB -lt 256 -or $o.CacheMB -gt 65536)) { Die 'hyperv: -CacheMB is 0 (no cache disk) or 256 to 65536' }
+    # static memory: the RAM disks, the cache disk and the jobs share it, so the tmpfs caps may take about two thirds at most
+    $cap = [math]::Floor($o.RamGB * 1024 * 0.65)
+    if (-not $given.RamdiskMB) {
+        # the default is 2048 MB per runner when that fits, else the workspaces stay on disk (-RamdiskMB 0 is also that)
+        if ($o.Runners * 2048 + $o.CacheMB -gt $cap) { $o.RamdiskMB = 0 }
+    } elseif ($o.RamdiskMB -ne 0 -and $o.RamdiskMB -lt 256) { Die 'hyperv: -RamdiskMB is 0 (off) or at least 256' }
+    if ($o.Runners * $o.RamdiskMB + $o.CacheMB -gt $cap) {
+        Die "hyperv: -Runners x -RamdiskMB plus -CacheMB ($($o.Runners * $o.RamdiskMB + $o.CacheMB) MB) is over 65% of the VM's $($o.RamGB) GB: the jobs need the rest"
     }
     if ($o.Tags -notmatch '^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$') { Die 'hyperv: -Tags is a comma-separated list of runner label names' }
     if ($o.Tags -split ',' -notcontains 'linux-ci') { Die 'hyperv: -Tags must include linux-ci' }
@@ -1733,7 +1736,7 @@ function New-HvFirstBoot($o, [string]$hostName, [string]$prefix, [string[]]$ciNa
     $l.Add('cd /root/hv-seed')
     $l.Add('export DEBIAN_FRONTEND=noninteractive')
     $l.Add('needs_reboot=0')
-    $l.Add('swapoff -a 2>/dev/null || true; sed -i "/\sswap\s/d" /etc/fstab; rm -f /swapfile /swap.img   # no swap file: it would sit on the VHDX')
+    $l.Add('swapoff -a 2>/dev/null || true; sed -i "/^[^#]*\sswap\s/d" /etc/fstab; rm -f /swapfile /swap.img   # no swap file: it would sit on the VHDX')
     # Hyper-V's shutdown, heartbeat and address services are the kernel module hv_utils (plus the hv_*_daemon tools). The
     # generic cloud kernel normally has it; if not, try the extra modules, then the Azure kernel (which has it built for Hyper-V).
     $l.Add('apt-get install -y -qq linux-cloud-tools-virtual >/dev/null 2>&1 || echo "note: linux-cloud-tools-virtual not installed"')
@@ -1747,16 +1750,23 @@ function New-HvFirstBoot($o, [string]$hostName, [string]$prefix, [string[]]$ciNa
     $l.Add('printf "hv_vmbus\nhv_utils\nhv_netvsc\nhv_storvsc\n" > /etc/modules-load.d/hyperv.conf')
     $l.Add('modprobe hv_utils >/dev/null 2>&1 || true')
     $l.Add('bash ./linux-provision.sh')
-    # tool caches (uv, pip, anything using XDG) go to tmpfs for every service, so jobs leave nothing on the VHDX
-    $l.Add('mkdir -p /etc/systemd/system.conf.d')
-    $l.Add("printf '[Manager]\nDefaultEnvironment=UV_CACHE_DIR=/dev/shm/uv-cache PIP_CACHE_DIR=/dev/shm/pip-cache XDG_CACHE_HOME=/dev/shm/xdg-cache\n' > /etc/systemd/system.conf.d/hv-caches.conf")
-    $l.Add('systemctl daemon-reexec')
     $l.Add('install -m 755 ./linuxrunner /tmp/linuxrunner')
     $l.Add("bash /tmp/linuxrunner bootstrap $hostName")
     $l.Add('rm -f /tmp/linuxrunner')
     $l.Add('LR=/opt/git-runner/linuxrunner')
+    if ($o.CacheMB -gt 0) {
+        # A capped tmpfs for tool caches, owned by the CI user, mounted by a unit. Only the CI runners' own .env points at it
+        # (below): no global environment, and XDG_CACHE_HOME is left alone.
+        $l.Add('id runner >/dev/null 2>&1 || useradd -m -s /bin/bash runner')
+        $l.Add("printf '[Unit]\nDescription=Tool caches in RAM\n[Mount]\nWhat=tmpfs\nWhere=/mnt/cicache\nType=tmpfs\nOptions=size=$($o.CacheMB)M,mode=0755,uid=%s,gid=%s,nosuid,nodev\n[Install]\nWantedBy=multi-user.target\n' `"`$(id -u runner)`" `"`$(id -g runner)`" > /etc/systemd/system/mnt-cicache.mount")
+        $l.Add('systemctl daemon-reload; systemctl enable --now mnt-cicache.mount')
+    }
     $l.Add("`$LR install-admin $($o.AdminRepo) `"`$(cat admin-token)`" $hostName-admin")
     foreach ($n in $ciNames) { $l.Add("`$LR add-runner $($o.CiRepo) $n $($o.Tags) `"`$(cat ci-token)`" ci") }
+    if ($o.CacheMB -gt 0) {
+        foreach ($n in $ciNames) { $l.Add("printf 'UV_CACHE_DIR=/mnt/cicache/uv\nPIP_CACHE_DIR=/mnt/cicache/pip\nUV_LINK_MODE=copy\n' >> /opt/git-runner/runners/$n/.env") }
+        $l.Add('$LR restart   # the runners read .env when they start')
+    }
     if ($o.CoresPerJob -gt 0) { $l.Add("`$LR cores $($o.CoresPerJob)") }
     if ($o.RamdiskMB -gt 0) { $l.Add("`$LR ramdisk on $($o.RamdiskMB)") }
     # leave the VHDX as small as possible: package caches and lists out, free blocks returned to the host (fstrim.timer keeps doing it)
@@ -2081,7 +2091,8 @@ function New-HvVmHost($o) {
     }
     if (-not $o.Image -and -not $o.KeepImage) {   # the downloaded image is only needed to build the disk
         Remove-Item -LiteralPath $src, "$src.part" -Force -ErrorAction SilentlyContinue
-        Log 'deleted the downloaded cloud image (-KeepImage keeps it for the next create)'
+        if (Test-Path -LiteralPath $src) { Log "could not delete the downloaded cloud image $src (about 0.6 GB): delete it yourself" }
+        else { Log 'deleted the downloaded cloud image (-KeepImage keeps it for the next create)' }
     }
     Log "VM $n started: $($o.VCpu) vCPU, $($o.RamGB) GB (static), disk up to $($o.DiskGB) GB at $disk"
     Log "first boot installs the tools and registers $($ciNames -join ', ') and $hostName-admin (some minutes)"
@@ -2168,26 +2179,49 @@ function Remove-HvVmHost($o) {
     if (-not (Get-ChildItem -LiteralPath $t.Dir -Force)) { Remove-Item -LiteralPath $t.Dir }
 }
 
+# $true when a job is running in the guest, $false when it is idle, $null when the guest cannot be asked (no ssh.exe, no address, or
+# no key: the VM has a login only if create got -SshKeyFile).
+function Get-HvGuestBusy($vm) {
+    $ssh = Get-Command ssh.exe -ErrorAction SilentlyContinue
+    if (-not $ssh) { return $null }
+    $ip = @(Get-VMNetworkAdapter -VMName $vm.Name | ForEach-Object { $_.IPAddresses } | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' }) | Select-Object -First 1
+    if (-not $ip) { return $null }
+    & $ssh.Source -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "ubuntu@$ip" 'pgrep -f Runner.Worker >/dev/null' 2>$null
+    switch ($LASTEXITCODE) { 0 { return $true } 1 { return $false } default { return $null } }
+}
+
+# Compacting needs the VM off. A VM that is running is only stopped when it is ready (heartbeat, every runner on GitHub, seed
+# ejected), nothing is running a job, and -Yes says the shutdown is wanted. The VM is started again afterwards, also after a
+# failure, but only if it is Off. A Windows restart in the middle leaves it Off (its auto-start does not start a VM that was stopped).
 function Invoke-HvCompact($o) {
     Assert-HvReady
     $t = Resolve-HvTarget $o
     $vm = $t.Vm
+    $m = $t.Marker
     $restart = $false
     if ($vm.State -ne 'Off') {
-        # Never automatic: stopping the VM ends any job running in it, so this takes the same -Yes as `stop`.
-        if (-not $o.Yes) { Die "VM $($vm.Name) is $($vm.State): compacting needs it off, which ends any job in it: add -Yes to stop it, compact, and start it again (or run hyperv stop -Yes first)" }
-        Stop-VM -Name $vm.Name
-        $restart = $true
+        if ((Get-HvHeartbeat $vm) -notlike 'OK*') { Die "VM $($vm.Name) has no OK heartbeat: it is not ready to be stopped for compacting (hyperv status)" }
+        $missing = Get-HvMissingRunners $m
+        if ($null -eq $missing) { Die 'could not ask GitHub whether the runners are registered: try again' }
+        if ($missing) { Die "runners not on GitHub yet: $($missing -join ', '): wait for the first boot (hyperv status)" }
+        if (Get-VMHardDiskDrive -VMName $vm.Name | Where-Object { [string]$_.Path -ieq [string]$m.seed }) { Die 'the seed disk is still attached: run hyperv eject-seed first' }
+        $busy = Get-HvGuestBusy $vm
+        if ($busy) { Die 'a job is running in the VM: compact when it is idle' }
+        if ($null -eq $busy) { Log 'warning: cannot look inside the guest (no ssh login), so a running job cannot be ruled out; stopping the VM would end it' }
+        if (-not $o.Yes) { Die "VM $($vm.Name) is $($vm.State): compacting stops it, which ends any job in it: add -Yes to stop it, compact, and start it again" }
+        $restart = $true   # set first: if Stop-VM fails half way, the finally below still brings the VM back
     }
-    $vhdx = [string]$t.Marker.vhdx
+    $vhdx = [string]$m.vhdx
     try {
+        if ($restart) { Stop-VM -Name $vm.Name }
+        if ((Get-VM -Name $vm.Name).State -ne 'Off') { Die "VM $($vm.Name) did not shut down: not touching its disk" }
         $before = (Get-VHD -Path $vhdx).FileSize
         Mount-VHD -Path $vhdx -ReadOnly -NoDriveLetter
         try { Optimize-VHD -Path $vhdx -Mode Full } finally { Dismount-VHD -Path $vhdx }
         $after = (Get-VHD -Path $vhdx).FileSize
         Log "compacted ${vhdx}: $([math]::Round($before / 1GB, 1)) GB -> $([math]::Round($after / 1GB, 1)) GB"
     } finally {
-        if ($restart) { Start-VM -Name $vm.Name; Log "VM $($vm.Name) started again" }
+        if ($restart -and (Get-VM -Name $vm.Name).State -eq 'Off') { Start-VM -Name $vm.Name; Log "VM $($vm.Name) started again" }
     }
 }
 
@@ -2251,7 +2285,7 @@ winrunner: GitHub Actions runners on this Windows PC (run in an administrator Po
   power-watch                     the power loop (a scheduled task runs this)
   install-power-watch             (re)create that scheduled task
   hyperv create -Yes -AdminRepo OWNER/REPO [-Name hv-ci] [-VCpu 4] [-RamGB 16] [-DiskGB 16] [-VhdxDir D:\hyperv]
-         [-Runners 2] [-Tags linux-ci] [-CiRepo ORG] [-WaitMin 30] [-IgnorePowerWatch] [-KeepImage] [-Image FILE] [-Switch NAME] [-RamdiskMB MB] [-CoresPerJob N] [-SshKeyFile F.pub]
+         [-Runners 2] [-Tags linux-ci] [-CiRepo ORG] [-WaitMin 30] [-IgnorePowerWatch] [-KeepImage] [-Image FILE] [-Switch NAME] [-RamdiskMB MB] [-CacheMB MB] [-CoresPerJob N] [-SshKeyFile F.pub]
                                   opt-in: ONE Ubuntu 24.04 Hyper-V VM (static CPU and RAM, starts with Windows) running the Linux
                                   runners win-N-hv-M (tagged linux-ci) and the admin runner hv-N-admin; needs Hyper-V on Windows 11 Pro+
   hyperv status|start [-Name N]   the VM's state, address, disks and whether its runners are on GitHub (-WaitMin N waits) / start it

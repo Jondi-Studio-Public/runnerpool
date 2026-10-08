@@ -39,6 +39,7 @@ FUNCS = [
     "New-HvUserData",
     "Read-HvSshKey",
     "Get-HvWslMemoryGB",
+    "Get-HvGuestBusy",
     "Assert-HvSpace",
     "Test-HvPowerWatchConflict",
     "Get-HvPrefix",
@@ -114,6 +115,23 @@ def test_defaults(tmp_path):
     assert "hv-ci 4 16 16 2 linux-ci example-org" in o
 
 
+def test_default_ramdisk_and_cache_follow_the_ram(tmp_path):
+    s = (
+        "foreach ($a in @('-RamGB','16'), @('-RamGB','4'), @('-RamGB','8'), @('-RamGB','8','-Runners','3'), @('-RamGB','4','-RamdiskMB','0'), @('-CacheMB','0'), @('-RamGB','16','-RamdiskMB','1024')) {"
+        " $o = ConvertFrom-HvArgs 'create' $a; '{0}:{1}' -f $o.RamdiskMB, $o.CacheMB }"
+    )
+    # 16 GB: fits; 4 GB: 2 x 2048 + 1024 is over 65%, so off; 8 GB: fits; 8 GB x 3 runners: over, off; explicit 0 stays 0; explicit sizes are kept
+    assert out(ps(tmp_path, s)).split() == [
+        "2048:1024",
+        "0:1024",
+        "2048:1024",
+        "0:1024",
+        "0:1024",
+        "2048:0",
+        "1024:1024",
+    ]
+
+
 def test_options_are_parsed(tmp_path):
     o = out(
         ps(
@@ -133,7 +151,7 @@ def test_options_are_parsed(tmp_path):
         ("'-VCpu','x'", "whole number"),
         ("'-VCpu','0'", "-VCpu is 1 to 64"),
         ("'-RamGB','1'", "-RamGB is 2 to 512"),
-        ("'-DiskGB','5'", "-DiskGB is 10 to 4000"),
+        ("'-DiskGB','5'", "-DiskGB is 16 to 4000"),
         ("'-Name','bad name'", "-Name is letters"),
         ("'-VhdxDir','relative\\dir'", "-VhdxDir is a full local path"),
         ("'-VhdxDir','\\\\server\\share'", "-VhdxDir is a full local path"),
@@ -144,6 +162,8 @@ def test_options_are_parsed(tmp_path):
         ("'-RamdiskMB','100'", "-RamdiskMB is 0"),
         ("'-RamGB','4','-RamdiskMB','4096'", "over 65%"),
         ("'-RamdiskMB','6000'", "over 65%"),
+        ("'-CacheMB','100'", "-CacheMB is 0"),
+        ("'-RamGB','4','-CacheMB','4000'", "over 65%"),
         ("'-WaitMin','999'", "-WaitMin is 0"),
         ("'-VhdxDir','D:vm'", "-VhdxDir is a full local path"),
         ("'-VhdxDir','D:'", "-VhdxDir is a full local path"),
@@ -163,8 +183,8 @@ def test_windows_paths_are_accepted_and_trimmed(tmp_path, given, want):
 
 
 def test_ramdisk_within_65_percent_is_accepted(tmp_path):
-    o = out(ps(tmp_path, "(ConvertFrom-HvArgs 'create' @('-RamGB','16','-Runners','2','-RamdiskMB','5000')).RamdiskMB"))
-    assert o.strip() == "5000"
+    o = out(ps(tmp_path, "(ConvertFrom-HvArgs 'create' @('-RamGB','16','-Runners','2','-RamdiskMB','4500')).RamdiskMB"))
+    assert o.strip() == "4500"
 
 
 # --- the PC's other memory and power ----------------------------------------------------------------------------
@@ -344,45 +364,104 @@ def test_stop_needs_yes(tmp_path):
     assert "add -Yes" in run(tmp_path, d, "'stop'", state="Running")
 
 
-def test_compact_refuses_a_running_vm(tmp_path):
+COMPACT = """
+$global:hvstate = '%STATE%'
+function Get-VM { param($Name, $ErrorAction) [pscustomobject]@{ Name = 'hv-ci'; Notes = 'win-runners hyperv vm abc'; State = $global:hvstate } }
+function Stop-VM { param($Name)
+  Write-Host 'STOP'
+  if ('%STOP%' -eq 'fail') { throw 'stop failed' }
+  if ('%STOP%' -eq 'failoff') { $global:hvstate = 'Off'; throw 'stop timed out' }
+  if ('%STOP%' -ne 'stuck') { $global:hvstate = 'Off' } }
+function Start-VM { param($Name) Write-Host 'START'; $global:hvstate = 'Running' }
+function Get-VHD { [pscustomobject]@{ FileSize = 6GB } }
+function Mount-VHD { Write-Host 'MOUNT' }
+function Dismount-VHD { Write-Host 'DISMOUNT' }
+function Optimize-VHD { param($Path, $Mode) Write-Host "OPT $Mode"; if ('%OPT%' -eq 'fail') { throw 'optimize failed' } }
+function Get-VMIntegrationService { [pscustomobject]@{ PrimaryStatusDescription = '%HB%' } }
+function Test-OnGitHub { %ON% }
+function Get-HvGuestBusy($vm) { %BUSY% }
+"""
+
+
+def compact(
+    tmp_path,
+    args="'compact','-Yes'",
+    state="Running",
+    stop="ok",
+    opt="ok",
+    hb="OK",
+    on="$true",
+    busy="$false",
+    seed=False,
+):
     d = make_vm_dir(tmp_path)
-    assert "add -Yes to stop it" in run(tmp_path, d, "'compact'", state="Running")
-
-
-COMPACT = (
-    "function Stop-VM { param($Name) Write-Host 'STOP' }; function Start-VM { param($Name) Write-Host 'START' };"
-    "function Get-VHD { [pscustomobject]@{ FileSize = 6GB } }; function Mount-VHD { Write-Host 'MOUNT' }; function Dismount-VHD { Write-Host 'DISMOUNT' };"
-    "function Optimize-VHD { param($Path, $Mode) Write-Host \"OPT $Mode\"; if ('%FAIL%' -eq '1') { throw 'optimize failed' } };"
-)
+    c = (
+        COMPACT.replace("%STATE%", state)
+        .replace("%STOP%", stop)
+        .replace("%OPT%", opt)
+        .replace("%HB%", hb)
+        .replace("%ON%", on)
+        .replace("%BUSY%", busy)
+    )
+    o = out(ps(tmp_path, f"Run {{ {vm(d, state=state, seed=seed)} {c} Invoke-Hyperv @({args}) }}"))
+    return o, [k for k in o.splitlines() if k in ("STOP", "MOUNT", "OPT Full", "DISMOUNT", "START")]
 
 
 def test_compact_with_yes_stops_compacts_and_restarts(tmp_path):
-    d = make_vm_dir(tmp_path)
-    o = out(
-        ps(
-            tmp_path,
-            f"Run {{ {vm(d, state='Running')} {COMPACT.replace('%FAIL%', '0')} Invoke-Hyperv @('compact','-Yes') }}",
-        )
-    )
-    lines = [k for k in o.splitlines() if k in ("STOP", "MOUNT", "OPT Full", "DISMOUNT", "START")]
-    assert lines == ["STOP", "MOUNT", "OPT Full", "DISMOUNT", "START"], o
+    o, steps = compact(tmp_path)
+    assert steps == ["STOP", "MOUNT", "OPT Full", "DISMOUNT", "START"], o
+    assert "started again" in o
 
 
 def test_compact_restarts_the_vm_even_when_it_fails(tmp_path):
-    d = make_vm_dir(tmp_path)
-    o = out(
-        ps(
-            tmp_path,
-            f"Run {{ {vm(d, state='Running')} {COMPACT.replace('%FAIL%', '1')} Invoke-Hyperv @('compact','-Yes') }}",
-        )
-    )
-    assert "optimize failed" in o and o.rstrip().splitlines().count("START") == 1 and "DISMOUNT" in o
+    o, steps = compact(tmp_path, opt="fail")
+    assert "optimize failed" in o and steps == ["STOP", "MOUNT", "OPT Full", "DISMOUNT", "START"]
+
+
+def test_a_failing_stop_vm_does_not_touch_the_disk_or_start_anything(tmp_path):
+    o, steps = compact(tmp_path, stop="fail")
+    assert "stop failed" in o and steps == ["STOP"]  # still running: nothing to start, nothing mounted
+
+
+def test_a_stop_that_fails_after_the_vm_is_off_still_restarts_it(tmp_path):
+    o, steps = compact(tmp_path, stop="failoff")
+    assert "stop timed out" in o and steps == ["STOP", "START"]  # restart was decided before Stop-VM
+
+
+def test_a_vm_that_is_not_off_is_never_mounted(tmp_path):
+    o, steps = compact(tmp_path, stop="stuck")
+    assert "did not shut down" in o and steps == ["STOP"]
+
+
+@pytest.mark.parametrize(
+    "kw, msg",
+    [
+        ({"hb": "No Contact"}, "no OK heartbeat"),
+        ({"on": "$false"}, "runners not on GitHub yet"),
+        ({"on": "$null"}, "could not ask GitHub"),
+        ({"seed": True}, "seed disk is still attached"),
+        ({"busy": "$true"}, "a job is running in the VM"),
+        ({"args": "'compact'"}, "add -Yes to stop it"),
+    ],
+)
+def test_compact_refuses_a_vm_that_is_not_ready(tmp_path, kw, msg):
+    o, steps = compact(tmp_path, **kw)
+    assert msg in o and steps == []
+
+
+def test_a_busy_vm_is_refused_even_with_yes(tmp_path):
+    _, steps = compact(tmp_path, busy="$true")
+    assert steps == []
+
+
+def test_an_unreachable_guest_is_warned_about_and_needs_yes(tmp_path):
+    o, steps = compact(tmp_path, busy="$null")
+    assert "cannot look inside the guest" in o and steps[0] == "STOP"
 
 
 def test_compact_on_a_stopped_vm_needs_no_yes_and_does_not_start_it(tmp_path):
-    d = make_vm_dir(tmp_path)
-    o = out(ps(tmp_path, f"Run {{ {vm(d, state='Off')} {COMPACT.replace('%FAIL%', '0')} Invoke-Hyperv @('compact') }}"))
-    assert "OPT Full" in o and "STOP" not in o.splitlines() and "START" not in o.splitlines()
+    o, steps = compact(tmp_path, args="'compact'", state="Off")
+    assert steps == ["MOUNT", "OPT Full", "DISMOUNT"], o
 
 
 def test_eject_seed_works_on_a_running_vm(tmp_path):
@@ -494,9 +573,8 @@ def test_firstboot_removes_the_seed_files_even_on_failure_and_checks_hv_utils(tm
 def test_firstboot_leaves_a_small_disk(tmp_path):
     o = out(ps(tmp_path, CLOUD + "$fb"))
     assert "swapoff -a" in o and "rm -f /swapfile" in o  # no swap file in the guest
+    assert 'sed -i "/^[^#]*\\sswap\\s/d" /etc/fstab' in o  # only a live fstab line, not a comment
     assert o.index("swapoff -a") < o.index("bash ./linux-provision.sh")
-    assert "UV_CACHE_DIR=/dev/shm/uv-cache" in o and "PIP_CACHE_DIR=/dev/shm/pip-cache" in o and "hv-caches.conf" in o
-    assert o.index("hv-caches.conf") < o.index("add-runner")  # the runners start with the tmpfs caches
     end = o[o.index("add-runner") :]
     assert (
         end.index("apt-get clean; rm -rf /var/lib/apt/lists/*")
@@ -505,6 +583,50 @@ def test_firstboot_leaves_a_small_disk(tmp_path):
     )
     assert "systemctl enable --now fstrim.timer" in o
     assert o.index("rm -rf /root/hv-seed", o.index("add-runner")) < o.index("fstrim -av")
+
+
+def test_tool_caches_live_on_a_capped_tmpfs_for_the_ci_runners_only(tmp_path):
+    o = out(ps(tmp_path, CLOUD + "$fb"))
+    assert "DefaultEnvironment" not in o and "system.conf.d" not in o and "daemon-reexec" not in o  # nothing global
+    assert "XDG_CACHE_HOME" not in o
+    mount = next(k for k in o.splitlines() if "mnt-cicache.mount" in k and "printf" in k)
+    assert (
+        "What=tmpfs" in mount
+        and "Where=/mnt/cicache" in mount
+        and "size=1024M" in mount
+        and "uid=%s" in mount
+        and "id -u runner" in mount
+    )
+    envs = [k for k in o.splitlines() if "/.env" in k]
+    assert len(envs) == 2 and all(
+        "UV_CACHE_DIR=/mnt/cicache/uv" in k and "PIP_CACHE_DIR=/mnt/cicache/pip" in k and "UV_LINK_MODE=copy" in k
+        for k in envs
+    )
+    assert (
+        "runners/win-1-hv-1/.env" in envs[0] and "runners/win-1-hv-2/.env" in envs[1] and "admin" not in "".join(envs)
+    )
+    assert o.index("enable --now mnt-cicache.mount") < o.index("add-runner") < o.index("/.env") < o.index("$LR restart")
+
+
+def test_no_cache_disk_when_cachemb_is_zero(tmp_path):
+    o = out(
+        ps(
+            tmp_path,
+            "$o = ConvertFrom-HvArgs 'create' @('-CacheMB','0'); New-HvFirstBoot $o 'hv-1' 'win-1' @('win-1-hv-1')",
+        )
+    )
+    assert "mnt-cicache" not in o and "UV_CACHE_DIR" not in o
+
+
+def test_the_generated_first_boot_script_is_valid_bash(tmp_path):
+    f = tmp_path / "firstboot.sh"
+    f.write_text(out(ps(tmp_path, CLOUD + "$fb")))
+    assert subprocess.run(["bash", "-n", str(f)], capture_output=True, text=True).returncode == 0
+    sc = shutil.which("shellcheck")
+    if sc is None:
+        pytest.skip("shellcheck not installed")
+    r = subprocess.run([sc, "-S", "warning", str(f)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout
 
 
 def test_user_data_is_cloud_config_with_lf_files(tmp_path):
@@ -616,7 +738,7 @@ function Remove-VM { param($Name, [switch]$Force) Write-Output "REMOVEVM $Name";
 """
 
 
-def create(tmp_path, args="", sys="C:", conflict="$false", free=500, badimg="0", fail=""):
+def create(tmp_path, args="", sys="C:", conflict="$false", free=500, badimg="0", fail="", extra=""):
     base = tmp_path / "vmdir"
     base.mkdir(exist_ok=True)
     target = base / "hv-ci"
@@ -632,7 +754,9 @@ def create(tmp_path, args="", sys="C:", conflict="$false", free=500, badimg="0",
     )
     r = ps(
         tmp_path,
-        pre + f"Run {{ Invoke-Hyperv @('create','-Yes','-AdminRepo','example-org/runnerpool','-WaitMin','0'{args}) }}",
+        pre
+        + extra
+        + f"Run {{ Invoke-Hyperv @('create','-Yes','-AdminRepo','example-org/runnerpool','-WaitMin','0'{args}) }}",
     )
     return out(r), base, target
 
@@ -723,6 +847,11 @@ def test_space_verdicts(tmp_path, free, disk, refused, warned):
 def test_create_deletes_the_downloaded_image_unless_kept_or_supplied(tmp_path):
     o, _, _ = create(tmp_path)
     assert "deleted the downloaded cloud image" in o and not (tmp_path / "dl.img").exists()
+
+
+def test_it_does_not_claim_a_deletion_that_did_not_happen(tmp_path):
+    o, _, _ = create(tmp_path, extra="function Remove-Item { };")  # the delete silently does nothing
+    assert "could not delete the downloaded cloud image" in o and "deleted the downloaded cloud image" not in o
 
 
 def test_keep_image_keeps_it(tmp_path):
