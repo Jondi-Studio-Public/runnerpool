@@ -143,7 +143,7 @@ distro. It is off by default and is never part of the installer. The VM runs Ubu
 | Memory | Shared with Windows, grows and shrinks | **Static**: the VM's RAM is taken from Windows for as long as it runs |
 | CPUs | All logical CPUs, pinned per job slot | A fixed vCPU count |
 | Disk | One `ext4.vhdx` under the user profile | A VHDX on any drive you choose (`-VhdxDir`) |
-| Starts | A boot task that runs `wsl.exe` | Hyper-V's own auto-start, before anyone logs in |
+| Starts | A boot task that runs `wsl.exe` | Hyper-V's own auto-start (60 s after boot), before anyone logs in |
 | Follows the PC's battery, `ci off`, `cores`, `slots` | Yes (the follower service) | **No**: the VM is a separate machine; use `runner ci hv-N off` |
 | Needs | WSL | Windows 11 **Pro, Enterprise or Education** (not Home), the Hyper-V feature, an elevated PowerShell |
 
@@ -156,70 +156,97 @@ integration. WSL and the VM can **coexist**; the model below keeps them out of e
 The VM's vCPUs come out of the same logical CPUs as the Windows jobs and the WSL distro. The PC's job slots do not cover the VM
 (it cannot see the slot folder), so split the budget yourself. On a 24-thread PC that keeps 4 for Windows:
 `runner slots win-1 2 8` (two jobs of 8 threads: WSL and native Windows) plus `-VCpu 4`, or `-VCpu 12` and `slots win-1 1 8`.
-Rule of thumb: `slots x threads + VCpu` is at most the logical CPU count minus what Windows itself needs.
+Rule of thumb: `slots x threads + VCpu` is at most the logical CPU count minus what Windows itself needs. `create` warns when
+the sum is over the logical CPU count.
 
 RAM is **static**. The VM holds all of `-RamGB` while it runs, and inside it a RAM-disk workspace (`-RamdiskMB`, a tmpfs cap
-per runner) counts against that same memory together with the job's own use. Keep `Runners x RamdiskMB` plus the memory a job
-needs per runner under `-RamGB` (`linuxrunner ramdisk` warns when the caps add up to more than the VM's RAM). `-CoresPerJob N`
-sets `linuxrunner cores N`, the per-job `CI_MAX_CORES`; per-runner limits (`runner limit hv-1 ...`) work as usual.
-`create` refuses a `-RamGB` that leaves Windows under 4 GB.
+per runner) counts against that same memory together with the job's own use. `create` refuses `Runners x RamdiskMB` above 65% of
+`-RamGB`, so the jobs keep the rest. It also refuses a `-RamGB` that leaves Windows under 4 GB, and **warns** when the VM plus
+what WSL may take (the `memory=` cap in a user's `.wslconfig`, or WSL's default of half the RAM) leaves Windows under 4 GB: the
+two are separate pools that both grow, so set `memory=` in `.wslconfig` or lower `-RamGB`. `-CoresPerJob N` sets
+`linuxrunner cores N`, the per-job `CI_MAX_CORES`; per-runner limits (`runner limit hv-1 ...`) work as usual.
 
 ### Commands (elevated PowerShell on the PC)
 
 ```powershell
 $wr = "$env:ProgramData\win-runners\winrunner.ps1"
 & $wr hyperv create -Yes -AdminRepo example-org/runnerpool -VCpu 8 -RamGB 24 -DiskGB 200 -VhdxDir D:\hyperv -Runners 2 -RamdiskMB 4096
-& $wr hyperv status            # state, heartbeat, address, disk size, runner names
+& $wr hyperv status            # state, heartbeat, address, disks, whether the runners are on GitHub; ejects the seed when ready
 & $wr hyperv stop -Yes         # guest shutdown (a job running in the VM ends); start with: hyperv start
-& $wr hyperv eject-seed        # VM off: detach and delete the seed disk once the runners have registered
+& $wr hyperv eject-seed        # detach and delete the seed disk now (works on a running VM)
 & $wr hyperv compact           # VM off: Optimize-VHD -Mode Full (run `sudo fstrim -av` in the VM first)
 & $wr hyperv remove -ConfirmRemove hv-ci                 # removes the VM, keeps the disks
-& $wr hyperv remove -ConfirmRemove hv-ci -DeleteVhdx     # also deletes the disks the tool made, and unregisters offline runners
+& $wr hyperv remove -ConfirmRemove hv-ci -DeleteVhdx     # also deletes the disks the tool made, and unregisters its runners
 ```
 
 Options (all optional except `-AdminRepo`; defaults in brackets): `-Name` [hv-ci, the Hyper-V VM name], `-VCpu` [4],
 `-RamGB` [16], `-DiskGB` [100, a dynamic VHDX that grows up to this], `-VhdxDir` [`%ProgramData%\win-runners\hyperv`; a local
-drive path], `-Runners` [2], `-Tags` [the runners' labels, comma-separated; default and must include `linux-ci`], `-CiRepo` [the org], `-Image` [a local `.img`, `.vhd` or
+drive path; used by `create`, and by `remove` only once the VM is gone], `-Runners` [2], `-Tags` [the runners' labels,
+comma-separated; default and must include `linux-ci`], `-CiRepo` [the org], `-Image` [a local `.img`, `.vhd` or
 `.vhdx`; default: Ubuntu's 24.04 cloud image, downloaded and checked against Ubuntu's published SHA-256], `-Switch`
 [Default Switch], `-RamdiskMB`, `-CoresPerJob`, `-SshKeyFile` [a public key for the image's `ubuntu` user; without it the VM
-has no login, only the runner tooling and the Hyper-V console].
+has no login, only the runner tooling and the Hyper-V console], `-WaitMin` [30; how long `create` waits for the guest and its
+runners, 0 = do not wait; `status -WaitMin N` waits too], `-IgnorePowerWatch`, `-AllowSystemDrive`.
+
+Every command after `create` finds the VM by its Hyper-V notes (which carry the marker's id) and the VM's folder from the VM's own
+`disk.vhdx`, so it works wherever `-VhdxDir` put the disks. `-Name` picks one by name; without it the only VM made by this tool is used.
 
 ### What `create` does
 
 1. Checks it is elevated, the Hyper-V feature and `vmms` are on, the VM name and folder are free, no other VM of this tool
-   exists (one per PC), the switch exists, RAM and vCPUs fit, and the drive has at least 30 GB free.
-2. Writes `hyperv-vm.json` (the **marker**) in `VhdxDir\NAME`, then builds `disk.vhdx` from the cloud image (a `.img` needs
-   `qemu-img` on `PATH`; a `.vhd`/`.vhdx` goes through `Convert-VHD`) and `seed.vhdx`, a 64 MB FAT32 disk labelled `CIDATA`
-   that holds cloud-init's `user-data` and `meta-data` (the NoCloud datasource). `user-data` carries `linuxrunner`,
+   exists (one per PC), the switch exists, vCPUs and RAM fit, and the drive has `-DiskGB` plus 20 GB free. It **refuses the
+   system drive** unless `-AllowSystemDrive` (a growing VHDX can fill it), and **refuses a PC that has a battery while the power
+   watch is installed** unless `-IgnorePowerWatch`: the power watch pauses CI on battery for the Windows and WSL runners but
+   cannot pause the VM.
+2. Checks the SSH key, downloads and verifies the image (to a `.part` file, renamed only when the checksum matches; TLS 1.2 is
+   forced for Windows PowerShell 5.1) and looks for `qemu-img`, all **before** any registration token is minted.
+3. Creates `VhdxDir\NAME`, **restricts it to SYSTEM and Administrators with `icacls` before anything is written**, writes
+   `hyperv-vm.json` (the **marker**), then builds `disk.vhdx` from the image (a `.img` needs `qemu-img` on `PATH`; a
+   `.vhd`/`.vhdx` goes through `Convert-VHD`) and `seed.vhdx`: a 128 MB FAT32 disk named `CIDATA` (cloud-init's NoCloud
+   datasource) mounted on a folder, not a drive letter, while it is written. It holds `user-data`, `meta-data`, `linuxrunner`,
    `linux-provision.sh`, a first-boot script and two **one-hour registration tokens**.
-3. Creates a Generation 2 VM: static memory, `AutomaticStartAction Start`, `AutomaticStopAction ShutDown`, checkpoints off,
-   Secure Boot on with the `MicrosoftUEFICertificateAuthority` template, the seed disk as a second drive. It starts.
-4. On first boot the VM runs `linux-provision.sh`, **then** `linuxrunner bootstrap`, `install-admin`, `add-runner` for each
-   runner and the optional `cores` and `ramdisk` settings. If provisioning fails nothing is registered; read
-   `/var/log/hv-firstboot.log` in the VM console (Hyper-V Manager) and `remove -DeleteVhdx`, then `create` again. Tokens expire
-   after an hour, so a VM that cannot boot within the hour needs a fresh `create`.
+4. Creates a Generation 2 VM: static memory, `AutomaticStartAction StartIfRunning` with a 60 s `AutomaticStartDelay` (so
+   Windows and the network are up first; a VM you stopped stays stopped), `AutomaticStopAction ShutDown`, checkpoints off, Secure
+   Boot on with the `MicrosoftUEFICertificateAuthority` template, and the seed disk as a second (SCSI) drive. It starts.
+5. **If any step fails, `create` rolls back**: it stops and removes the VM if it made it, deletes only the files it made (the marker's
+   disks, the marker, the `vm` and seed-mount folders) and the folder if nothing else is in it. The downloaded image stays cached.
+6. On first boot the VM runs `linux-provision.sh`, **then** `linuxrunner bootstrap`, `install-admin`, `add-runner` for each
+   runner and the optional `cores` and `ramdisk` settings. A trap deletes `/root/hv-seed` (tokens and scripts) whether this
+   worked or not. If provisioning fails nothing is registered; read `/var/log/hv-firstboot.log` in the VM console (Hyper-V
+   Manager), `remove -DeleteVhdx`, and `create` again. Tokens expire after an hour, so a VM that cannot boot within the hour needs a
+   fresh `create`.
+7. `create` then waits (up to `-WaitMin`) for the guest heartbeat and for every runner to show on GitHub, and **ejects the seed disk**
+   (a SCSI hot-remove, deleting the file). If it times out, `hyperv status` does the same check and the same eject once it passes.
 
-Run `eject-seed` once `runner status hv-N` answers: it removes the seed disk with the tokens (cloud-init keeps its own copy
-under `/var/lib/cloud`, root-only, and the tokens are dead after an hour).
+**Hyper-V guest services (`hv_utils`).** Clean shutdown, the heartbeat and the address in `status` need the kernel module `hv_utils`.
+The first-boot script installs `linux-cloud-tools-virtual`, and if `modinfo hv_utils` still finds nothing it tries
+`linux-modules-extra-$(uname -r)` and then `linux-azure` (a kernel built for Hyper-V; it reboots the VM once after the runners are
+registered). It also writes `/etc/modules-load.d/hyperv.conf`. If none of it works the script logs a warning, and without `hv_utils`
+`AutomaticStopAction ShutDown` cannot shut the guest down cleanly. Check `hyperv status` shows a heartbeat.
 
 ### What the refusals protect
 
 - `create` needs `-Yes`; `stop` needs `-Yes`; `remove` needs the VM's name typed again as `-ConfirmRemove`, and `-DeleteVhdx` to
   touch any disk. Without `-DeleteVhdx` the VHDXs are always kept.
-- Every command refuses when not elevated, when the Hyper-V module or feature is missing, and (start, stop, compact, remove)
-  when the VM's notes do not carry the marker's id, so a VM you made by hand is never touched.
+- Every command refuses when not elevated, or when the Hyper-V module or feature is missing, and (start, stop, compact, eject-seed,
+  remove, status) acts only on a VM whose notes carry the id of the `hyperv-vm.json` beside its own `disk.vhdx`, so a VM you made
+  by hand is never touched.
 - `remove -DeleteVhdx` deletes only the files the marker names, and only if each is a `.vhdx` directly inside the VM's folder
   with the marker's tool, kind and name matching. A folder without a marker, or with someone else's, is refused, and other files
-  in the folder are left alone. `create` never reuses or overwrites an existing folder.
+  in the folder are left alone. It then unregisters the tool's runners from GitHub, waiting up to a minute for each to show
+  offline (a running guest keeps its runners online). `create` never reuses or overwrites an existing folder.
+- Name lookups on GitHub read every page of the runner list, and a listing it cannot read in full counts as unknown, not free.
 - Nothing runs `wsl --shutdown`, touches `.wslconfig`, or changes the Windows runners.
 
 ### Not verified on real hardware
 
-This was written and unit-tested without a Hyper-V host (the tests cover argument parsing, the cloud-init text, and every
-refusal, with stand-in cmdlets). Check on the first `create`: that cloud-init finds the FAT32 `CIDATA` seed disk; that the
-Ubuntu cloud image boots under Secure Boot with that template; that `linux-cloud-tools-virtual` gives a heartbeat and an
-address in `hyperv status`; that `Stop-VM` shuts the guest down cleanly (the Hyper-V shutdown service); and that the Default
-Switch gives the VM internet access. The VM is not paused on battery and ignores `runner cores`/`slots` for the PC.
+This was written and unit-tested without a Hyper-V host (the tests cover argument parsing, the cloud-init text, the order of
+checks, the rollback and every refusal, with stand-in cmdlets). Check on the first `create`: that cloud-init finds the FAT32
+`CIDATA` seed disk; that the Ubuntu cloud image boots under Secure Boot with that template; that `hv_utils` is present (or the
+fallbacks install it) so `hyperv status` shows a heartbeat and an address; that `Stop-VM` shuts the guest down cleanly; that the
+Default Switch gives the VM internet access; that the seed disk mounts on a folder and hot-removes from the running VM; and that
+`icacls` leaves the folder usable for Hyper-V (the VM worker process reads the VHDXs through the VM's own ACL entry).
+The VM is not paused on battery and ignores `runner cores`/`slots` for the PC.
 
 ## Job slots: the PC's CPU cap
 
