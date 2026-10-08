@@ -64,7 +64,8 @@ folder (`.runner`'s `workFolder`, normally `_work`), so checkouts and test temp 
 
 Not covered: `reregister`/`remove` (the adopted runners keep their registration), `rotate-token`
 (no token or App key is stored), `battery`, `postgres`, `tailscale`, `ssh`. The dashboard still only lists the PC's
-runners; per-host controls for `wsl-N` are a follow-up.
+runners; per-host controls for `wsl-N` are a follow-up. `push-setup URL TOKENFILE` makes the box report its info to the dashboard every 30 s
+(see "Linux and WSL boxes" in [dashboard-deploy.md](dashboard-deploy.md)).
 
 WSL rules: never `wsl --shutdown` (it stops every runner) and never change `.wslconfig`.
 

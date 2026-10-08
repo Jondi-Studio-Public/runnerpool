@@ -18,7 +18,7 @@ RUN mkdir /data /ci && chown macs:macs /data /ci
 # PyJWT (with cryptography) signs the GitHub App's JWT; see dashboard/gh_app_token.py.
 COPY dashboard/requirements.txt ./dashboard/requirements.txt
 RUN pip install --no-cache-dir -r dashboard/requirements.txt
-COPY macs ./runner
+COPY runner ./runner
 COPY mac/gitrunner ./mac/gitrunner
 COPY dashboard ./dashboard
 COPY watchdog ./watchdog

@@ -103,9 +103,10 @@ class AppTokenSource:
         # expires_at is an ISO time; the lifetime is an hour, so trust that over parsing it.
         self._token, self._expires = token, self._now() + 3600
 
-    def token(self):
+    def token(self, min_ttl=0):
+        """The cached token, minted afresh when it has less than REFRESH_BEFORE (or min_ttl) s left."""
         with self._lock:
-            if not self._token or self._now() >= self._expires - REFRESH_BEFORE:
+            if not self._token or self._now() >= self._expires - max(REFRESH_BEFORE, min_ttl):
                 try:
                     self._mint()
                 except AppTokenError:
@@ -150,10 +151,10 @@ class TokenProvider:
     def configured(self):
         return bool(self.pat or self.source)
 
-    def token(self):
+    def token(self, min_ttl=0):
         if self.source:
             try:
-                tok = self.source.token()
+                tok = self.source.token(min_ttl)
                 self._warned = False
                 return tok
             except AppTokenError as e:
