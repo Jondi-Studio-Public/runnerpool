@@ -80,6 +80,8 @@ os.makedirs(SSH_SOCKETS, mode=0o700, exist_ok=True)
 INFO_EVERY = 10
 INFO_BACKOFF = 45
 RUNNERS_EVERY = 10
+# After the loop idled, an answer younger than this is served as is while a refresh runs behind it.
+RUNNERS_STALE_OK = 3600
 # While every device is reporting its own runner state (Mac info over SSH, PC and WSL pushes), the runner list
 # is read from GitHub this often instead, and the device-reported `busy` is shown in place of GitHub's.
 RUNNERS_EVERY_DIRECT = 60
@@ -1165,8 +1167,15 @@ class State:
     def get_runners(self, force=False):
         ttl = self.runners_ttl()  # not under the lock: direct_covers takes it
         with self.lock:
-            if not force and self.runners and time.time() - self.runners_at < ttl:
-                return self.runners
+            if not force and self.runners:
+                age = time.time() - self.runners_at
+                if age < ttl:
+                    return self.runners
+                if IDLE_AFTER <= age < RUNNERS_STALE_OK:
+                    # The loop idled: serve the last answer now and let it refresh behind us (woken here), so
+                    # opening the page after a quiet spell does not wait on GitHub. The page re-polls in 5 s.
+                    self.wake.set()
+                    return self.runners
 
         def one(repo):
             path = f"repos/{repo}" if "/" in repo else f"orgs/{repo}"
@@ -1193,7 +1202,8 @@ class State:
             }
 
         scopes = ([ORG] if ORG else []) + REPOS
-        with ThreadPoolExecutor(len(scopes)) as pool:
+        with ThreadPoolExecutor(len(scopes) + 1) as pool:
+            sha = pool.submit(macrunner_sha)  # its own gh call, cached 5 min: overlap it, don't add it on
             repos = list(pool.map(one, scopes))
         macs_found = sorted(
             {
@@ -1205,7 +1215,7 @@ class State:
             },
             key=natural_key,
         )
-        answer = {"at": now(), "macs": macs_found, "macrunner_sha": macrunner_sha(), "repos": repos}
+        answer = {"at": now(), "macs": macs_found, "macrunner_sha": sha.result(), "repos": repos}
         with self.lock:
             # Keep the last known Macs when the admin repo could not be read this time.
             if self.runners and any(r["repo"] == ADMIN_REPO and r["error"] for r in repos):
@@ -1401,13 +1411,16 @@ class State:
     def known_mac(self, host):
         if not HOST_RE.match(host or ""):
             return False
-        return host in self.get_runners()["macs"]
+        # A host missing from a stale list may be new: look again, fresh, before saying it is unknown.
+        return host in self.get_runners()["macs"] or host in self.get_runners(force=True)["macs"]
 
     def known_pc(self, host):
         """A win-N PC the runner lists show."""
         if not is_push_host(host):
             return False
-        return any(d["host"] == host for d in self.get_runners().get("devices", []))
+        return any(d["host"] == host for d in self.get_runners().get("devices", [])) or any(
+            d["host"] == host for d in self.get_runners(force=True).get("devices", [])
+        )
 
     def known_host(self, host, action):
         """A Mac; or a listed win-N PC for the actions it takes (PC_ACTIONS); or for `limit` also the wsl-N
