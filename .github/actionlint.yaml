@@ -7,3 +7,4 @@ self-hosted-runner:
     - win-ci
     - linux-admin
     - linux-ci
+    - pg-ci

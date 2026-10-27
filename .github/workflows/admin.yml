@@ -71,7 +71,7 @@ permissions:
 
 env:
   CI_REPO: ${{ github.repository_owner }} # org-level: the Macs' CI runners serve every repo in the org
-  CI_LABELS: mac-ci-heavy,mac-ci
+  CI_LABELS: mac-ci-heavy,mac-ci,pg-ci
   CI_HOST_LABELS: ${{ vars.CI_HOST_LABELS }} # optional repo variable: extra CI labels for one Mac, HOST=label[,label];...  e.g. host-a=gpu
 
 jobs:

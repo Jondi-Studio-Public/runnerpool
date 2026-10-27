@@ -1385,7 +1385,7 @@ function Get-NextWslName([string]$adminRepo) {
     Die 'no free wsl-N name'
 }
 
-# $e: the bootstrap settings. WSL_SET is "set:count:tags;..." and the default is "wsl:2:linux-ci,docker".
+# $e: the bootstrap settings. WSL_SET is "set:count:tags;..." and the default is "wsl:2:linux-ci,pg-ci,docker".
 function Install-WslSet($e) {
     $distro = if ($e.WSL_DISTRO) { $e.WSL_DISTRO } else { 'gh-runner' }
     & wsl.exe --status *> $null

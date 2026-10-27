@@ -71,7 +71,7 @@ The installer asks "Also set up Linux (WSL) runners? [Y/n]". Yes adds two genera
 for every repo in the org (label `linux-ci`; opt in with `runs-on: [self-hosted, linux, linux-ci]`), named
 `win-1-wsl-1` and `-2` after the PC, plus a `wsl-N` admin runner, in a WSL distro called `gh-runner` that
 systemd runs. Change the count with the
-`WSL_SET` build setting (`wsl:4:linux-ci,docker`; the default is `wsl:2:linux-ci,docker`). They are managed as host `wsl-N` through the Admin (Linux) workflow, with
+`WSL_SET` build setting (`wsl:4:linux-ci,pg-ci,docker`; the default is `wsl:2:linux-ci,pg-ci,docker`). They are managed as host `wsl-N` through the Admin (Linux) workflow, with
 `linux/linuxrunner` (see [linux.md](linux.md)). A runner name already registered on GitHub (another PC's) is
 skipped, never taken over.
 
