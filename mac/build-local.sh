@@ -19,7 +19,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 TOOLS=$HOME/pkgtools
 ORG=${GITRUNNER_ORG:?set GITRUNNER_ORG to your GitHub org}
 CI_REPO=$ORG  # org-level CI runners
-CI_LABELS=mac-ci-heavy,mac-ci
+CI_LABELS=mac-ci-heavy,mac-ci,pg-ci
 CI_HOST_LABELS=${CI_HOST_LABELS:-}  # extra labels per Mac, HOST=label[,label];...  e.g. host-a=gpu
 ADMIN_REPO=${ADMIN_REPO:-$ORG/runnerpool}
 IDENT=${GITRUNNER_BUNDLE_ID:-io.github.git-runner.mac-runners}   # reverse-DNS bundle id; set GITRUNNER_BUNDLE_ID for your own

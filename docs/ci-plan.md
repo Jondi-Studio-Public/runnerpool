@@ -79,7 +79,7 @@ Pin `@main` to a tag or commit if you want changes here to reach a repo only whe
   don't both pick the one idle Mac). It is a snapshot taken when the plan ran, so a Mac that
   went busy meanwhile only means the job queues there. Needs `RUNNER_STATUS_TOKEN`; without it
   every slot is the PC.
-- **mac-first**: one runs-on label array for a job that can run on either machine and may queue: the Macs when one is online, else the PC. Use it as `runs-on: ${{ fromJSON(needs.plan.outputs.mac-first) }}`. Without `RUNNER_STATUS_TOKEN` it is the PC.
+- **mac-first**: one runs-on label array for a job that can run on either machine and may queue: the Macs when one is online, else the PC. Use it as `runs-on: ${{ fromJSON(needs.plan.outputs.mac-first) }}`. Without `RUNNER_STATUS_TOKEN` it is the PC. It is a plan-time snapshot, so a Mac that goes offline or busy afterwards leaves the job queued on it. Prefer a label both pools carry (`pg-ci` for Postgres jobs: `runs-on: [self-hosted, pg-ci]`), which GitHub routes to the first idle runner.
 - **Macs alone never run a repo's CI**: they only join a run the PC is taking.
 
 ## Sharding pytest

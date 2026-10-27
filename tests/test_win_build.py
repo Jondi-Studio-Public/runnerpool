@@ -61,7 +61,7 @@ def test_linux_tool_and_wsl_set_are_embedded(tmp_path):
     text = build(tmp_path, RUNNER_PAT="t")
     payload = re.search(r"\$LinuxPayload = '([^']+)'", text).group(1)
     assert base64.b64decode(payload) == (ROOT / "linux" / "linuxrunner").read_bytes()
-    assert "WSL_SET        = 'wsl:2:linux-ci,docker'" in text
+    assert "WSL_SET        = 'wsl:2:linux-ci,pg-ci,docker'" in text
     provision = re.search(r"\$ProvisionPayload = '([^']+)'", text).group(1)
     assert base64.b64decode(provision) == (ROOT / "linux" / "linux-provision.sh").read_bytes()
 

@@ -24,7 +24,7 @@ ADMIN_REPO=${ADMIN_REPO:-$ORG/runnerpool}
 # runners for every repo in the org, named <win host>-wsl-N (e.g. win-1-wsl-1) and opted into with the
 # linux-ci tag; a new Linux box is provisioned for them (linux/linux-provision.sh). The docker tag also gets
 # Docker Engine installed in the distro (linuxrunner install-docker), for jobs that build x86-64 images.
-WSL_SET=${WSL_SET-wsl:2:linux-ci,docker}
+WSL_SET=${WSL_SET-wsl:2:linux-ci,pg-ci,docker}
 
 if [ -z "${CI_APP_KEY_B64:-}" ] && [ -n "${CI_APP_PRIVATE_KEY:-}" ]; then
   CI_APP_KEY_B64=$(printf '%s' "$CI_APP_PRIVATE_KEY" | base64 | tr -d '\r\n')
